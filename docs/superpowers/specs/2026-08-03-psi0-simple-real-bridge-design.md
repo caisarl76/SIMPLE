@@ -1,7 +1,8 @@
 # PSI0 SIMPLE PC2 Bridge Design
 
 Date: 2026-08-03
-Status: revised after second runtime-contract review
+Revised: 2026-08-04
+Status: revised after third runtime-contract review
 
 ## Objective
 
@@ -116,6 +117,7 @@ The implementation will add or change:
 - `scripts/postprocess_psi0.py`: corrected chronological RPY history and `0.74` initial height.
 - `third_party/decoupled_wbc/control/robot_model/supplemental_info/g1/g1_supplemental_info.py`: corrected right-hand limits while retaining the explicitly classified conservative shoulder-roll envelope.
 - `third_party/decoupled_wbc/control/main/teleop/configs/configs.py`: serialized `env_type` plus an explicit `domain_id` copied into WBC `DOMAIN_ID` so simulation can be isolated.
+- `third_party/decoupled_wbc/control/main/teleop/run_g1_control_loop.py` and a nested helper: publish the config service only after model construction and include the canonical connected-model attestation.
 - unit tests for the bridge, converter, joint limits, HTTP timeout, and WBC preflight.
 - a fake policy server, fake composed-camera server, policy-contract fixture, and bounded simulation smoke-test driver under `scripts/tests/`.
 - `.gitmodules` only if an accessible decoupled-WBC fork must replace the current fetch URL.
@@ -176,6 +178,25 @@ env_type: Literal["sim", "real"] = field(init=False)
 
 `__post_init__` continues assigning the value returned by `resolve_interface`. The regression test constructs the real `ControlLoopConfig(interface="sim", domain_id=42)`, calls `to_dict()`, and asserts the payload contains `env_type="sim"`, normalized `interface="lo"` on Linux, and `domain_id=42`. The test inspects the actual service payload rather than a bridge fake.
 
+The WBC currently publishes its config service before constructing `robot_model` or `wbc_policy`. The nested change moves service publication until both objects have constructed successfully and adds `model_contract` plus `model_contract_sha256` to the response. `model_contract` uses schema `decoupled_wbc.g1-model-contract.v1` and contains:
+
+- the exact decoupled-WBC Git SHA and `working_tree_clean=true`;
+- robot-model name;
+- all 43 ordered joint names;
+- all 43 effective lower and upper position-limit arrays after supplemental overrides;
+- the exact 31 ordered `upper_body` joint names;
+- the selected URDF SHA-256;
+- both resolved WBC ONNX paths, file SHA-256 values, and 516-input/15-output signatures.
+
+The digest is SHA-256 over UTF-8 canonical JSON of `model_contract` using sorted keys and compact separators; the digest field itself is excluded. In `sim-control`, PC2:
+
+1. recomputes the response digest and rejects malformed content;
+2. obtains the expected nested SHA from the SIMPLE root gitlink and requires an exact match plus a clean WBC tree;
+3. builds the expected contract from its clean checked-out submodule;
+4. compares the full ordered names, effective limits, URDF hash, ONNX hashes/signatures, and final digest.
+
+This attests the model actually used by the connected WBC. A process running another checkout, the old signed hand limits, reordered joints, or different ONNX files cannot pass merely by returning compatible top-level configuration fields.
+
 For `sim-control`, the returned configuration must match all of the following:
 
 | Field | Required value |
@@ -192,7 +213,7 @@ For `sim-control`, the returned configuration must match all of the following:
 | `wbc_model_path` | `policy/GR00T-WholeBodyControl-Balance.onnx,policy/GR00T-WholeBodyControl-Walk.onnx` |
 | `domain_id` | the CLI's dedicated simulation domain, initially `42` |
 
-The bridge then instantiates the same `lower_and_upper_body` G1 model and asserts:
+The attested connected model and the locally built expected `lower_and_upper_body` G1 model must both assert:
 
 - the full named state has 43 joints;
 - the upper-body target group has exactly 31 unique names;
@@ -246,9 +267,9 @@ The bridge consumes `G1Env/env_state_act`. A state sample is accepted only when 
 - has shape `(43,)`;
 - contains only finite values;
 - maps one-to-one to the preflighted 43 joint names;
-- lies within the corrected URDF/model position bounds with a measured-state tolerance of `0.05` radians.
+- lies within the attested effective model position bounds with a measured-state tolerance of `0.05` radians.
 
-An invalid sample never replaces `last_valid_q`. In `ACTIVE`, it causes an immediate atomic fault. In `PAUSED` or `shadow`, it is reported and ignored. Holds are constructed only from `last_valid_q`, never from an invalid current sample.
+An invalid sample never replaces `last_valid_q`. In `ACTIVE`, it causes an immediate atomic fault. In `PAUSED` or `shadow`, it is reported and ignored. The tolerance absorbs small measurement overshoot for state validity only; it never expands a commanded or held target limit.
 
 The PSI0 observation has shape `(1, 32)`:
 
@@ -279,7 +300,7 @@ Activation and every inference snapshot require all three conditions. While acti
 
 The bridge has four states:
 
-- `PAUSED`: startup state; does not query PSI0. After the first valid state it republishes a fixed measured-pose, zero-navigation hold in `sim-control`.
+- `PAUSED`: startup state; does not query PSI0. After the first valid state it republishes a fixed bounded-pose, zero-navigation hold in `sim-control`.
 - `ACTIVE`: fixed-horizon requests and validated actions may execute.
 - `FAULT`: latched safe state; all policy actions are discarded and a fixed zero-navigation hold is published in `sim-control`.
 - `STOPPED`: terminal shutdown state.
@@ -298,7 +319,7 @@ Every pause, fault, rearm, and stop increments a monotonically increasing genera
 2. increments the generation;
 3. clears the current, staged, and immutable committed-prefix buffers and their indices;
 4. clears logical request/deadline/history bookkeeping;
-5. captures a hold from `last_valid_q` and last safe height;
+5. constructs the bounded hold defined below from fresh `last_valid_q` or the last safe published goal;
 6. leaves the separate physical-worker-busy flag set until the blocked request really returns.
 
 No new worker thread is spawned to work around a blocked request. The one worker either returns or reaches its explicit HTTP timeout; its late result is discarded.
@@ -329,13 +350,16 @@ The bridge calls `/act-rtc-v1` with the normal SIMPLE fields:
 - empty condition dictionary;
 - dataset name `simple`.
 
-The first request of an activation generation carries:
+Every request, including R0, uses the same RTC schema. R0 carries `reset=True`; successors omit it:
 
 ```python
 history = {
     "reset": True,
     "session_id": session_id,
     "request_seq": 0,
+    "observation_tick": r0,
+    "rtc_delay_steps": d,
+    "committed_actions": committed_hold_actions,  # shape (d, 36)
 }
 ```
 
@@ -351,7 +375,7 @@ history = {
 }
 ```
 
-The server normalizes the supplied committed actions, uses them as RTC plan prefix `0:d`, generates a length-`P` plan, and returns denormalized plan suffix `d:d+s`. The response action shape is exactly `(s, 36)` and its RTC metadata echoes `session_id`, `request_seq`, `observation_tick`, `P`, `s`, `d`, and `first_action_tick=r+d`. Missing or mismatched metadata is a whole-response fault. The reset response also has shape `(s, 36)` but has no committed prefix; PC2 assigns its first execution tick only after validation.
+The server first resets the named session when requested, then normalizes the supplied committed actions, uses them as RTC plan prefix `0:d`, generates a length-`P` plan, and returns denormalized plan suffix `d:d+s`. Every response action shape is exactly `(s, 36)`, including R0. Its RTC metadata echoes `session_id`, `request_seq`, `observation_tick`, `P`, `s`, `d`, and `first_action_tick=r+d`. Missing or mismatched metadata is a whole-response fault; there is no alternate reset response schema.
 
 This protocol makes the actual post-slew PC2 commands, rather than the server's previous raw prediction, the RTC conditioning source. The current `/act` endpoint does not implement these semantics and is ineligible for control.
 
@@ -359,28 +383,29 @@ This protocol makes the actual post-slew PC2 commands, rather than the server's 
 
 Only one inference worker performs HTTP. `HttpActionClient` retains `timeout=None` as its general backward-compatible default; this bridge constructs it with a five-second timeout.
 
-1. On activation, dispatch reset request R0 and publish hold while it runs. R0 must return and validate by the fixed `d * Delta` runtime deadline; its `s` actions become `current`.
-2. Let `e0` be the tick at which `current[0]` is first published. Do not request a successor at `e0`.
-3. At tick `r=e0+s-d`, exactly `d` current actions remain. Starting from the last published command, run the slew limiter forward across those `d` raw actions, replace them with the resulting effective commands, mark them immutable, and send that exact `(d, 36)` committed prefix with `o[r]`.
-4. Continue publishing the immutable committed prefix during ticks `r` through `r+d-1`. An early valid response is stored as one staged suffix and does not alter these commands.
-5. At tick `r+d`, after all committed commands have been consumed, require the staged `(s, 36)` suffix and atomically make it current. Its element zero is the command for tick `r+d`.
-6. The next request trigger occurs after `s-d` actions from that suffix, at tick `r+s`. Thus steady request start ticks differ by exactly `s`, while every observation-to-first-new-action delay is exactly `d` ticks.
-7. If a response fails validation or HTTP before handoff, fault immediately. If no valid response is available before action selection at tick `r+d`, atomically fault and publish zero-navigation hold instead of another policy action.
+1. Before activation is permitted, at least one bounded paused-hold goal must have published successfully. At activation tick `r0`, repeat that exact zero-navigation 36-D hold action `d` times, mark the prefix immutable, and dispatch R0 with `o[r0]` and the full tick metadata above.
+2. Continue publishing the committed hold prefix during ticks `r0` through `r0+d-1`. R0 must return and validate before action selection at tick `r0+d`; an early valid suffix is staged.
+3. At tick `r0+d`, require the staged `(s, 36)` suffix, make it current, and publish its element zero. The response metadata fixes this element's global tick as `first_action_tick=r0+d`.
+4. At the next request tick `r=r0+s`, exactly `d` current actions remain. Starting from the last published command, run the slew limiter forward across those `d` raw actions, replace them with the resulting effective commands, mark them immutable, and send that exact `(d, 36)` committed prefix with `o[r]`.
+5. Continue publishing the immutable committed prefix during ticks `r` through `r+d-1`. An early valid response is stored as one staged suffix and does not alter these commands.
+6. At tick `r+d`, after all committed commands have been consumed, require the staged suffix and atomically make it current. Its element zero is the command for tick `r+d`.
+7. Every later request starts `s` ticks after the previous request and after `s-d` actions from the current suffix have executed. Thus every observation-to-first-new-action delay is exactly `d` ticks.
+8. If a response fails validation or HTTP before handoff, fault immediately. If no valid response is available before action selection at tick `r+d`, atomically fault and publish zero-navigation hold instead of another policy action.
 
 The worker records completion with the shared monotonic clock and request tick. Each main-loop tick drains a completed result before checking handoff, but a result stamped after its `r+d` deadline is rejected. No response appends behind an arbitrary queue, replaces partly executed commands, or changes a committed prefix.
 
-For the initial fake contract `P=30, s=24, d=6`, a request begins when six actions remain, the runtime handoff is 0.12 seconds later, and latency certification requires warmed p99 at or below 0.10 seconds. The generic five-second HTTP timeout only bounds the physical worker after a logical RTC fault.
+For the initial fake contract `P=30, s=24, d=6`, R0 begins with six committed hold actions and every successor begins with six committed policy actions remaining. Each runtime handoff is 0.12 seconds later, and latency certification requires warmed p99 at or below 0.10 seconds. The generic five-second HTTP timeout only bounds the physical worker after a logical RTC fault.
 
 ### Time-indexed sentinel example
 
-The deterministic scheduler test uses `P=8, s=5, d=3` and starts the validated reset chunk at tick 100:
+The deterministic scheduler test uses `P=8, s=5, d=3` and activates at tick 100:
 
-- ticks 100-101 publish reset-chunk actions 0-1;
-- at tick 102, `o[102]` contains the post-slew history from tick 101, and the request commits the exact post-slew commands for ticks 102-104;
-- those committed commands publish unchanged at ticks 102-104 while inference runs;
-- the response represents generated-plan indices `3:8`, tagged for global ticks 105-109, and must be available before tick 105 selection;
-- tick 105 publishes response element 0;
-- tick 107 starts the following request with history from tick 106 and committed commands for ticks 107-109.
+- `o[100]` contains post-slew paused-hold history from tick 99; R0 carries `observation_tick=100`, `d=3`, and exact committed hold commands for ticks 100-102;
+- those hold commands publish unchanged at ticks 100-102 while R0 runs;
+- R0 returns generated-plan indices `3:8`, tagged for global ticks 103-107, and must be available before tick 103 selection;
+- tick 103 publishes R0 response element 0;
+- tick 105 starts R1 with history from tick 104 and exact post-slew committed commands for ticks 105-107;
+- R1 returns generated-plan indices `3:8`, tagged for global ticks 108-112, and tick 108 publishes R1 response element 0.
 
 Unique per-tick and per-dimension sentinels prove there are no duplicates, skips, raw-versus-slew substitutions, stale-history updates, or off-by-one handoffs.
 
@@ -446,7 +471,15 @@ These are simulation defaults, not approved real-robot gains or rates.
 
 Before any valid state, the bridge publishes nothing. It never invents an upper-body initial pose.
 
-Entering `PAUSED` or `FAULT` captures the upper-body portion of `last_valid_q` once and republishes that fixed pose at 50 Hz with zero navigation and the last safe height (`0.74` before any action). It does not continuously follow measured joints.
+`build_bounded_hold(now)` has an exact source order:
+
+1. If `last_valid_q` is no more than 0.10 seconds old, extract its named upper-body values and clamp each value to the attested effective lower/upper limit. Record the source as `measured_clamped`, including every clamped joint and delta.
+2. Otherwise, if a previously successful bounded publication exists, copy its 31-D upper-body target and bounded base height, set navigation to zero, and record the source as `last_safe_published`.
+3. Otherwise return no hold. Publish nothing and deny activation until a fresh valid state permits step 1.
+
+The base height is independently clamped to `[0.20, 0.74]`; navigation is always exactly zero. Once `PAUSED` or `FAULT` captures a hold, that target is fixed and republished at 50 Hz rather than following later measurements. Every successful hold or policy publication updates the bounded, final-post-slew `last_safe_published` fallback. Named inverse mapping converts the bounded 31-D WBC hold into the 36-D PSI0 action order used by R0, with the same height and four zero navigation values.
+
+Consequently, a measurement up to 0.05 radians outside an effective joint envelope may remain valid for monitoring, but the corresponding hold target is the nearest effective endpoint and is never published outside the envelope. R0's committed hold prefix is built from this already bounded, successfully published hold.
 
 When Ctrl-C is received in `sim-control`, the bridge first enters paused hold and publishes 25 final hold ticks (0.5 seconds), then transitions to `STOPPED` and closes its publisher. This leaves the WBC's last received goal as a zero-navigation hold, but does not guarantee balance after the bridge exits. The WBC and its lower-body balance/walk policy are separate processes whose current activation state is unchanged by `p` or Ctrl-C. Operators must not terminate the WBC or remove support based on the bridge's last command.
 
@@ -462,6 +495,8 @@ Shutdown is bounded as follows:
 4. close messaging resources and restore the terminal in `finally` blocks;
 5. report any daemon worker that did not exit, while allowing the process to terminate; no non-daemon worker may remain.
 
+The explicit overall deadline from Ctrl-C receipt to bridge-process exit is 6.5 seconds: at most 0.5 seconds of final hold, 5.5 seconds of inference-worker join budget, and 0.5 seconds for camera/messaging/terminal cleanup. The long bound is tested separately and is not assumed to fit inside the smoke test's two-second cleanup phase.
+
 The bridge never kills the PSI0 server, WBC, simulator, or any robot process.
 
 ## Verification
@@ -474,17 +509,18 @@ Tests must cover:
 2. A 43-value named sentinel maps every hand and arm joint to the correct 32-D index; the final four values are executed-command history.
 3. A 36-value named sentinel maps every waist, arm, hand, height, and navigation value to the correct 31-D WBC goal position.
 4. Corrected right-hand effective limits equal the URDF within `1e-7`, both shoulder-roll effective limits equal their documented conservative subsets, and no other commanded-joint discrepancy exists. Each effective midpoint and endpoint is accepted; values `1e-4` outside are rejected.
-5. Invalid measured-state shape, non-finite values, out-of-bounds values, stale age, and excessive camera/state skew cannot replace `last_valid_q` or activate control.
+5. Invalid measured-state shape, non-finite values, out-of-tolerance values, stale age, and excessive camera/state skew cannot replace `last_valid_q` or activate control. A measurement 0.04 radians outside an effective limit is accepted but its hold is clamped to the endpoint; 0.051 radians outside is rejected. Stale state selects `last_safe_published`, and no fallback publishes nothing.
 6. RGB and BGR options pass red/blue sentinels through the actual composed-camera JPEG schema with tolerance.
-7. The bridge starts paused; local `p` activates only after both preflights and synchronized inputs.
-8. The `P=8, s=5, d=3` time-indexed sentinel proves request ticks, observation history, post-slew committed prefixes, response indices, first execution ticks, and subsequent request spacing exactly.
+7. The bridge starts paused; local `p` activates only after both preflights, synchronized inputs, and one successful bounded hold publication. R0 contains `observation_tick`, `d` identical committed hold actions, and an echoed `first_action_tick=r0+d`.
+8. The `P=8, s=5, d=3` time-indexed sentinel proves R0 at tick 100, hold-prefix ticks 100-102, first suffix tick 103, R1 at tick 105, observation history, post-slew committed prefixes, response indices, and subsequent handoff at tick 108 exactly.
 9. RTC constraints reject `d<2`, `d>s`, `d+s>P`, `d>=rtc_training_max_delay`, legacy `/act` semantics, short/long suffixes, wrong metadata, and late responses before any partial suffix executes.
 10. A blocked fake request never blocks 50 Hz publication, cannot be bypassed by a second worker, and prevents rearm until physically idle.
 11. Pause, fault, and stop atomically clear current, staged, and committed actions; all late generations are discarded; the first fault goal has zero navigation.
 12. The general HTTP client remains unbounded by default while the bridge passes five seconds explicitly.
-13. The real `ControlLoopConfig(interface="sim", domain_id=42).to_dict()` payload contains `env_type="sim"`, Linux `interface="lo"`, and `domain_id=42`; every WBC config mismatch fails before publisher creation.
+13. The real `ControlLoopConfig(interface="sim", domain_id=42).to_dict()` payload contains `env_type="sim"`, Linux `interface="lo"`, and `domain_id=42`. An event-order test proves robot-model and WBC-policy construction both precede service publication. The real model-contract builder emits 43/31 ordered names, effective limits, nested SHA, clean-tree flag, URDF/ONNX hashes, and a reproducible digest; mutating any hand limit, joint order, hash, SHA, or cleanliness flag changes/rejects the contract before publisher creation.
 14. Camera polling and terminal cleanup finish within their stated shutdown bounds.
 15. A clean `git clone --no-local` plus recursive submodule initialization resolves the recorded decoupled-WBC SHA and passes its targeted tests; root tests run against that clean submodule, not the developer's dirty checkout.
+16. A deterministic subprocess shutdown test starts a local HTTP handler that accepts `/act-rtc-v1` and withholds its response beyond the client's five-second read timeout. After the handler signals that the request is in flight, the test sends Ctrl-C immediately and requires bridge exit within 6.5 seconds, final zero-navigation hold publication, camera exit, terminal restoration, no live non-daemon bridge thread, and reusable ports.
 
 ### Isolated 15-second simulation smoke test
 
@@ -509,9 +545,10 @@ The phases are:
 
 - seconds 0-3: paused hold;
 - seconds 3-11: active fake inference;
-- at second 11: the fake policy stalls its next request beyond the six-tick/0.12-second handoff deadline;
+- at second 11: the fake policy makes its next request take exactly 0.30 seconds, exceeding the six-tick/0.12-second handoff deadline but returning well before smoke cleanup;
 - seconds 11-13: observe latched fault and hold;
-- seconds 13-15: Ctrl-C and cleanup.
+- at second 13: require the invalidated worker to be physically idle, then send Ctrl-C;
+- seconds 13-15: final hold and short-path cleanup.
 
 Pass criteria are all of:
 
@@ -520,11 +557,14 @@ Pass criteria are all of:
 - the main loop continues publishing while HTTP is blocked;
 - successor requests start with exactly six committed post-slew actions remaining, and accepted handoffs introduce no duplicate or skipped tick;
 - fault is recorded no later than request start plus 0.14 seconds (six-tick deadline plus one observation tick);
+- the late 0.30-second response is discarded, and the worker reports idle before second 13;
 - the first goal at or after the fault transition has navigation exactly `[0, 0, 0, 0]` and no queued policy action executes afterward;
 - all bridge threads exit, child PIDs are reaped, terminal settings are restored, and all test ports can be rebound;
 - the generated metrics file records zero real-interface connections and zero extra goal publishers.
 
 This smoke test does initialize Unitree SDK2 DDS inside the simulator. Safety comes from loopback interface plus dedicated Unitree domain 42, together with ROS domain 42; it does not claim to avoid DDS.
+
+The smoke test exercises the short shutdown path only. The deterministic test in item 16 owns the five-second in-flight-request case and its 6.5-second overall assertion.
 
 ### Live policy integration gate
 
