@@ -481,7 +481,7 @@ The base height is independently clamped to `[0.20, 0.74]`; navigation is always
 
 Consequently, a measurement up to 0.05 radians outside an effective joint envelope may remain valid for monitoring, but the corresponding hold target is the nearest effective endpoint and is never published outside the envelope. R0's committed hold prefix is built from this already bounded, successfully published hold.
 
-When Ctrl-C is received in `sim-control`, the bridge first enters paused hold and publishes 25 final hold ticks (0.5 seconds), then transitions to `STOPPED` and closes its publisher. This leaves the WBC's last received goal as a zero-navigation hold, but does not guarantee balance after the bridge exits. The WBC and its lower-body balance/walk policy are separate processes whose current activation state is unchanged by `p` or Ctrl-C. Operators must not terminate the WBC or remove support based on the bridge's last command.
+When Ctrl-C is received in `sim-control`, the bridge first attempts `build_bounded_hold(now)`. If a bounded hold exists, it enters paused hold and publishes that fixed target for 25 final ticks (0.5 seconds). If no bounded hold exists, including shutdown before the first valid state, it publishes no goal and proceeds directly to bounded cleanup. After either branch it transitions to `STOPPED` and closes its publisher. A published final hold leaves the WBC's last received goal as a zero-navigation hold, but does not guarantee balance after the bridge exits. The WBC and its lower-body balance/walk policy are separate processes whose current activation state is unchanged by `p` or Ctrl-C. Operators must not terminate the WBC or remove support based on the bridge's last command.
 
 ## Concurrency and bounded shutdown
 
@@ -489,7 +489,7 @@ The main thread owns the 50 Hz state machine, keyboard events, deadlines, action
 
 Shutdown is bounded as follows:
 
-1. latch stop, invalidate the generation, clear current, staged, and committed-prefix buffers, and publish the final 0.5-second hold in `sim-control`;
+1. latch stop, invalidate the generation, and clear current, staged, and committed-prefix buffers; in `sim-control`, publish the final 0.5-second hold only when `build_bounded_hold(now)` returns one, otherwise publish nothing and continue immediately;
 2. signal the camera reader, whose 100 ms poll exits and whose own thread closes its socket;
 3. prevent new HTTP work and wait at most 5.5 seconds for the existing five-second request timeout;
 4. close messaging resources and restore the terminal in `finally` blocks;
@@ -521,6 +521,7 @@ Tests must cover:
 14. Camera polling and terminal cleanup finish within their stated shutdown bounds.
 15. A clean `git clone --no-local` plus recursive submodule initialization resolves the recorded decoupled-WBC SHA and passes its targeted tests; root tests run against that clean submodule, not the developer's dirty checkout.
 16. A deterministic subprocess shutdown test starts a local HTTP handler that accepts `/act-rtc-v1` and withholds its response beyond the client's five-second read timeout. After the handler signals that the request is in flight, the test sends Ctrl-C immediately and requires bridge exit within 6.5 seconds, final zero-navigation hold publication, camera exit, terminal restoration, no live non-daemon bridge thread, and reusable ports.
+17. A separate subprocess sends Ctrl-C before the first valid robot state. It requires zero goal messages, zero inference requests, terminal and messaging cleanup, no live non-daemon bridge thread, reusable ports, and process exit within 0.5 seconds because neither the final-hold phase nor an HTTP join is pending.
 
 ### Isolated 15-second simulation smoke test
 
