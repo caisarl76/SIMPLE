@@ -4307,7 +4307,7 @@ The real `run_bridge()` calls: parser/mode validation; `create_ros_wbc_config_cl
 
 Construct the local WBC identity with this exact helper; it proves the root gitlink, nested HEAD, nested cleanliness, and locally hashed model all describe one checkout:
 
-\`\`\`python
+```python
 from pathlib import Path
 import subprocess
 
@@ -4362,7 +4362,7 @@ def build_local_wbc_identity(repository_root):
     }:
         raise PreflightError("local WBC model contract Git identity")
     return LocalWbcIdentity(gitlink, contract)
-\`\`\`
+```
 
 - [ ] **Step 11: Run adapter/preflight tests and commit**
 
@@ -5657,7 +5657,9 @@ def run_wall_clock_fake_bridge(port, duration_s):
     return SimpleNamespace(
         request_started_at=worker.metrics.first_request_started_at,
         fault_at=bridge.metrics.first_fault_at,
-        late_results_discarded=bridge.metrics.discarded_old_generation_results,
+        old_generation_results_discarded=(
+            bridge.metrics.discarded_old_generation_results
+        ),
         policy_actions_after_fault=policy_actions_after_fault,
         requests_submitted=worker.metrics.requests_submitted,
     )
@@ -5695,7 +5697,7 @@ def test_point_30_second_one_shot_latency_faults_at_deadline_and_is_discarded():
         report = run_wall_clock_fake_bridge(fake.port, duration_s=0.45)
         assert report.request_started_at is not None
         assert report.fault_at <= report.request_started_at + 0.14
-        assert report.late_results_discarded == 1
+        assert report.old_generation_results_discarded == 1
         assert report.policy_actions_after_fault == 0
         assert report.requests_submitted == 1
         assert fake.max_concurrent_requests == 1
@@ -6258,9 +6260,11 @@ import subprocess
 import numpy as np
 import pytest
 
+import scripts.tests.smoke_psi0_simple_bridge as smoke_driver
 from scripts.tests.smoke_psi0_simple_bridge import (
     OwnedChildren, SmokeConfig, SmokeSafetyError, arm_next_policy_delay,
-    build_launch_plan, launch, validate_smoke_report,
+    allocate_smoke_run_directory, build_launch_plan, collect_smoke_report,
+    default_wbc_preflight, launch, validate_smoke_report,
 )
 
 EXPECTED_WBC_ARGS = (
@@ -6360,6 +6364,118 @@ def test_smoke_arms_delay_through_cross_process_control_endpoint():
     )]
 
 
+class StaticWbcConfigClient:
+    def __init__(self, payload):
+        self.payload = payload
+        self.timeouts = []
+
+    def get_config(self, timeout_s):
+        self.timeouts.append(timeout_s)
+        return self.payload
+
+
+def test_smoke_wbc_preflight_reads_the_producer_top_level_payload():
+    payload = {"env_type": "sim", "interface": "lo", "model_contract": {}}
+    client = StaticWbcConfigClient(payload)
+    result = default_wbc_preflight(
+        10.0, client_factory=lambda *args, **kwargs: client,
+        clock=lambda: 9.0,
+    )
+    assert result is payload
+    assert client.timeouts == [1.0]
+
+
+def test_smoke_wbc_preflight_rejects_a_nonexistent_wrapper_schema():
+    client = StaticWbcConfigClient({
+        "control_loop_config": {"env_type": "sim", "interface": "lo"}
+    })
+    with pytest.raises(SmokeSafetyError, match="sim/loopback"):
+        default_wbc_preflight(
+            10.0, client_factory=lambda *args, **kwargs: client,
+            clock=lambda: 9.0,
+        )
+
+
+def test_two_exact_smoke_commands_allocate_unique_preserved_runs(tmp_path):
+    nonces = iter(("run-a", "run-b"))
+    kwargs = {
+        "now_ns": lambda: 123456789,
+        "token_hex": lambda length: next(nonces),
+    }
+    first = allocate_smoke_run_directory(tmp_path, **kwargs)
+    marker = first / "psi0-smoke-report.json"
+    marker.write_text("first run", encoding="utf-8")
+    second = allocate_smoke_run_directory(tmp_path, **kwargs)
+    assert first == tmp_path / "psi0-smoke-123456789-run-a"
+    assert second == tmp_path / "psi0-smoke-123456789-run-b"
+    assert marker.read_text(encoding="utf-8") == "first run"
+    assert list(second.iterdir()) == []
+
+
+def test_the_exact_task_13_cli_can_be_invoked_twice(monkeypatch, tmp_path):
+    run_directories = iter((tmp_path / "run-1", tmp_path / "run-2"))
+    allocation_roots = []
+    launched = []
+
+    def allocate(root):
+        allocation_roots.append(root)
+        output = next(run_directories)
+        output.mkdir()
+        return output
+
+    monkeypatch.setattr(smoke_driver, "allocate_smoke_run_directory", allocate)
+    monkeypatch.setattr(smoke_driver, "launch", launched.append)
+    monkeypatch.setattr(
+        smoke_driver.secrets, "token_hex", lambda length: "a" * (2 * length)
+    )
+    argv = [
+        "--duration-s", "15", "--unitree-domain-id", "42",
+        "--camera-port", "15555", "--policy-port", "22086",
+    ]
+    assert smoke_driver.main(argv) == 0
+    assert smoke_driver.main(argv) == 0
+    assert allocation_roots == ["outputs", "outputs"]
+    assert [config.output_dir for config in launched] == [
+        str(tmp_path / "run-1"), str(tmp_path / "run-2"),
+    ]
+
+
+def test_collector_uses_lowercase_fault_and_old_generation_counter():
+    zero = np.zeros(36, np.float32).tolist()
+    records = [
+        {
+            "event": "request", "request_seq": 17,
+            "observation_tick": 100,
+            "committed_actions": np.zeros((6, 36), np.float32).tolist(),
+            "monotonic_s": 11.0,
+        },
+        {
+            "event": "tick", "tick": 100, "published": True,
+            "state": "active", "source_kind": "hold",
+            "psi0_action": zero, "monotonic_s": 11.00,
+            "discarded_late_results": 0,
+            "discarded_old_generation_results": 0,
+        },
+        {
+            "event": "tick", "tick": 101, "published": True,
+            "state": "fault", "source_kind": "hold",
+            "psi0_action": zero, "monotonic_s": 11.02,
+            "discarded_late_results": 0,
+            "discarded_old_generation_results": 1,
+        },
+    ]
+    report = collect_smoke_report(
+        records, scenario_started_at=0.0, armed_seq=17,
+        delayed_record={"request_seq": 17, "applied_latency_s": 0.30},
+        worker_idle_at_s=12.0, goal_counts_before=[0, 1],
+        goal_counts_running=[1, 1], goal_counts_after=[0, 1],
+        terminal_restored=True, ports_rebound=True,
+    )
+    assert report["fault_at"] == 11.02
+    assert report["old_generation_results_discarded"] == 1
+    assert report["late_results_discarded"] == 0
+
+
 @pytest.mark.parametrize(
     "updates",
     [
@@ -6381,7 +6497,7 @@ The exact Tyro flags are fixed in `EXPECTED_WBC_ARGS`; there is no implementatio
 
 - [ ] **Step 2: Implement immutable launch-plan validation**
 
-Implement `SmokeConfig`, `ChildSpec`, `LaunchPlan`, and `build_launch_plan()`. The policy `ChildSpec` must pass the config's exact token/readiness path through `--control-token` and `--ready-json`; reject an empty token, a non-loopback host, a readiness path outside the configured output directory, or an existing readiness file. The production CLI creates `control_token=secrets.token_hex(16)` once when no token is injected by a unit test and never writes it to metrics. Run all Step 1 tests. Do not call `Popen` in this checkbox.
+Implement `SmokeConfig`, `ChildSpec`, `LaunchPlan`, and `build_launch_plan()`. The policy `ChildSpec` must pass the config's exact token/readiness path through `--control-token` and `--ready-json`; reject an empty token, a non-loopback host, a readiness path outside the configured run directory, or any existing artifact file. On every invocation, the production CLI atomically creates a new `psi0-smoke-<time_ns>-<nonce>` directory below `--output-dir`, prints that path, and never removes or overwrites an earlier run. It creates `control_token=secrets.token_hex(16)` once when no token is injected by a unit test and never writes it to metrics. Run all Step 1 tests. Do not call `Popen` in this checkbox.
 
 ```python
 import argparse
@@ -6682,16 +6798,20 @@ def wait_bridge_preflight(path, deadline, clock=time.monotonic):
     raise TimeoutError("bridge preflight readiness timeout")
 
 
-def default_wbc_preflight(deadline):
-    remaining = deadline - time.monotonic()
+def default_wbc_preflight(
+    deadline, *, client_factory=create_ros_wbc_config_client,
+    clock=time.monotonic,
+):
+    remaining = deadline - clock()
     if remaining <= 0.0:
         raise TimeoutError("WBC readiness deadline")
-    client = create_ros_wbc_config_client(
+    client = client_factory(
         "WBCPolicy/robot_config", domain_id=42
     )
     payload = client.get_config(timeout_s=min(3.0, remaining))
-    config = payload.get("control_loop_config", {})
-    if config.get("env_type") != "sim" or config.get("interface") != "lo":
+    if type(payload) is not dict:
+        raise SmokeSafetyError("WBC configuration payload must be an object")
+    if payload.get("env_type") != "sim" or payload.get("interface") != "lo":
         raise SmokeSafetyError("WBC is not isolated sim/loopback")
     return payload
 
@@ -6753,7 +6873,9 @@ def collect_smoke_report(
 ):
     ticks = [record for record in records if record.get("event") == "tick"]
     publishes = [record for record in ticks if record.get("published") is True]
-    fault_ticks = [record for record in ticks if record.get("state") == "FAULT"]
+    fault_ticks = [record for record in ticks if record.get("state") == "fault"]
+    if not fault_ticks:
+        raise SmokeSafetyError("metrics contain no lowercase fault tick")
     fault_at = fault_ticks[0]["monotonic_s"] - scenario_started_at
     requests_ = [
         {"tick": record["observation_tick"],
@@ -6793,6 +6915,9 @@ def collect_smoke_report(
         "first_fault_goal_navigation": first_fault_action[32:36].tolist(),
         "policy_actions_after_fault": sum(
             record.get("source_kind") == "policy" for record in fault_ticks
+        ),
+        "old_generation_results_discarded": (
+            final_tick["discarded_old_generation_results"]
         ),
         "late_results_discarded": final_tick["discarded_late_results"],
         "worker_idle_at_s": worker_idle_at_s,
@@ -6935,9 +7060,20 @@ def build_parser():
     return parser
 
 
+def allocate_smoke_run_directory(
+    output_root, *, now_ns=time.time_ns, token_hex=secrets.token_hex,
+):
+    root = Path(output_root)
+    root.mkdir(parents=True, exist_ok=True)
+    output = root / f"psi0-smoke-{now_ns()}-{token_hex(4)}"
+    output.mkdir(mode=0o755, exist_ok=False)
+    return output
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    output = Path(args.output_dir)
+    output = allocate_smoke_run_directory(args.output_dir)
+    print(f"smoke run directory: {output}", flush=True)
     token = args.control_token or secrets.token_hex(16)
     config = SmokeConfig(
         duration_s=args.duration_s, ros_domain_id=42,
@@ -6991,6 +7127,8 @@ After the second-13 worker-idle check, query `GET /test-control/status` with the
 
 Append a generated passing report and one-field mutation matrix:
 
+The armed 0.30-second response returns only after the handoff underrun has latched `FAULT` and advanced the bridge generation. Therefore the only valid accounting is exactly one `old_generation_results_discarded` and zero `late_results_discarded`; the latter counter is reserved for a response drained after its deadline but before a generation transition.
+
 ```python
 def passing_smoke_report():
     publish_times = [3.0 + index * 0.02 for index in range(400)]
@@ -7023,7 +7161,8 @@ def passing_smoke_report():
         "fault_at": 11.12,
         "first_fault_goal_navigation": [0.0, 0.0, 0.0, 0.0],
         "policy_actions_after_fault": 0,
-        "late_results_discarded": 1,
+        "old_generation_results_discarded": 1,
+        "late_results_discarded": 0,
         "worker_idle_at_s": 12.8,
         "goal_counts_before": [0, 1],
         "goal_counts_running": [1, 1],
@@ -7051,7 +7190,8 @@ def test_passing_smoke_report_meets_every_bound():
         ("fault_at", 11.141),
         ("first_fault_goal_navigation", [0.0, 0.0, 0.1, 0.0]),
         ("policy_actions_after_fault", 1),
-        ("late_results_discarded", 0),
+        ("old_generation_results_discarded", 0),
+        ("late_results_discarded", 1),
         ("worker_idle_at_s", 13.01),
         ("goal_counts_after", [1, 1]),
         ("live_children_after", [123]),
@@ -7180,7 +7320,8 @@ def validate_smoke_report(report):
     exact = {
         "first_fault_goal_navigation": [0.0, 0.0, 0.0, 0.0],
         "policy_actions_after_fault": 0,
-        "late_results_discarded": 1,
+        "old_generation_results_discarded": 1,
+        "late_results_discarded": 0,
         "goal_counts_before": [0, 1],
         "goal_counts_running": [1, 1],
         "goal_counts_after": [0, 1],
@@ -7244,7 +7385,7 @@ ROS_DOMAIN_ID=42 uv run --group sonic python scripts/tests/smoke_psi0_simple_bri
   --policy-port 22086
 ```
 
-Expected: exit zero with a metrics summary containing all approved smoke pass criteria. This initializes Unitree SDK2 DDS only on loopback/domain 42; it does not contact a robot.
+Expected: exit zero with a metrics summary containing all approved smoke pass criteria. Record the printed unique run directory; its metrics JSONL, report, and logs are immutable inputs to Task 16. Re-running this exact command allocates another directory and preserves the first. This initializes Unitree SDK2 DDS only on loopback/domain 42; it does not contact a robot.
 
 ## Task 14: Document operations and the external live-server handoff
 
@@ -7781,7 +7922,7 @@ Fetch `/contract` exactly once before warmup, parse it with `PolicyContract.from
 
 Use this complete concrete transport:
 
-\`\`\`python
+```python
 from urllib.parse import urlparse
 
 import requests
@@ -7861,7 +8002,7 @@ class HttpBenchmarkTransport:
         except Exception as error:
             raise BenchmarkRequestError("decode", str(error)) from error
         return result
-\`\`\`
+```
 
 - [ ] Add NPZ key/dtype/shape/finite validation and run loader cases.
 - [ ] Add strict metadata construction/comparison and run metadata mutations.
@@ -7976,7 +8117,7 @@ Because measured request indices are 10–109, `samples[request_index % 100]` vi
 
 Implement the evidence writer, local effective-limit loader, parser, and entry point exactly:
 
-\`\`\`python
+```python
 import argparse
 from dataclasses import asdict
 import hashlib
@@ -8149,7 +8290,7 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-\`\`\`
+```
 
 Expose this command without defaults for artifact identity paths:
 
@@ -8256,7 +8397,7 @@ Expected: every command exits zero.
 
 - [ ] **Step 4: Re-run the isolated 15-second smoke test**
 
-Run the exact Task 13 command and preserve its metrics JSONL as a verification artifact. Expected: all pass criteria and zero real-interface connections.
+Run the exact Task 13 command. It atomically allocates and prints a new timestamp-and-nonce run directory beneath `outputs`; require that path to differ from the Task 13 path, preserve both directories unchanged, and use the new directory's metrics JSONL as the verification artifact. Expected: all pass criteria and zero real-interface connections. If allocation collides or any artifact already exists in the newly allocated directory, the driver fails closed instead of deleting or overwriting data.
 
 - [ ] **Step 5: Verify the external nested branch still contains the exact gitlink SHA**
 
