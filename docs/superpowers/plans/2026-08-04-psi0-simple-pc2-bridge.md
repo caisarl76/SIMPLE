@@ -389,6 +389,7 @@ def test_policy_contract_records_bound_episode_and_converter_commit(tmp_path):
     assert payload["raw_episode_sha256"] == bound.raw_episode_sha256
     assert payload["processed_episode_sha256"] == bound.processed_episode_sha256
     assert payload["converter_commit"] == "2" * 40
+    assert payload["test_only"] is False
 ```
 
 - [ ] **Step 2: Verify the new module is absent**
@@ -432,6 +433,9 @@ Read raw `observation.amo_policy_command`, reconstruct history with the recorded
 Create a CLI that accepts `--raw-episode-parquet`, `--processed-episode-parquet`, `--processed-episodes-jsonl`, `--checkpoint`, `--dataset-manifest`, `--server-commit`, `--prediction-horizon`, `--execution-horizon`, `--rtc-delay-steps`, `--rtc-training-max-delay`, and `--output`. It calls `load_bound_episode()` and passes only that result to its core comparison:
 
 ```python
+import re
+
+
 def certify_layout(stored_state: np.ndarray, history_cmd: np.ndarray) -> dict[str, object]:
     stored = np.asarray(stored_state, dtype=np.float32)
     history = np.asarray(history_cmd, dtype=np.float32)
@@ -454,9 +458,82 @@ def certify_layout(stored_state: np.ndarray, history_cmd: np.ndarray) -> dict[st
         "legacy_row_reversed_match": False,
         "off_by_one_match": False,
     }
+
+
+def validate_policy_contract_payload(payload):
+    types = {
+        "schema": str, "test_only": bool, "checkpoint_sha256": str,
+        "dataset_manifest_sha256": str, "raw_episode_sha256": str,
+        "processed_episode_sha256": str, "source_episode_index": int,
+        "processed_episode_index": int, "converter_commit": str,
+        "server_commit": str, "converter_layout": str, "observation_dim": int,
+        "action_dim": int, "action_frequency_hz": int,
+        "prediction_horizon": int, "execution_horizon": int,
+        "rtc_delay_steps": int, "rtc_training_max_delay": int,
+        "rtc_enabled": bool, "rtc_endpoint": str, "request_semantics": str,
+        "response_semantics": str, "image_key": str,
+        "camera_color_order": str,
+    }
+    if type(payload) is not dict or set(payload) != set(types):
+        raise TypeError("policy contract keys do not exactly match v2 schema")
+    for key, expected in types.items():
+        if type(payload[key]) is not expected:
+            raise TypeError(f"policy contract field {key} must be {expected.__name__}")
+    for key in (
+        "checkpoint_sha256", "dataset_manifest_sha256", "raw_episode_sha256",
+        "processed_episode_sha256",
+    ):
+        if re.fullmatch(r"[0-9a-f]{64}", payload[key]) is None:
+            raise ValueError(key)
+    for key in ("converter_commit", "server_commit"):
+        if re.fullmatch(r"[0-9a-f]{40}", payload[key]) is None:
+            raise ValueError(key)
+    d = payload["rtc_delay_steps"]
+    s = payload["execution_horizon"]
+    p = payload["prediction_horizon"]
+    if not (2 <= d <= s and d + s <= p and d < payload["rtc_training_max_delay"]):
+        raise ValueError("invalid RTC horizon/delay contract")
+
+
+def build_policy_contract_payload(
+    *, bound_episode, checkpoint_sha256, dataset_manifest_sha256,
+    server_commit, prediction_horizon, execution_horizon,
+    rtc_delay_steps, rtc_training_max_delay,
+):
+    certification = certify_layout(
+        bound_episode.stored_state, bound_episode.history_cmd
+    )
+    payload = {
+        "schema": "simple.psi0.policy-contract.v2",
+        "test_only": False,
+        "checkpoint_sha256": checkpoint_sha256,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "raw_episode_sha256": bound_episode.raw_episode_sha256,
+        "processed_episode_sha256": bound_episode.processed_episode_sha256,
+        "source_episode_index": bound_episode.source_episode_index,
+        "processed_episode_index": bound_episode.processed_episode_index,
+        "converter_commit": bound_episode.converter_commit,
+        "server_commit": server_commit,
+        "converter_layout": certification["layout"],
+        "observation_dim": 32,
+        "action_dim": 36,
+        "action_frequency_hz": 50,
+        "prediction_horizon": prediction_horizon,
+        "execution_horizon": execution_horizon,
+        "rtc_delay_steps": rtc_delay_steps,
+        "rtc_training_max_delay": rtc_training_max_delay,
+        "rtc_enabled": True,
+        "rtc_endpoint": "/act-rtc-v1",
+        "request_semantics": "exact-post-slew-committed-prefix",
+        "response_semantics": "denormalized-executable-suffix",
+        "image_key": "rgb_head_stereo_left",
+        "camera_color_order": "rgb",
+    }
+    validate_policy_contract_payload(payload)
+    return payload
 ```
 
-Write JSON atomically with schema `simple.psi0.policy-contract.v2`, SHA-256 hashes of the checkpoint and dataset manifest, the provided server commit, dimensions `32/36`, `50 Hz`, `/act-rtc-v1`, RGB key/order, committed-prefix/executable-suffix semantics, RTC fields, and the certification result. Also write the bound episode's exact `source_episode_index`, `processed_episode_index`, `raw_episode_sha256`, `processed_episode_sha256`, and `converter_commit`. Reject a non-40-character hexadecimal converter or server commit and any RTC tuple that violates the approved inequalities.
+Write that exact payload atomically; the causal certification is represented by the strict `converter_layout` field and does not add an unrecognized JSON key. Reject a non-40-character hexadecimal converter or server commit and any RTC tuple that violates the approved inequalities. The writer accepts no `test_only` argument: only the checked-in fake fixture in Task 12 may set it true. Task 9 owns `PolicyContract`; to preserve TDD task order, this task defines an identical private `validate_policy_contract_payload()` key/type/value validator, and Task 9 replaces it with the shared parser without changing the emitted bytes.
 
 Complete and run one focused test after each bounded subaction:
 
@@ -1902,11 +1979,11 @@ def policy_payload(**updates):
     return payload
 
 
-def test_policy_contract(**updates):
+def make_policy_contract(**updates):
     return PolicyContract.from_dict(policy_payload(**updates))
 
 
-def test_joint_contract():
+def make_joint_contract():
     names = (
         *(f"leg_joint_{index}" for index in range(12)),
         "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
@@ -1974,11 +2051,34 @@ class ImmediateInference:
 Then create `tests/test_psi0_bridge_scheduler.py`. `Psi0SimpleBridge.tick()` returns immutable `TickResult(tick, goal, psi0_action, source_tick, source_kind)`; this makes tick provenance observable without reaching into private fields:
 
 ```python
+from dataclasses import replace
+
+import numpy as np
+import pytest
+
+from simple.deploy.psi0_simple_bridge import (
+    PolicyContract,
+    Psi0SimpleBridge,
+    RtcRequest,
+    RtcResult,
+    validate_rtc_result,
+)
+from tests.psi0_bridge_testkit import (
+    ImmediateInference,
+    ManualClock,
+    fresh_inputs,
+    make_joint_contract,
+    make_policy_contract,
+    policy_payload,
+    sentinel_actions,
+)
+
+
 def test_rtc_sentinel_has_exact_request_and_handoff_ticks():
     clock = ManualClock(99)
-    contract = test_policy_contract()
+    contract = make_policy_contract()
     inference = ImmediateInference(clock, contract)
-    bridge = Psi0SimpleBridge(contract, test_joint_contract(), inference, clock, start_tick=99)
+    bridge = Psi0SimpleBridge(contract, make_joint_contract(), inference, clock, start_tick=99)
     robot_state, frame = fresh_inputs(clock)
     bridge.update_inputs(robot_state, frame)
     paused = bridge.tick()
@@ -2014,9 +2114,6 @@ def test_rtc_sentinel_has_exact_request_and_handoff_ticks():
 Append strict contract-type tests first:
 
 ```python
-from dataclasses import replace
-
-
 @pytest.fixture
 def clock():
     return ManualClock(100)
@@ -2077,6 +2174,7 @@ def valid_request_and_result(clock, contract):
         image=np.zeros((4, 4, 3), np.uint8),
         committed_actions=sentinel_actions(100, 3),
         reset=False,
+        deadline_at=103 / 50.0,
     )
     result = RtcResult(
         generation=1,
@@ -2095,11 +2193,11 @@ def valid_request_and_result(clock, contract):
 
 @pytest.mark.parametrize("rows", [4, 6])
 def test_response_length_is_exact(clock, rows):
-    contract = test_policy_contract()
+    contract = make_policy_contract()
     request, result = valid_request_and_result(clock, contract)
     result = replace(result, actions=sentinel_actions(103, rows))
     with pytest.raises(ValueError, match="shape"):
-        validate_rtc_result(request, result, contract, test_joint_contract())
+        validate_rtc_result(request, result, contract, make_joint_contract())
 
 
 @pytest.mark.parametrize(
@@ -2112,19 +2210,19 @@ def test_response_length_is_exact(clock, rows):
     ],
 )
 def test_every_response_metadata_mismatch_is_rejected(clock, key, bad_value):
-    contract = test_policy_contract()
+    contract = make_policy_contract()
     request, result = valid_request_and_result(clock, contract)
     metadata = dict(result.metadata)
     metadata[key] = bad_value
     with pytest.raises(ValueError, match=key):
         validate_rtc_result(
             request, replace(result, metadata=metadata), contract,
-            test_joint_contract(),
+            make_joint_contract(),
         )
 
 
 def test_missing_extra_and_wrong_type_metadata_are_rejected(clock):
-    contract = test_policy_contract()
+    contract = make_policy_contract()
     request, result = valid_request_and_result(clock, contract)
     for metadata in (
         {key: value for key, value in result.metadata.items() if key != "session_id"},
@@ -2135,12 +2233,12 @@ def test_missing_extra_and_wrong_type_metadata_are_rejected(clock):
         with pytest.raises((TypeError, ValueError), match="metadata|request_seq|session_id"):
             validate_rtc_result(
                 request, replace(result, metadata=metadata), contract,
-                test_joint_contract(),
+                make_joint_contract(),
             )
 
 
 def test_nonfinite_out_of_bounds_and_late_results_are_rejected(clock):
-    contract = test_policy_contract()
+    contract = make_policy_contract()
     request, result = valid_request_and_result(clock, contract)
     for actions in (
         np.where(np.indices(result.actions.shape)[1] == 0, np.nan, result.actions),
@@ -2149,12 +2247,12 @@ def test_nonfinite_out_of_bounds_and_late_results_are_rejected(clock):
         with pytest.raises(ValueError):
             validate_rtc_result(
                 request, replace(result, actions=actions), contract,
-                test_joint_contract(),
+                make_joint_contract(),
             )
     with pytest.raises(ValueError, match="deadline"):
         validate_rtc_result(
             request, replace(result, completed_at=result.completed_at + 1e-6),
-            contract, test_joint_contract(),
+            contract, make_joint_contract(),
         )
 ```
 
@@ -2165,6 +2263,26 @@ Add and run each test function separately before moving to lifecycle behavior.
 Create `tests/test_psi0_bridge_lifecycle.py` with an explicit blocking port and atomic-state assertions:
 
 ```python
+from copy import deepcopy
+
+import numpy as np
+import pytest
+
+from simple.deploy.psi0_simple_bridge import (
+    BridgeState,
+    Psi0SimpleBridge,
+    RtcResult,
+    TimedRobotState,
+)
+from tests.psi0_bridge_testkit import (
+    ManualClock,
+    fresh_inputs,
+    make_joint_contract,
+    make_policy_contract,
+    sentinel_actions,
+)
+
+
 class BlockingInference:
     def __init__(self):
         self.requests = []
@@ -2193,7 +2311,7 @@ class BlockingInference:
 def ready_bridge(inference):
     clock = ManualClock(99)
     bridge = Psi0SimpleBridge(
-        test_policy_contract(), test_joint_contract(), inference, clock,
+        make_policy_contract(), make_joint_contract(), inference, clock,
         start_tick=99,
     )
     bridge.update_inputs(*fresh_inputs(clock))
@@ -2455,6 +2573,7 @@ class RtcRequest:
     image: np.ndarray
     committed_actions: np.ndarray
     reset: bool
+    deadline_at: float
 
     @property
     def first_action_tick(self) -> int:
@@ -2487,33 +2606,445 @@ class InferencePort(Protocol):
         raise NotImplementedError
 ```
 
-These protocol bodies define the injected boundary only; no production I/O belongs in the core file. Implement `validate_rtc_result()` against the exact Step 2 schema and run only the protocol/deadline cases.
+These protocol bodies define the injected boundary only; no production I/O belongs in the core file. Add the exact validator and run only the protocol/deadline cases:
+
+```python
+RTC_RESPONSE_FIELDS = (
+    "session_id", "request_seq", "observation_tick", "prediction_horizon",
+    "execution_horizon", "rtc_delay_steps", "first_action_tick",
+)
+
+
+def validate_rtc_result(request, result, contract, joints):
+    if result.error is not None:
+        raise ValueError(f"inference error: {result.error}")
+    if type(result.completed_at) is not float or not np.isfinite(result.completed_at):
+        raise ValueError("result completion time must be finite float")
+    if result.completed_at > request.deadline_at:
+        raise ValueError("RTC result missed monotonic deadline")
+    metadata = result.metadata
+    if type(metadata) is not dict or set(metadata) != set(RTC_RESPONSE_FIELDS):
+        raise TypeError("RTC response metadata key set is invalid")
+    expected = {
+        "session_id": request.session_id,
+        "request_seq": request.request_seq,
+        "observation_tick": request.observation_tick,
+        "prediction_horizon": contract.prediction_horizon,
+        "execution_horizon": contract.execution_horizon,
+        "rtc_delay_steps": contract.rtc_delay_steps,
+        "first_action_tick": request.first_action_tick,
+    }
+    for key, value in expected.items():
+        expected_type = str if key == "session_id" else int
+        if type(metadata[key]) is not expected_type:
+            raise TypeError(f"RTC response {key} has wrong type")
+        if metadata[key] != value:
+            raise ValueError(f"RTC response {key} mismatch")
+    actions = np.asarray(result.actions)
+    validate_action_suffix(actions, contract.execution_horizon, joints)
+    return actions.astype(np.float32, copy=True)
+```
+
+Key order is not semantically significant; key set, exact Python JSON types, and values are.
 
 - [ ] **Step 7: Add scheduler state, immutable status, and atomic exit transitions**
 
-`Psi0SimpleBridge` owns these fields under one lock: `state`, `generation`, `tick_index`, `session_id`, `request_seq`, `request_tick`, `handoff_tick`, `next_request_tick`, `scheduled_actions: dict[int,np.ndarray]`, `staged_first_tick`, `staged_actions`, `command_history_rpyh`, `last_valid_state`, `last_safe_goal`, `fault_reason`, and logical-request-active. Initialize `command_history_rpyh` exactly as `np.array([0.0, 0.0, 0.0, 0.74], dtype=np.float32)`. The injected `InferencePort.busy` remains separate.
+Add the following state types and class skeleton verbatim. `consume_goal` is the only effectful core callback; shadow supplies a preview recorder and sim-control supplies the already-preflighted ROS publisher. Returning false is a fail-closed sink rejection.
 
-Implement immutable `BridgeStatus`/metrics snapshots plus `enter_fault(reason)`, `pause()`, and `stop()` as single locked transitions that increment generation and clear all logical action/request state. Never clear `InferencePort.busy` from the core. Run `test_exit_transition_*` before proceeding.
+```python
+@dataclass(frozen=True)
+class BridgeStatus:
+    state: BridgeState
+    generation: int
+    scheduled_ticks: tuple[int, ...]
+    staged_first_tick: int | None
+    staged_count: int
+    committed_ticks: tuple[int, ...]
+    deadline: float | None
+    logical_request_active: bool
+
+
+@dataclass
+class BridgeMetrics:
+    discarded_old_generation_results: int = 0
+    discarded_late_results: int = 0
+    fault_transitions: int = 0
+    requests_submitted: int = 0
+    results_accepted: int = 0
+    first_fault_at: float | None = None
+
+
+@dataclass(frozen=True)
+class TickResult:
+    tick: int
+    goal: Goal | None
+    psi0_action: np.ndarray | None
+    source_tick: int | None
+    source_kind: str
+
+
+class Psi0SimpleBridge:
+    def __init__(
+        self, contract, joints, inference, clock, *, start_tick=0,
+        consume_goal=None,
+    ):
+        self.contract = contract
+        self.joints = joints
+        self.inference = inference
+        self.clock = clock
+        self._consume_goal = consume_goal or (lambda goal: True)
+        self._lock = threading.RLock()
+        self._epoch = clock() - start_tick / contract.action_frequency_hz
+        self.state = BridgeState.PAUSED
+        self.generation = 0
+        self.tick_index = start_tick
+        self.session_id = uuid.uuid4().hex
+        self.request_seq = 0
+        self._request = None
+        self._handoff_tick = None
+        self._next_request_tick = None
+        self._scheduled_actions = {}
+        self._frozen_ticks = set()
+        self._staged_first_tick = None
+        self._staged_actions = None
+        self.command_history_rpyh = np.array(
+            [0.0, 0.0, 0.0, 0.74], dtype=np.float32
+        )
+        self.command_history_tick = start_tick - 1
+        self._latest_camera = None
+        self._latest_input_error = "no valid state"
+        self.last_valid_state = None
+        self.last_safe_goal = None
+        self._last_safe_action = None
+        self._hold_consumed = False
+        self.fault_reason = None
+        self.metrics = BridgeMetrics()
+
+    def _scheduled_time(self, tick):
+        return self._epoch + tick / self.contract.action_frequency_hz
+
+    def status(self):
+        with self._lock:
+            committed = ()
+            deadline = None
+            if self._request is not None:
+                committed = self._request.committed_global_ticks
+                deadline = self._request.deadline_at
+            return BridgeStatus(
+                state=self.state,
+                generation=self.generation,
+                scheduled_ticks=tuple(sorted(self._scheduled_actions)),
+                staged_first_tick=self._staged_first_tick,
+                staged_count=(
+                    0 if self._staged_actions is None else len(self._staged_actions)
+                ),
+                committed_ticks=committed,
+                deadline=deadline,
+                logical_request_active=self._request is not None,
+            )
+
+    def _clear_policy_locked(self):
+        self._request = None
+        self._handoff_tick = None
+        self._next_request_tick = None
+        self._scheduled_actions.clear()
+        self._frozen_ticks.clear()
+        self._staged_first_tick = None
+        self._staged_actions = None
+
+    def _transition_out_locked(self, state, reason=None):
+        if self.state is BridgeState.STOPPED:
+            return
+        if state is BridgeState.FAULT and self.state is BridgeState.FAULT:
+            return
+        self.generation += 1
+        self._clear_policy_locked()
+        self.state = state
+        self.fault_reason = reason if state is BridgeState.FAULT else None
+        if state is BridgeState.FAULT:
+            self.metrics.fault_transitions += 1
+            if self.metrics.first_fault_at is None:
+                self.metrics.first_fault_at = self.clock()
+
+    def pause(self):
+        with self._lock:
+            self._transition_out_locked(BridgeState.PAUSED)
+
+    def enter_fault(self, reason):
+        with self._lock:
+            self._transition_out_locked(BridgeState.FAULT, str(reason))
+
+    def stop(self):
+        with self._lock:
+            self._transition_out_locked(BridgeState.STOPPED)
+```
+
+Import `threading` and `uuid` at module scope. Never mutate `InferencePort.busy` from the core. Run `test_exit_transition_*` before proceeding.
+
+- [ ] Add immutable status/result types and mutable counters; run import tests.
+- [ ] Add constructor/epoch initialization; run the paused-state assertion.
+- [ ] Add `status()` and `_clear_policy_locked()`; run buffer snapshot assertions.
+- [ ] Add the three public exit transitions; run only `test_exit_transition_*`.
 
 - [ ] **Step 8: Implement paused holds, R0 activation, and physical-busy rearm**
 
-Implement `activate()` to require PAUSED, fresh synchronized inputs, idle worker, and one successfully published bounded hold. At `r0`, schedule exactly `d` copies of the inverse 36-D hold, submit reset R0, and set handoff `r0+d` and next request `r0+s`.
+Add these methods to the class. This fixes R0's observation tick, first-action tick, exact committed hold prefix, and deadline without a separate reset schema:
 
-Implement `handle_toggle()` for PAUSED/ACTIVE/FAULT and run the startup/rearm tests. Do not implement successor scheduling in this checkbox.
+```python
+    def update_inputs(self, state, camera):
+        with self._lock:
+            accepted, reason = accept_measured_state(
+                self.last_valid_state, state, self.joints, self.clock()
+            )
+            self.last_valid_state = accepted
+            self._latest_input_error = reason
+            if (
+                type(camera) is not TimedCameraFrame
+                or type(camera.image) is not np.ndarray
+                or camera.image.ndim != 3
+                or camera.image.shape[2] != 3
+                or camera.image.dtype != np.uint8
+            ):
+                self._latest_camera = None
+                self._latest_input_error = "camera shape/dtype"
+            else:
+                self._latest_camera = camera
+
+    def _snapshot_locked(self):
+        if self._latest_input_error is not None:
+            raise ValueError(self._latest_input_error)
+        return validate_synchronized_snapshot(
+            self.last_valid_state, self._latest_camera, self.clock()
+        )
+
+    def _make_request_locked(self, tick, committed, reset):
+        snapshot = self._snapshot_locked()
+        committed = np.asarray(committed, np.float32).copy()
+        if committed.shape != (self.contract.rtc_delay_steps, 36):
+            raise ValueError("committed prefix must have exact (d,36) shape")
+        request = RtcRequest(
+            generation=self.generation,
+            session_id=self.session_id,
+            request_seq=self.request_seq,
+            observation_tick=tick,
+            history_tick=tick - 1,
+            observation=build_psi0_observation(
+                snapshot.state.q, self.joints.joint_names,
+                self.command_history_rpyh,
+            ).copy(),
+            image=np.ascontiguousarray(snapshot.camera.image).copy(),
+            committed_actions=committed,
+            reset=reset,
+            deadline_at=self._scheduled_time(tick + self.contract.rtc_delay_steps),
+        )
+        self.inference.submit(request)
+        self._request = request
+        self._handoff_tick = request.first_action_tick
+        self.request_seq += 1
+        self.metrics.requests_submitted += 1
+        return request
+
+    def _consume_locked(self, tick, action, source_kind, source_tick):
+        action = np.asarray(action, np.float32).copy()
+        goal = map_psi0_action_to_goal(
+            action, self.joints.upper_body_joint_names, self.clock()
+        )
+        if self._consume_goal(goal) is not True:
+            self._transition_out_locked(BridgeState.FAULT, "command sink rejected")
+            return TickResult(tick, None, None, None, "none")
+        self.last_safe_goal = goal
+        self._last_safe_action = action
+        self.command_history_rpyh = action[[28, 29, 30, 31]].copy()
+        self.command_history_tick = tick
+        if source_kind == "hold":
+            self._hold_consumed = True
+        return TickResult(tick, goal, action, source_tick, source_kind)
+
+    def _hold_tick_locked(self, tick):
+        hold = build_bounded_hold(
+            self.clock(), self.last_valid_state, self.last_safe_goal, self.joints
+        )
+        if hold is None:
+            return TickResult(tick, None, None, None, "none")
+        return self._consume_locked(tick, hold.psi0_action, "hold", None)
+
+    def activate(self):
+        with self._lock:
+            if self.state not in (BridgeState.PAUSED, BridgeState.FAULT):
+                raise RuntimeError("bridge is not paused or faulted")
+            if not self._hold_consumed:
+                raise RuntimeError("one consumed paused hold is required")
+            self._snapshot_locked()
+            if self.inference.busy:
+                raise RuntimeError("physical worker busy")
+            if self._last_safe_action is None:
+                raise RuntimeError("no bounded hold action")
+            self._clear_policy_locked()
+            self.session_id = uuid.uuid4().hex
+            self.request_seq = 0
+            self.fault_reason = None
+            self.state = BridgeState.ACTIVE
+            r0 = self.tick_index
+            d = self.contract.rtc_delay_steps
+            committed = np.repeat(self._last_safe_action[None], d, axis=0)
+            for offset, action in enumerate(committed):
+                tick = r0 + offset
+                self._scheduled_actions[tick] = action.copy()
+                self._frozen_ticks.add(tick)
+            try:
+                self._make_request_locked(r0, committed, reset=True)
+            except Exception as error:
+                self._transition_out_locked(BridgeState.FAULT, str(error))
+                raise
+            self._next_request_tick = r0 + self.contract.execution_horizon
+
+    def handle_toggle(self):
+        with self._lock:
+            state = self.state
+        if state is BridgeState.ACTIVE:
+            self.pause()
+        elif state in (BridgeState.PAUSED, BridgeState.FAULT):
+            self.activate()
+        else:
+            raise RuntimeError("stopped bridge cannot be toggled")
+```
+
+Run the startup/rearm tests. Do not add successor scheduling in this checkbox.
+
+- [ ] Add input acceptance and synchronized snapshot retrieval.
+- [ ] Add exact request construction/deadline calculation with an injected recorder.
+- [ ] Add consumed hold/history ownership and run startup-hold tests.
+- [ ] Add R0 activation/toggle branches and run physical-busy rearm tests.
 
 - [ ] **Step 9: Implement tick order, successor scheduling, and history ownership**
 
-Implement `tick()` in the approved order:
+Add the following complete transition methods. No request appends behind a remaining queue: each accepted suffix is installed by global tick, and every successor observes the state at its own `r` while committing the already scheduled `r:r+d` prefix.
 
-1. validate latest inputs and drain at most one completed result;
-2. reject stale generation, bad metadata, bad suffix, or completion after the monotonic deadline corresponding to `r+d`;
-3. at a response handoff, install exactly `s` suffix actions starting at `r+d`;
-4. at `next_request_tick`, precompute and freeze final post-slew commands for ticks `r:r+d`, submit them with observation/history from `r-1`, then increment next request tick by `s`;
-5. select the scheduled action for the current tick, or atomically enter FAULT if the required suffix is absent;
-6. validate/map/slew/publish or shadow-preview the command;
-7. only after successful publication/preview consumption, update `last_safe_goal` and `[roll,pitch,yaw,height]` history.
+```python
+    def _drain_result_locked(self):
+        result = self.inference.poll()
+        if result is None:
+            return
+        if result.generation != self.generation:
+            self.metrics.discarded_old_generation_results += 1
+            return
+        request = self._request
+        if request is None or result.request_seq != request.request_seq:
+            self._transition_out_locked(BridgeState.FAULT, "unexpected RTC result")
+            return
+        if result.error is not None:
+            self._transition_out_locked(BridgeState.FAULT, result.error)
+            return
+        try:
+            actions = validate_rtc_result(
+                request, result, self.contract, self.joints
+            )
+        except ValueError as error:
+            if "deadline" in str(error):
+                self.metrics.discarded_late_results += 1
+            self._transition_out_locked(BridgeState.FAULT, str(error))
+            return
+        self._staged_first_tick = request.first_action_tick
+        self._staged_actions = np.asarray(actions, np.float32).copy()
+        self._request = None
+        self.metrics.results_accepted += 1
 
-Return immutable `TickResult` after each consumed command and advance history only there. Run the P=8/s=5/d=3 sentinel, then the remaining lifecycle tests.
+    def _install_staged_locked(self, tick):
+        if self._staged_first_tick != tick or self._staged_actions is None:
+            self._transition_out_locked(BridgeState.FAULT, "RTC handoff underrun")
+            return False
+        for offset, action in enumerate(self._staged_actions):
+            global_tick = tick + offset
+            self._scheduled_actions[global_tick] = action.copy()
+            self._frozen_ticks.discard(global_tick)
+        self._staged_first_tick = None
+        self._staged_actions = None
+        self._handoff_tick = None
+        return True
+
+    def _freeze_successor_prefix_locked(self, request_tick):
+        previous = self._last_safe_action
+        if previous is None or self.command_history_tick != request_tick - 1:
+            raise ValueError("command history does not end at r-1")
+        committed = []
+        for tick in range(
+            request_tick, request_tick + self.contract.rtc_delay_steps
+        ):
+            requested = self._scheduled_actions.get(tick)
+            if requested is None:
+                raise ValueError(f"missing committed action at tick {tick}")
+            limited = apply_slew_limit(previous, requested, self.joints, dt=0.02)
+            self._scheduled_actions[tick] = limited.copy()
+            self._frozen_ticks.add(tick)
+            committed.append(limited.copy())
+            previous = limited
+        return np.stack(committed)
+
+    def _active_tick_locked(self, tick):
+        try:
+            self._snapshot_locked()
+        except ValueError as error:
+            self._transition_out_locked(BridgeState.FAULT, str(error))
+            return self._hold_tick_locked(tick)
+
+        self._drain_result_locked()
+        if self.state is not BridgeState.ACTIVE:
+            return self._hold_tick_locked(tick)
+
+        if self._handoff_tick == tick:
+            if not self._install_staged_locked(tick):
+                return self._hold_tick_locked(tick)
+
+        if self._next_request_tick == tick:
+            if self.inference.busy or self._request is not None:
+                self._transition_out_locked(
+                    BridgeState.FAULT, "physical worker busy at successor"
+                )
+                return self._hold_tick_locked(tick)
+            try:
+                committed = self._freeze_successor_prefix_locked(tick)
+                self._make_request_locked(tick, committed, reset=False)
+            except Exception as error:
+                self._transition_out_locked(BridgeState.FAULT, str(error))
+                return self._hold_tick_locked(tick)
+            self._next_request_tick = tick + self.contract.execution_horizon
+
+        requested = self._scheduled_actions.pop(tick, None)
+        if requested is None:
+            self._transition_out_locked(BridgeState.FAULT, "scheduled action underrun")
+            return self._hold_tick_locked(tick)
+        if tick in self._frozen_ticks:
+            action = requested
+            self._frozen_ticks.remove(tick)
+        else:
+            action = apply_slew_limit(
+                self._last_safe_action, requested, self.joints, dt=0.02
+            )
+        return self._consume_locked(tick, action, "policy", tick)
+
+    def tick(self):
+        with self._lock:
+            tick = self.tick_index
+            if self.state is BridgeState.STOPPED:
+                return TickResult(tick, None, None, None, "none")
+            if self.state is BridgeState.ACTIVE:
+                result = self._active_tick_locked(tick)
+            else:
+                self._drain_result_locked()
+                result = self._hold_tick_locked(tick)
+            self.tick_index += 1
+            return result
+
+    def build_bounded_shutdown_hold(self):
+        with self._lock:
+            result = build_bounded_hold(
+                self.clock(), self.last_valid_state, self.last_safe_goal,
+                self.joints,
+            )
+            return None if result is None else result.goal
+```
+
+`validate_rtc_result()` returns a copied `(s,36)` array after exact metadata, whole-suffix bound, and `result.completed_at <= request.deadline_at` checks. It never installs state. Return immutable `TickResult` after each consumed command and advance history only in `_consume_locked()`. Run the P=8/s=5/d=3 sentinel, then the remaining lifecycle tests.
 
 Build `tick()` through these independently tested subactions:
 
@@ -2566,7 +3097,7 @@ from scripts.psi0_simple_real_bridge import (
     validate_connected_wbc, validate_then_create_publisher,
 )
 from simple.deploy.psi0_simple_bridge import BridgeMode, PolicyContract
-from tests.psi0_bridge_testkit import ManualClock, policy_payload, test_joint_contract
+from tests.psi0_bridge_testkit import ManualClock, make_joint_contract, policy_payload
 
 
 POLICY_WIRE_FIELDS = tuple(policy_payload())
@@ -2616,6 +3147,8 @@ def test_shadow_contract_failure_never_calls_publisher_factory():
         wbc_payload=valid_wbc_payload(),
         graph=FakeGraph(publishers=0, subscriptions=1),
         publisher_factory=lambda: calls.append("publisher"),
+        expected_model_contract=valid_model_contract(),
+        expected_gitlink_sha="1" * 40,
     )
     assert result.policy_certified is False
     assert calls == []
@@ -2647,7 +3180,7 @@ WBC_REQUIRED = {
 
 
 def valid_model_contract():
-    joints = list(test_joint_contract().joint_names)
+    joints = list(make_joint_contract().joint_names)
     return {
         "schema": "decoupled_wbc.g1-model-contract.v1",
         "git": {"commit": "1" * 40, "working_tree_clean": True},
@@ -2705,29 +3238,23 @@ def test_connected_wbc_payload_matches_every_top_level_and_model_identity():
     assert actual["model_contract_sha256"] == digest_model_contract(expected)
 
 
+def set_path(payload, path, value):
+    target = payload
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+
 @pytest.mark.parametrize(
     "path,value,error",
     [
         (("env_type",), "real", "env_type"),
         (("domain_id",), 0, "domain_id"),
-        (("model_contract_sha256",), "0" * 64, "digest"),
-        (("model_contract", "git", "commit"), "0" * 40, "git"),
-        (("model_contract", "git", "working_tree_clean"), False, "clean"),
-        (("model_contract", "robot_model", "name"), "wrong", "robot_model"),
-        (("model_contract", "robot_model", "joint_names", 0), "wrong", "joint_names"),
-        (("model_contract", "robot_model", "upper_body_joint_names", 0), "wrong", "upper_body"),
-        (("model_contract", "robot_model", "lower_position_limits", 12), -9.0, "limits"),
-        (("model_contract", "urdf", "sha256"), "0" * 64, "urdf"),
-        (("model_contract", "onnx_models", 0, "sha256"), "0" * 64, "onnx"),
-        (("model_contract", "onnx_models", 1, "input", "feature_size"), 515, "onnx"),
     ],
 )
-def test_wbc_mutation_fails_before_publisher(path, value, error):
+def test_top_level_wbc_mutation_fails_before_publisher(path, value, error):
     payload = copy.deepcopy(valid_wbc_payload())
-    target = payload
-    for key in path[:-1]:
-        target = target[key]
-    target[path[-1]] = value
+    set_path(payload, path, value)
     calls = []
     with pytest.raises(PreflightError, match=error):
         validate_then_create_publisher(
@@ -2735,6 +3262,55 @@ def test_wbc_mutation_fails_before_publisher(path, value, error):
             publisher_factory=lambda: calls.append("publisher"),
         )
     assert calls == []
+
+
+def test_stale_transmitted_model_digest_fails_before_field_comparison():
+    payload = copy.deepcopy(valid_wbc_payload())
+    set_path(payload, ("model_contract", "robot_model", "name"), "wrong")
+    calls = []
+    with pytest.raises(PreflightError, match="digest"):
+        validate_then_create_publisher(
+            payload, valid_model_contract(), "1" * 40, 42,
+            publisher_factory=lambda: calls.append("publisher"),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "path,value,error",
+    [
+        (("git", "commit"), "0" * 40, "git"),
+        (("git", "working_tree_clean"), False, "clean"),
+        (("robot_model", "name"), "wrong", "robot_model"),
+        (("robot_model", "joint_names", 0), "wrong", "joint_names"),
+        (("robot_model", "upper_body_joint_names", 0), "wrong", "upper_body"),
+        (("robot_model", "lower_position_limits", 12), -9.0, "limits"),
+        (("urdf", "sha256"), "0" * 64, "urdf"),
+        (("onnx_models", 0, "sha256"), "0" * 64, "onnx"),
+        (("onnx_models", 1, "input", "feature_size"), 515, "onnx"),
+    ],
+)
+def test_recomputed_digest_still_reports_model_field_mismatch(path, value, error):
+    payload = copy.deepcopy(valid_wbc_payload())
+    set_path(payload["model_contract"], path, value)
+    payload["model_contract_sha256"] = digest_model_contract(payload["model_contract"])
+    calls = []
+    with pytest.raises(PreflightError, match=error):
+        validate_then_create_publisher(
+            payload, valid_model_contract(), "1" * 40, 42,
+            publisher_factory=lambda: calls.append("publisher"),
+        )
+    assert calls == []
+
+
+def test_transmitted_digest_value_mutation_reports_digest():
+    payload = copy.deepcopy(valid_wbc_payload())
+    payload["model_contract_sha256"] = "0" * 64
+    with pytest.raises(PreflightError, match="digest"):
+        validate_then_create_publisher(
+            payload, valid_model_contract(), "1" * 40, 42,
+            publisher_factory=lambda: None,
+        )
 
 
 def test_wbc_service_timeout_is_three_seconds_and_destroys_resources():
@@ -2893,11 +3469,131 @@ Validate `BridgeMode(args.mode)` and ensure no parser branch accepts `real`, `re
 
 - [ ] **Step 6: Implement strict local/server policy comparison**
 
-Implement `compare_policy_contracts()` and run only the Step 1 mutation matrix. Keep shadow's mismatches sorted in policy wire-field order; never use arbitrary set order.
+Implement this exact wire-order comparison and run only the Step 1 mutation matrix:
+
+```python
+POLICY_FIELD_MAP = (
+    ("schema", "schema"), ("test_only", "test_only"),
+    ("checkpoint_sha256", "checkpoint_sha256"),
+    ("dataset_manifest_sha256", "dataset_manifest_sha256"),
+    ("raw_episode_sha256", "raw_episode_sha256"),
+    ("processed_episode_sha256", "processed_episode_sha256"),
+    ("source_episode_index", "source_episode_index"),
+    ("processed_episode_index", "processed_episode_index"),
+    ("converter_commit", "converter_commit"),
+    ("server_commit", "server_commit"),
+    ("converter_layout", "converter_layout"),
+    ("observation_dim", "observation_dim"),
+    ("action_dim", "action_dim"),
+    ("action_frequency_hz", "action_frequency_hz"),
+    ("prediction_horizon", "prediction_horizon"),
+    ("execution_horizon", "execution_horizon"),
+    ("rtc_delay_steps", "rtc_delay_steps"),
+    ("rtc_training_max_delay", "rtc_training_max_delay"),
+    ("rtc_enabled", "rtc_enabled"), ("rtc_endpoint", "endpoint"),
+    ("request_semantics", "request_semantics"),
+    ("response_semantics", "response_semantics"),
+    ("image_key", "image_key"),
+    ("camera_color_order", "camera_color_order"),
+)
+
+
+@dataclass(frozen=True)
+class PolicyPreflightResult:
+    policy_certified: bool
+    mismatched_fields: tuple[str, ...]
+
+
+def compare_policy_contracts(local, server, mode, wbc_env_type):
+    mismatches = tuple(
+        wire_name for wire_name, attribute in POLICY_FIELD_MAP
+        if getattr(local, attribute) != getattr(server, attribute)
+    )
+    if (local.test_only or server.test_only) and wbc_env_type != "sim":
+        raise PreflightError("test-only policy contract requires sim WBC")
+    if mismatches and mode is not BridgeMode.SHADOW:
+        raise PreflightError(
+            "policy contract mismatch: " + ",".join(mismatches)
+        )
+    return PolicyPreflightResult(not mismatches, mismatches)
+```
+
+The tuple is the canonical wire order; never use set iteration for error order.
 
 - [ ] **Step 7: Implement the bounded WBC config client and connected-model validator**
 
-Implement `BoundedWbcConfigClient`, local expected-contract construction, root-gitlink lookup, digest recomputation, and exact full comparison. `get_config(timeout_s=3.0)` owns a temporary rclpy node/client, loops `wait_for_service()` in at most 50 ms intervals until the monotonic deadline, waits for the async result only within the remaining budget, and destroys client/node in `finally`. Read the expected nested SHA with:
+Implement `BoundedWbcConfigClient`, local expected-contract construction, root-gitlink lookup, digest recomputation, and exact full comparison. Use this complete deadline wrapper; the injectable form is what the Step 2 timeout test invokes:
+
+```python
+class BoundedWbcConfigClient:
+    def __init__(self, *, clock, wait_once, request_once=None, destroy):
+        self._clock = clock
+        self._wait_once = wait_once
+        self._request_once = request_once or (
+            lambda timeout: (_ for _ in ()).throw(RuntimeError("no requester"))
+        )
+        self._destroy = destroy
+
+    def get_config(self, timeout_s=3.0):
+        deadline = self._clock() + timeout_s
+        try:
+            while True:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise TimeoutError(f"WBC config service timed out after {timeout_s:.1f}s")
+                if self._wait_once(min(0.05, remaining)):
+                    break
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise TimeoutError(f"WBC config service timed out after {timeout_s:.1f}s")
+            payload = self._request_once(remaining)
+            if type(payload) is not dict:
+                raise PreflightError("WBC config response must be a dictionary")
+            return payload
+        finally:
+            self._destroy()
+
+
+def create_ros_wbc_config_client(service_name, domain_id):
+    if os.environ.get("ROS_DOMAIN_ID") != str(domain_id):
+        raise PreflightError("ROS_DOMAIN_ID does not match requested domain")
+    context = rclpy.context.Context()
+    context.init()
+    node = rclpy.create_node("psi0_wbc_preflight", context=context)
+    executor = SingleThreadedExecutor(context=context)
+    executor.add_node(node)
+    client = node.create_client(Trigger, service_name)
+
+    def request_once(timeout_s):
+        future = client.call_async(Trigger.Request())
+        executor.spin_until_future_complete(future, timeout_sec=timeout_s)
+        if not future.done() or future.result() is None:
+            raise TimeoutError("WBC config response timed out")
+        response = future.result()
+        if not response.success:
+            raise PreflightError(f"WBC config service failed: {response.message}")
+        packed = base64.b64decode(response.message.encode("ascii"), validate=True)
+        payload = msgpack.unpackb(packed, object_hook=mnp.decode, raw=False)
+        if type(payload) is not dict:
+            raise PreflightError("WBC config response must be a dictionary")
+        return payload
+
+    def destroy():
+        executor.remove_node(node)
+        node.destroy_client(client)
+        node.destroy_node()
+        executor.shutdown()
+        context.shutdown()
+
+    return BoundedWbcConfigClient(
+        clock=time.monotonic,
+        wait_once=lambda seconds: client.wait_for_service(timeout_sec=seconds),
+        request_once=request_once,
+        destroy=destroy,
+    )
+```
+
+The temporary client uses its own rclpy context, so its unconditional `context.shutdown()` cannot stop the runtime context created later. Read the expected nested SHA with:
 
 ```python
 subprocess.run(
@@ -2907,6 +3603,97 @@ subprocess.run(
     capture_output=True,
     text=True,
 )
+```
+
+Use this exact digest-first validator; nested field tests recompute the digest specifically to reach `_first_difference()`:
+
+```python
+@dataclass(frozen=True)
+class ValidatedWbc:
+    joint_contract: JointContract
+
+
+EXPECTED_WBC_FIELDS = {
+    "env_type": "sim",
+    "interface": "lo",
+    "simulator": "mujoco",
+    "messaging_backend": "ros2",
+    "control_frequency": 50,
+    "enable_waist": True,
+    "with_hands": True,
+    "wbc_version": "gear_wbc",
+    "wbc_policy_class": "G1DecoupledWholeBodyPolicy",
+    "wbc_model_path": (
+        "policy/GR00T-WholeBodyControl-Balance.onnx,"
+        "policy/GR00T-WholeBodyControl-Walk.onnx"
+    ),
+}
+
+
+def _first_difference(actual, expected, path="model_contract"):
+    if type(actual) is not type(expected):
+        return f"{path} type"
+    if isinstance(expected, dict):
+        if set(actual) != set(expected):
+            return f"{path} keys"
+        for key in expected:
+            difference = _first_difference(
+                actual[key], expected[key], f"{path}.{key}"
+            )
+            if difference is not None:
+                return difference
+        return None
+    if isinstance(expected, list):
+        if len(actual) != len(expected):
+            return f"{path} length"
+        for index, expected_value in enumerate(expected):
+            difference = _first_difference(
+                actual[index], expected_value, f"{path}[{index}]"
+            )
+            if difference is not None:
+                return difference
+        return None
+    return None if actual == expected else path
+
+
+def validate_connected_wbc(
+    *, actual, expected_contract, expected_gitlink_sha, required_domain_id,
+):
+    if type(actual) is not dict:
+        raise PreflightError("WBC payload must be a dictionary")
+    contract = actual.get("model_contract")
+    transmitted = actual.get("model_contract_sha256")
+    if type(contract) is not dict or type(transmitted) is not str:
+        raise PreflightError("model contract digest fields are missing")
+    try:
+        recomputed = digest_model_contract(contract)
+    except (TypeError, ValueError) as error:
+        raise PreflightError(f"model contract digest input: {error}") from error
+    if transmitted != recomputed:
+        raise PreflightError("model contract digest mismatch")
+
+    required = {**EXPECTED_WBC_FIELDS, "domain_id": required_domain_id}
+    for key, expected in required.items():
+        if key not in actual or type(actual[key]) is not type(expected):
+            raise PreflightError(f"WBC field {key} missing or wrong type")
+        if actual[key] != expected:
+            raise PreflightError(f"WBC field {key} mismatch")
+    if contract.get("git", {}).get("commit") != expected_gitlink_sha:
+        raise PreflightError("model_contract.git.commit differs from root gitlink")
+    difference = _first_difference(contract, expected_contract)
+    if difference is not None:
+        raise PreflightError(f"connected WBC {difference} mismatch")
+
+    model = contract["robot_model"]
+    names = tuple(model["joint_names"])
+    upper = tuple(model["upper_body_joint_names"])
+    lower = np.asarray(model["lower_position_limits"], np.float32)
+    high = np.asarray(model["upper_position_limits"], np.float32)
+    if len(names) != 43 or len(set(names)) != 43 or len(upper) != 31:
+        raise PreflightError("connected WBC joint_names/upper_body dimensions")
+    if lower.shape != (43,) or high.shape != (43,) or not np.all(lower < high):
+        raise PreflightError("connected WBC effective limits")
+    return ValidatedWbc(JointContract(names, upper, lower, high))
 ```
 
 Run the Step 2 tests before adding publishers or camera code.
@@ -2920,7 +3707,95 @@ Complete in this order:
 
 - [ ] **Step 8: Implement graph ownership and the goal publisher adapter**
 
-Implement `establish_goal_ownership()`, `RosGoalPublisher`, and only the five approved `Goal` fields. Run the graph tests and prove rejected preflight never invokes the publisher factory.
+Add these exact ROS runtime/publisher boundaries. They use native `ByteMultiArray` plus the repository's `msgpack_numpy` wire format, but do not use its global `ROSManager`, which cannot provide isolated ownership or bounded destruction:
+
+```python
+class RosRuntime:
+    def __init__(self, domain_id):
+        if os.environ.get("ROS_DOMAIN_ID") != str(domain_id):
+            raise PreflightError("ROS_DOMAIN_ID does not match requested domain")
+        self.context = rclpy.context.Context()
+        self.context.init()
+        self.node = rclpy.create_node("psi0_simple_bridge", context=self.context)
+        self.executor = SingleThreadedExecutor(context=self.context)
+        self.executor.add_node(self.node)
+        self.thread = threading.Thread(
+            target=self.executor.spin, name="psi0-ros-executor", daemon=True
+        )
+        self.thread.start()
+
+    def counts(self, topic):
+        return self.node.count_publishers(topic), self.node.count_subscribers(topic)
+
+    def close(self):
+        self.executor.shutdown(timeout_sec=0.5)
+        self.thread.join(0.5)
+        self.node.destroy_node()
+        self.context.shutdown()
+        if self.thread.is_alive():
+            raise RuntimeError("ROS executor did not stop within 0.5s")
+
+
+class RosGoalPublisher:
+    def __init__(self, runtime, topic):
+        self._runtime = runtime
+        self._publisher = runtime.node.create_publisher(ByteMultiArray, topic, 1)
+        self.closed = False
+        self.publish_attempts = 0
+
+    def publish(self, goal):
+        if self.closed:
+            raise RuntimeError("goal publisher is closed")
+        payload = {
+            "target_upper_body_pose": goal.target_upper_body_pose.copy(),
+            "base_height_command": goal.base_height_command.copy(),
+            "navigate_cmd": goal.navigate_cmd.copy(),
+            "timestamp": float(goal.timestamp),
+            "target_time": float(goal.target_time),
+        }
+        if set(payload) != {
+            "target_upper_body_pose", "base_height_command", "navigate_cmd",
+            "timestamp", "target_time",
+        }:
+            raise AssertionError("goal payload key drift")
+        packed = msgpack.packb(payload, default=mnp.encode, use_bin_type=True)
+        message = ByteMultiArray()
+        message.data = list(packed)
+        self.publish_attempts += 1
+        self._publisher.publish(message)
+        return True
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self._runtime.node.destroy_publisher(self._publisher)
+
+
+def establish_goal_ownership(mode, graph, publisher_factory):
+    if mode is BridgeMode.SHADOW:
+        return None
+    before = graph.counts(CONTROL_GOAL_TOPIC)
+    if before != (0, 1):
+        raise PreflightError(
+            f"expected 0 publishers/1 subscription before bridge, got {before}"
+        )
+    publisher = publisher_factory()
+    after = graph.counts(CONTROL_GOAL_TOPIC)
+    if after != (1, 1):
+        close = getattr(publisher, "close", None)
+        if close is not None:
+            close()
+        raise PreflightError(
+            f"expected 1 publisher/1 subscription after bridge, got {after}"
+        )
+    return publisher
+```
+
+Run the graph tests and prove rejected preflight never invokes the publisher factory.
+
+- [ ] Add the isolated ROS context/executor and a close-only lifecycle test.
+- [ ] Add exact five-field goal serialization with a fake rclpy publisher.
+- [ ] Add before/after graph count enforcement and run all ownership cases.
 
 - [ ] **Step 9: Implement state and camera adapters with bounded close**
 
@@ -2929,13 +3804,183 @@ Create concrete `RosStateSource` and `ComposedCameraReader` classes in the scrip
 ```python
 @dataclass(frozen=True)
 class RuntimeAdapters:
-    wbc_config_client: BoundedWbcConfigClient
     state_source: RosStateSource
     camera_reader: ComposedCameraReader
     goal_publisher: RosGoalPublisher | None
+    ros_runtime: RosRuntime | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeDependencyFactories:
+    state_source: Callable[[], object]
+    camera_reader: Callable[[], object]
+    graph: Callable[[], object]
+
+
+def build_runtime_adapters(
+    *, mode, publisher_factory, test_dependencies,
+):
+    graph = test_dependencies.graph()
+    publisher = establish_goal_ownership(mode, graph, publisher_factory)
+    state_source = None
+    camera_reader = None
+    try:
+        state_source = test_dependencies.state_source()
+        camera_reader = test_dependencies.camera_reader()
+        return RuntimeAdapters(state_source, camera_reader, publisher)
+    except Exception:
+        for adapter in (camera_reader, state_source, publisher):
+            close = getattr(adapter, "close", None)
+            if close is not None:
+                close()
+        raise
 ```
 
-`RosStateSource.poll()` returns `TimedRobotState | None`; every adapter exposes `close()`. The camera socket is created, polled with 100 ms timeout, decoded, and closed only inside its reader thread; `ComposedCameraReader.close(timeout_s=0.5)` signals and joins that thread. Run the camera tests after this checkbox.
+Production creates one `RosRuntime`, then passes factories closing over it; after construction, replace the returned value with `dataclasses.replace(adapters, ros_runtime=runtime)`. `RuntimeAdapters.close()` is not added: the shutdown coordinator owns and closes each field once in its defined order.
+
+`RosStateSource.poll()` returns `TimedRobotState | None`. Add this complete implementation, including the callback-time receive timestamp rather than a poll-time timestamp:
+
+```python
+def unpack_dict_message(message):
+    packed = bytes(message.data)
+    payload = msgpack.unpackb(packed, object_hook=mnp.decode, raw=False)
+    if type(payload) is not dict:
+        raise ValueError("ROS state payload must be a dictionary")
+    return payload
+
+
+class RosStateSource:
+    def __init__(self, runtime, topic, clock=time.monotonic):
+        self._runtime = runtime
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._latest = None
+        self._error = None
+        self._subscription = runtime.node.create_subscription(
+            ByteMultiArray, topic, self._callback, 1
+        )
+
+    def _callback(self, message):
+        try:
+            payload = unpack_dict_message(message)
+            q = np.asarray(payload["q"], np.float32)
+            sample = TimedRobotState(q.copy(), self._clock())
+            error = None
+        except Exception as caught:
+            sample = None
+            error = f"state decode: {caught}"
+        with self._lock:
+            self._latest = sample
+            self._error = error
+
+    def poll(self):
+        with self._lock:
+            if self._error is not None:
+                raise ValueError(self._error)
+            sample, self._latest = self._latest, None
+            return sample
+
+    def close(self):
+        self._runtime.node.destroy_subscription(self._subscription)
+
+
+def decode_camera_message(serialized, *, key, color_order, received_at):
+    schema = ImageMessageSchema.deserialize(serialized)
+    if key not in schema.images or key not in schema.timestamps:
+        raise KeyError(key)
+    image = np.asarray(schema.images[key])
+    if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
+        raise ValueError("camera image must be HxWx3 uint8")
+    if color_order == "bgr":
+        image = image[..., ::-1]
+    elif color_order != "rgb":
+        raise ValueError("camera color order must be rgb or bgr")
+    return TimedCameraFrame(
+        np.ascontiguousarray(image), float(received_at),
+        float(schema.timestamps[key]),
+    )
+
+
+class ComposedCameraReader:
+    def __init__(self, host, port, key, color_order, clock=time.monotonic):
+        if host in {"0.0.0.0", "*"}:
+            raise ValueError("camera client requires a concrete host")
+        self._endpoint = f"tcp://{host}:{port}"
+        self._key = key
+        self._color_order = color_order
+        self._clock = clock
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._condition = threading.Condition()
+        self._latest = None
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._run, name="psi0-camera-reader", daemon=True
+        )
+        self._thread.start()
+        if not self._ready.wait(0.5):
+            raise TimeoutError("camera reader did not initialize")
+
+    def _run(self):
+        context = zmq.Context()
+        socket = context.socket(zmq.SUB)
+        try:
+            socket.setsockopt(zmq.SUBSCRIBE, b"")
+            socket.setsockopt(zmq.CONFLATE, 1)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.connect(self._endpoint)
+            poller = zmq.Poller()
+            poller.register(socket, zmq.POLLIN)
+            self._ready.set()
+            while not self._stop.is_set():
+                if socket not in dict(poller.poll(100)):
+                    continue
+                packed = socket.recv(zmq.NOBLOCK)
+                serialized = msgpack.unpackb(packed, object_hook=mnp.decode, raw=False)
+                frame = decode_camera_message(
+                    serialized, key=self._key, color_order=self._color_order,
+                    received_at=self._clock(),
+                )
+                with self._condition:
+                    self._latest = frame
+                    self._condition.notify_all()
+        except Exception as caught:
+            with self._condition:
+                self._error = caught
+                self._condition.notify_all()
+        finally:
+            socket.close(linger=0)
+            context.term()
+            self._ready.set()
+
+    def poll(self):
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError(f"camera reader failed: {self._error}")
+            frame, self._latest = self._latest, None
+            return frame
+
+    def wait_for_frame(self, timeout_s):
+        deadline = self._clock() + timeout_s
+        with self._condition:
+            while self._latest is None and self._error is None:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise TimeoutError("camera frame timed out")
+                self._condition.wait(remaining)
+            if self._error is not None:
+                raise RuntimeError(f"camera reader failed: {self._error}")
+            frame, self._latest = self._latest, None
+            return frame
+
+    def close(self, timeout_s=0.5):
+        self._stop.set()
+        self._thread.join(timeout_s)
+        if self._thread.is_alive():
+            raise RuntimeError("camera reader did not stop within timeout")
+```
+
+The ZMQ socket/context are created, used, and closed only in `_run()`. Every adapter exposes `close()`. Run the camera tests after this checkbox.
 
 Complete in four bounded subactions:
 
@@ -2946,7 +3991,49 @@ Complete in four bounded subactions:
 
 - [ ] **Step 10: Implement preflight sequencing before publisher construction**
 
-`run_bridge()` must perform, in order: parse/validate mode; WBC bounded query; connected/local model digest comparison; local/server policy contract comparison; ROS graph ownership check; then publisher construction only for `sim-control`. Shadow never calls the publisher factory. Record every result in metrics.
+Implement the preflight as a pure orchestrator with the exact call order below. Construction of state/camera/worker/keyboard happens only after this function returns; publisher construction appears exactly once and last:
+
+```python
+@dataclass(frozen=True)
+class PreflightResult:
+    policy_certified: bool
+    policy_mismatched_fields: tuple[str, ...]
+    joint_contract: JointContract
+    publisher: object | None
+
+
+def run_preflight(
+    *, mode, local_policy, server_policy, wbc_payload, graph,
+    publisher_factory, expected_model_contract,
+    expected_gitlink_sha, required_domain_id=42,
+):
+    mode = BridgeMode(mode)
+    local = PolicyContract.from_dict(local_policy)
+    validated_wbc = validate_connected_wbc(
+        actual=wbc_payload,
+        expected_contract=expected_model_contract,
+        expected_gitlink_sha=expected_gitlink_sha,
+        required_domain_id=required_domain_id,
+    )
+    try:
+        server = PolicyContract.from_dict(server_policy)
+        policy_result = compare_policy_contracts(
+            local, server, mode, wbc_payload.get("env_type")
+        )
+    except (TypeError, ValueError, PreflightError) as error:
+        if mode is not BridgeMode.SHADOW:
+            raise
+        policy_result = PolicyPreflightResult(False, (str(error),))
+    publisher = establish_goal_ownership(mode, graph, publisher_factory)
+    return PreflightResult(
+        policy_certified=policy_result.policy_certified,
+        policy_mismatched_fields=policy_result.mismatched_fields,
+        joint_contract=validated_wbc.joint_contract,
+        publisher=publisher,
+    )
+```
+
+The real `run_bridge()` calls: parser/mode validation; `create_ros_wbc_config_client(...).get_config(3.0)`; local contract read; HTTP server contract fetch; `run_preflight(...)`; and only then constructs runtime adapters. Record each completed phase in metrics. Shadow passes a publisher factory that raises `AssertionError` if invoked.
 
 - [ ] **Step 11: Run adapter/preflight tests and commit**
 
@@ -2987,8 +4074,8 @@ import pytest
 
 from scripts.psi0_simple_real_bridge import FiftyHzLoop, HttpInferenceWorker, LocalKeyboard
 from simple.baselines.client import RtcActionResponse
-from simple.deploy.psi0_simple_bridge import RtcRequest
-from tests.psi0_bridge_testkit import ManualClock
+from simple.deploy.psi0_simple_bridge import PolicyContract, RtcRequest
+from tests.psi0_bridge_testkit import ManualClock, policy_payload
 
 
 def valid_runtime_request(generation=1):
@@ -3002,6 +4089,7 @@ def valid_runtime_request(generation=1):
         image=np.zeros((8, 8, 3), np.uint8),
         committed_actions=np.zeros((6, 36), np.float32),
         reset=True,
+        deadline_at=106 / 50.0,
     )
 
 
@@ -3045,7 +4133,13 @@ class BlockingHttpClient:
 
 def test_one_blocked_worker_never_blocks_tick_thread_or_allows_replacement():
     client = BlockingHttpClient()
-    worker = HttpInferenceWorker(client=client, clock=ManualClock(100))
+    worker = HttpInferenceWorker(
+        client=client, clock=ManualClock(100),
+        contract=PolicyContract.from_dict(policy_payload(
+            prediction_horizon=30, execution_horizon=24,
+            rtc_delay_steps=6, rtc_training_max_delay=7,
+        )),
+    )
     thread_identity = worker.thread.ident
     worker.submit(valid_runtime_request())
     assert client.entered.wait(0.2)
@@ -3165,7 +4259,115 @@ def test_ctrl_c_with_five_second_request_publishes_exact_final_hold(tmp_path):
 
 - [ ] **Step 4: Implement the inference worker**
 
-`HttpInferenceWorker` owns one daemon thread and one `HttpActionClient(timeout=5.0)`. It has a capacity-one input slot, capacity-one result slot, a physical-busy event, and methods matching `InferencePort`. `submit()` rejects when busy. The thread calls `query_rtc_action()` with image exactly `{contract.image_key: request.image}`, state exactly `{"states": request.observation}`, the configured instruction, condition `{}`, dataset `"simple"`, `gt_action=[]`, and history containing the five successor keys plus `reset=True` only when `request.reset` is true. It timestamps completion with monotonic time and always clears physical busy in `finally`. It never retries and never starts a replacement worker. Reuse the exact Task 3 recording-session tests at this worker boundary to prove R0 carries reset and successors omit it.
+`HttpInferenceWorker` owns one daemon thread and one `HttpActionClient(timeout=5.0)`. Add this complete implementation; `contract` and `instruction` are constructor arguments in production, while the runtime unit test may inject their defaults:
+
+```python
+class HttpInferenceWorker:
+    def __init__(
+        self, *, client, clock, contract, instruction="instruction",
+    ):
+        self.client = client
+        self.clock = clock
+        self.contract = contract
+        self.instruction = instruction
+        self._input = queue.Queue(maxsize=1)
+        self._output = queue.Queue(maxsize=1)
+        self._physical_busy = threading.Event()
+        self._stopping = threading.Event()
+        self.metrics = WorkerMetrics()
+        self.thread = threading.Thread(
+            target=self._run, name="psi0-http-worker", daemon=True
+        )
+        self.thread.start()
+
+    @property
+    def busy(self):
+        return self._physical_busy.is_set()
+
+    def submit(self, request):
+        if self._stopping.is_set():
+            raise RuntimeError("inference worker is stopping")
+        if self.busy or not self._output.empty():
+            raise RuntimeError("inference worker busy")
+        self._physical_busy.set()
+        try:
+            self._input.put_nowait(request)
+        except Exception:
+            self._physical_busy.clear()
+            raise
+        self.metrics.requests_submitted += 1
+
+    def _serialize_history(self, request):
+        history = {
+            "session_id": request.session_id,
+            "request_seq": request.request_seq,
+            "observation_tick": request.observation_tick,
+            "rtc_delay_steps": self.contract.rtc_delay_steps,
+            "committed_actions": request.committed_actions.copy(),
+        }
+        if request.reset:
+            history["reset"] = True
+        return history
+
+    def _run(self):
+        while True:
+            try:
+                request = self._input.get(timeout=0.05)
+            except queue.Empty:
+                if self._stopping.is_set():
+                    return
+                continue
+            if self._stopping.is_set():
+                self._physical_busy.clear()
+                return
+            started_at = self.clock()
+            if self.metrics.first_request_started_at is None:
+                self.metrics.first_request_started_at = started_at
+            try:
+                response = self.client.query_rtc_action(
+                    {self.contract.image_key: request.image},
+                    self.instruction,
+                    {"states": request.observation},
+                    {},
+                    history=self._serialize_history(request),
+                    dataset="simple",
+                    gt_action=[],
+                )
+                result = RtcResult(
+                    generation=request.generation,
+                    request_seq=request.request_seq,
+                    completed_at=self.clock(),
+                    actions=np.asarray(response.action, np.float32).copy(),
+                    metadata=dict(response.metadata),
+                )
+            except Exception as error:
+                result = RtcResult(
+                    generation=request.generation,
+                    request_seq=request.request_seq,
+                    completed_at=self.clock(), actions=None, metadata=None,
+                    error=f"{type(error).__name__}: {error}",
+                )
+            try:
+                self._output.put_nowait(result)
+            finally:
+                self._physical_busy.clear()
+            if self._stopping.is_set():
+                return
+
+    def poll(self):
+        try:
+            return self._output.get_nowait()
+        except queue.Empty:
+            return None
+
+    def close(self, timeout_s):
+        self._stopping.set()
+        self.thread.join(timeout_s)
+        if self.thread.is_alive():
+            raise RuntimeError("inference worker failed to stop within timeout")
+```
+
+`WorkerMetrics` is a dataclass with `requests_submitted: int = 0` and `first_request_started_at: float | None = None`. Both production and tests pass the parsed contract explicitly. The worker never retries or starts a replacement thread. Reuse the exact Task 3 recording-session tests at this boundary to prove R0 carries reset and successors omit it.
 
 Implement in bounded subactions:
 
@@ -3176,7 +4378,68 @@ Implement in bounded subactions:
 
 - [ ] **Step 5: Implement local-keyboard and metrics ownership**
 
-`LocalKeyboard` owns the terminal file descriptor, saves original `termios`, enters cbreak, polls with `select`, enqueues only `p`, and restores settings in `finally`. `JsonlMetrics` writes one compact record per preflight, state transition, request, result, publish/preview, fault, and shutdown event; every record includes mode, state, generation, monotonic time, `published`, and `policy_certified`.
+Use these exact implementations:
+
+```python
+class LocalKeyboard:
+    ACCEPTED_KEYS = (b"p",)
+
+    def __init__(self, fd):
+        self.fd = fd
+        self._original = None
+
+    def __enter__(self):
+        if not os.isatty(self.fd):
+            raise RuntimeError("local keyboard requires a TTY")
+        self._original = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def poll(self, timeout_s=0.0):
+        accepted = []
+        readable, _, _ = select.select([self.fd], [], [], timeout_s)
+        while readable:
+            value = os.read(self.fd, 1)
+            if value in self.ACCEPTED_KEYS:
+                accepted.append(value.decode("ascii"))
+            readable, _, _ = select.select([self.fd], [], [], 0.0)
+        return tuple(accepted)
+
+    def close(self):
+        if self._original is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self._original)
+            self._original = None
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+
+class JsonlMetrics:
+    def __init__(self, path, *, mode, clock=time.monotonic):
+        self._file = Path(path).open("x", encoding="utf-8")
+        self._mode = mode.value
+        self._clock = clock
+        self._closed = False
+
+    def write(self, event, bridge, *, published, policy_certified, **fields):
+        if self._closed:
+            raise RuntimeError("metrics writer is closed")
+        payload = {
+            "event": event, "mode": self._mode, "state": bridge.state.value,
+            "generation": bridge.generation, "monotonic_s": self._clock(),
+            "published": bool(published),
+            "policy_certified": bool(policy_certified), **fields,
+        }
+        self._file.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        self._file.flush()
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._file.close()
+```
+
+The runtime writes one record per preflight, state transition, request, result, publish/preview, fault, and shutdown event.
 
 - [ ] Implement keyboard save/cbreak entry.
 - [ ] Implement nonblocking `p`-only polling.
@@ -3198,7 +4461,133 @@ On Ctrl-C:
 5. signal camera exit, prevent new inference work, join the worker for at most 5.5 seconds, close messaging, restore terminal, and exit;
 6. enforce the overall 6.5-second bound for the in-flight case and 0.5-second bound when neither final hold nor HTTP join is pending.
 
-The runtime never signals or terminates the WBC, simulator, policy server, or any robot process.
+Implement that ordering with the following coordinator and loop. `publisher` is `None` in shadow; `preview_sink.close()` is passed in its place so resource ownership is still explicit.
+
+```python
+@dataclass(frozen=True)
+class ShutdownReport:
+    final_hold_publishes: int
+    publisher_closed_after_publish_count: int
+    cleanup_errors: tuple[str, ...]
+
+
+class ShutdownCoordinator:
+    def __init__(
+        self, *, bridge, command_sink, camera, worker, state_source,
+        ros_runtime, keyboard, metrics, clock=time.monotonic, sleep=time.sleep,
+    ):
+        self.bridge = bridge
+        self.command_sink = command_sink
+        self.camera = camera
+        self.worker = worker
+        self.state_source = state_source
+        self.ros_runtime = ros_runtime
+        self.keyboard = keyboard
+        self.metrics = metrics
+        self.clock = clock
+        self.sleep = sleep
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            raise RuntimeError("shutdown coordinator may run only once")
+        self._closed = True
+        errors = []
+        self.bridge.stop()
+        hold = self.bridge.build_bounded_shutdown_hold()
+        published = 0
+        try:
+            if hold is not None and self.command_sink is not None:
+                first = self.clock()
+                for index in range(25):
+                    deadline = first + index * 0.02
+                    self.sleep(max(0.0, deadline - self.clock()))
+                    if self.command_sink.publish(hold) is not True:
+                        raise RuntimeError("final hold publish rejected")
+                    published += 1
+        except Exception as error:
+            errors.append(f"final_hold: {error}")
+        finally:
+            if self.command_sink is not None:
+                try:
+                    self.command_sink.close()
+                except Exception as error:
+                    errors.append(f"publisher: {error}")
+
+        for name, close in (
+            ("camera", lambda: self.camera.close(timeout_s=0.5)),
+            ("worker", lambda: self.worker.close(timeout_s=5.5)),
+            ("state", self.state_source.close),
+            ("keyboard", self.keyboard.close),
+            ("ros", self.ros_runtime.close),
+            ("metrics", self.metrics.close),
+        ):
+            try:
+                close()
+            except Exception as error:
+                errors.append(f"{name}: {error}")
+        return ShutdownReport(
+            final_hold_publishes=published,
+            publisher_closed_after_publish_count=published,
+            cleanup_errors=tuple(errors),
+        )
+
+
+class FiftyHzLoop:
+    def __init__(self, clock=time.monotonic, sleep=time.sleep):
+        self.clock = clock
+        self.sleep = sleep
+        self._next = None
+
+    def run_n(self, count, callback):
+        first = self.clock() if self._next is None else self._next
+        for index in range(count):
+            scheduled = first + index * 0.02
+            self.sleep(max(0.0, scheduled - self.clock()))
+            callback(scheduled)
+        self._next = first + count * 0.02
+
+
+def run_runtime(bridge, adapters, keyboard, coordinator, metrics, certified):
+    latest_state = None
+    latest_camera = None
+
+    def one_tick(_scheduled):
+        nonlocal latest_state, latest_camera
+        state = adapters.state_source.poll()
+        camera = adapters.camera_reader.poll()
+        latest_state = state if state is not None else latest_state
+        latest_camera = camera if camera is not None else latest_camera
+        if latest_state is not None and latest_camera is not None:
+            bridge.update_inputs(latest_state, latest_camera)
+        for _ in keyboard.poll(0.0):
+            bridge.handle_toggle()
+        result = bridge.tick()
+        metrics.write(
+            "tick", bridge, published=(result.goal is not None),
+            policy_certified=certified, tick=result.tick,
+            source_kind=result.source_kind,
+        )
+
+    loop = FiftyHzLoop()
+    try:
+        while bridge.state is not BridgeState.STOPPED:
+            loop.run_n(1, one_tick)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        shutdown_report = coordinator.close()
+    return shutdown_report
+```
+
+In shadow, the command sink's `publish()` records a preview and returns true but never owns a ROS publisher; its `close()` only closes that recorder. If no bounded hold exists, the loop above performs zero final calls. If it exists, the coordinator calls `publish()` exactly 25 times with the same `Goal` object, closes the sink immediately afterward, and has no code path for a 26th call. The runtime never signals or terminates the WBC, simulator, policy server, or any robot process.
+
+- [ ] Add idempotence rejection and bridge-stop/hold capture only.
+- [ ] Add the exact 25-tick publisher branch and run the fake-clock unit case.
+- [ ] Add the no-hold zero-publish branch and run the pre-state case.
+- [ ] Add ordered cleanup with error accumulation and run both subprocess cases.
+- [ ] Add the persistent-deadline 50 Hz loop and run the 50-scheduled-tick case.
+- [ ] Wire `run_runtime()` and prove unexpected exceptions are re-raised after cleanup.
 
 - [ ] **Step 8: Run runtime/shutdown tests and commit**
 
@@ -3266,10 +4655,15 @@ Create `tests/test_psi0_bridge_fake_integration.py`; both fakes are context mana
 from pathlib import Path
 from types import SimpleNamespace
 import json
+import signal
+import socket
+import subprocess
+import sys
 import time
 
 import numpy as np
 import pytest
+import requests
 
 from scripts.psi0_simple_real_bridge import ComposedCameraReader, HttpInferenceWorker
 from scripts.tests.fake_composed_camera_server import running_fake_camera
@@ -3279,9 +4673,23 @@ from simple.deploy.psi0_simple_bridge import (
     BridgeState, PolicyContract, Psi0SimpleBridge, TimedCameraFrame,
     TimedRobotState,
 )
-from tests.psi0_bridge_testkit import test_joint_contract
+from tests.psi0_bridge_testkit import make_joint_contract
 
 CONTRACT_PATH = Path("scripts/tests/fixtures/psi0_policy_contract_test_v2.json")
+
+
+def assert_loopback_port_rebinds(port):
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", port))
+
+
+def wait_for_json(path, timeout_s=2.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.exists():
+            return json.loads(path.read_text())
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {path}")
 
 
 def rtc_history(seq, tick, committed, reset=False):
@@ -3309,9 +4717,10 @@ def run_wall_clock_fake_bridge(port, duration_s):
     worker = HttpInferenceWorker(
         client=HttpActionClient("127.0.0.1", port, timeout=5.0),
         clock=time.monotonic,
+        contract=contract,
     )
     bridge = Psi0SimpleBridge(
-        contract, test_joint_contract(), worker, time.monotonic, start_tick=0
+        contract, make_joint_contract(), worker, time.monotonic, start_tick=0
     )
     def refresh_inputs():
         now = time.monotonic()
@@ -3379,6 +4788,46 @@ def test_point_30_second_one_shot_latency_faults_at_deadline_and_is_discarded():
         assert fake.max_concurrent_requests == 1
 
 
+def test_cli_control_endpoint_delays_exact_next_request_across_processes(tmp_path):
+    ready = tmp_path / "policy-ready.json"
+    token = "test-control-token"
+    command = [
+        sys.executable, "scripts/tests/fake_psi0_rtc_server.py",
+        "--host", "127.0.0.1", "--port", "0",
+        "--normal-latency-s", "0.05",
+        "--contract", str(CONTRACT_PATH),
+        "--control-token", token, "--ready-json", str(ready),
+    ]
+    process = subprocess.Popen(command, cwd=Path(__file__).resolve().parents[1])
+    port = None
+    try:
+        port = wait_for_json(ready)["port"]
+        base = f"http://127.0.0.1:{port}"
+        armed = requests.post(
+            f"{base}/test-control/arm-next-delay",
+            json={"token": token, "latency_s": 0.30}, timeout=0.5,
+        )
+        assert armed.status_code == 202
+        assert armed.json() == {"armed_request_seq": 0, "latency_s": 0.30}
+        client = HttpActionClient("127.0.0.1", port, timeout=1.0)
+        started = time.monotonic()
+        query_fake(client, rtc_history(0, 100, np.zeros((6, 36), np.float32), reset=True))
+        assert time.monotonic() - started >= 0.295
+        status = requests.get(
+            f"{base}/test-control/status",
+            headers={"X-Test-Control-Token": token}, timeout=0.5,
+        ).json()
+        assert status["records"][0]["request_seq"] == 0
+        assert status["records"][0]["applied_latency_s"] == pytest.approx(0.30)
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+        process.wait(timeout=1.0)
+    assert process.returncode == 0
+    assert port is not None
+    assert_loopback_port_rebinds(port)
+
+
 def test_fake_camera_round_trip_and_bounded_close():
     with running_fake_camera(key="rgb_head_stereo_left") as fake:
         reader = ComposedCameraReader(
@@ -3399,14 +4848,60 @@ The helper contains no ROS, DDS, MuJoCo, or GPU dependency.
 
 - [ ] **Step 3: Implement the fake RTC HTTP server**
 
-Use `ThreadingHTTPServer` bound to `127.0.0.1` and an OS-assigned port. `running_fake_policy(..., normal_latency_s=0.05)` must default to exactly `0.05`, record the actual selected delay per request, and track active/max-concurrent handler counts under a lock. Implement only `GET /contract` and `POST /act-rtc-v1`; return 404 for `/act`. Deserialize requests with `RequestMessage.deserialize()`. Validate `dataset_name="simple"`, empty condition, exact image/state dictionaries, R0-only reset, full history key sets, and the supplied `(d,36)` committed prefix. Generate a safe stationary suffix from the final committed command:
+Use `ThreadingHTTPServer` bound to `127.0.0.1` and an OS-assigned port. `running_fake_policy(..., normal_latency_s=0.05)` must default to exactly `0.05`, record the actual selected delay per request, and track active/max-concurrent handler counts under one lock. Deserialize requests with `RequestMessage.deserialize()`. Validate `dataset_name="simple"`, empty condition, exact image/state dictionaries, R0-only reset, full history key sets, and the supplied `(d,36)` committed prefix. Generate a safe stationary suffix from the final committed command:
 
 ```python
 actions = np.repeat(committed_actions[-1:], execution_horizon, axis=0).astype(np.float32)
 actions[:, 32:36] = 0.0
 ```
 
-Return NumPy-serialized actions and metadata with the exact seven keys/types from Task 3, echoing session, sequence, observation tick, P/s/d, and `first_action_tick=observation_tick+d`. Expose thread-safe request records and `delay_next_request(seconds)`; close and join the server thread explicitly.
+Return NumPy-serialized actions and metadata with the exact seven keys/types from Task 3, echoing session, sequence, observation tick, P/s/d, and `first_action_tick=observation_tick+d`. The normal routes are exactly `GET /contract` and `POST /act-rtc-v1`; return 404 for `/act`.
+
+The CLI-only control plane is normative. It is disabled unless both `--control-token TOKEN` and `--ready-json PATH` are supplied. With control enabled, expose:
+
+```text
+POST /test-control/arm-next-delay
+  request JSON:  {"token": <exact token string>, "latency_s": <float>}
+  success:       202 {"armed_request_seq": N, "latency_s": value}
+  bad token:     403
+  extra/missing keys, bool/non-number latency, latency outside [0.0, 1.0]: 400
+
+GET /test-control/status
+  header:        X-Test-Control-Token: <exact token string>
+  success:       200 {"last_started_request_seq": N-or--1,
+                      "active_requests": N,
+                      "max_concurrent_requests": N,
+                      "records": [{"request_seq": N,
+                                   "applied_latency_s": value}]}
+  bad token:     403
+```
+
+The control and action handlers share the same `state.lock`. The control handler executes this critical section and then returns the accepted sequence:
+
+```python
+with state.lock:
+    target_seq = state.last_started_request_seq + 1
+    if target_seq in state.delay_by_seq:
+        raise ControlError(409, "next request already armed")
+    state.delay_by_seq[target_seq] = latency_s
+```
+
+The action handler validates the request's wire `request_seq`, then executes this critical section before sleeping:
+
+```python
+with state.lock:
+    expected_seq = state.last_started_request_seq + 1
+    if request_seq != expected_seq:
+        raise ProtocolError(409, f"expected request_seq {expected_seq}")
+    state.last_started_request_seq = request_seq
+    applied_latency_s = state.delay_by_seq.pop(request_seq, state.normal_latency_s)
+    state.active_requests += 1
+    state.max_concurrent_requests = max(
+        state.max_concurrent_requests, state.active_requests
+    )
+```
+
+This lock ordering defines “next” across processes even when a request races the control POST. The handler appends its record and decrements `active_requests` under the same lock in `finally`. The in-process `delay_next_request(seconds)` calls the same locked arming function; it is not a separate implementation. Atomically write `ready-json` as `{"host":"127.0.0.1","port":<bound port>}` only after `serve_forever` is ready. On SIGINT, call `shutdown()`, `server_close()`, join the server thread, and exit zero.
 
 Implement one route/behavior per bounded subaction:
 
@@ -3415,6 +4910,8 @@ Implement one route/behavior per bounded subaction:
 - [ ] Add request deserialization and exact field/history validation.
 - [ ] Add stationary suffix plus exact seven-key metadata response.
 - [ ] Add locked concurrency counters and default/one-shot latency.
+- [ ] Add the tokenized arm/status routes and run the cross-process test.
+- [ ] Add atomic readiness JSON, SIGINT close, and port-rebind assertion.
 
 - [ ] **Step 4: Implement the fake composed-camera server**
 
@@ -3423,7 +4920,7 @@ Do not subclass or instantiate `SensorServer`, because it binds `tcp://*`. Use o
 - [ ] Add the loopback PUB-thread lifecycle and port rebind test.
 - [ ] Add real-schema JPEG serialization and red/blue sentinel publication.
 
-Both fake scripts expose `--host 127.0.0.1 --port PORT`; they reject any other host. The policy fake additionally exposes `--normal-latency-s 0.05`. Port `0` requests an OS-assigned port for pytest, while the smoke driver uses fixed isolated ports 15555/22086.
+Both fake scripts expose `--host 127.0.0.1 --port PORT`; they reject any other host. The policy fake additionally exposes `--contract PATH --normal-latency-s 0.05 --control-token TOKEN --ready-json PATH`. Port `0` requests an OS-assigned port for pytest, while the isolated smoke driver keeps its approved fixed ports 15555/22086 and still consumes readiness JSON before issuing control calls.
 
 - [ ] **Step 5: Run fake integration tests and commit**
 
@@ -3461,8 +4958,8 @@ import numpy as np
 import pytest
 
 from scripts.tests.smoke_psi0_simple_bridge import (
-    OwnedChildren, SmokeConfig, SmokeSafetyError, build_launch_plan, launch,
-    validate_smoke_report,
+    OwnedChildren, SmokeConfig, SmokeSafetyError, arm_next_policy_delay,
+    build_launch_plan, launch, validate_smoke_report,
 )
 
 EXPECTED_WBC_ARGS = (
@@ -3479,7 +4976,9 @@ def valid_smoke_config(**updates):
         "duration_s": 15.0, "ros_domain_id": 42, "unitree_domain_id": 42,
         "wbc_interface": "lo", "camera_host": "127.0.0.1",
         "camera_port": 15555, "policy_host": "127.0.0.1",
-        "policy_port": 22086,
+        "policy_port": 22086, "control_token": "smoke-control-token",
+        "policy_ready_json": "outputs/psi0-smoke-policy-ready.json",
+        "output_dir": "outputs",
     }
     values.update(updates)
     return SmokeConfig(**values)
@@ -3502,14 +5001,52 @@ def test_smoke_launch_plan_is_exact_and_normal_policy_latency_is_50ms():
     assert "--normal-latency-s" in policy.argv
     index = policy.argv.index("--normal-latency-s")
     assert policy.argv[index + 1] == "0.05"
-    assert policy.argv[-4:] == (
-        "--host", "127.0.0.1", "--port", "22086"
+    assert policy.argv[policy.argv.index("--host") + 1] == "127.0.0.1"
+    assert policy.argv[policy.argv.index("--port") + 1] == "22086"
+    assert policy.argv[policy.argv.index("--control-token") + 1] == "smoke-control-token"
+    assert policy.argv[policy.argv.index("--ready-json") + 1] == (
+        "outputs/psi0-smoke-policy-ready.json"
     )
     bridge = plan.child("bridge")
     assert bridge.use_pty is True
     assert "--mode" in bridge.argv and bridge.argv[bridge.argv.index("--mode") + 1] == "sim-control"
     assert all(child.env["ROS_DOMAIN_ID"] == "42" for child in plan.children)
     assert all(child.env["UNITREE_DOMAIN_ID"] == "42" for child in plan.children)
+
+
+class FakeControlResponse:
+    status_code = 202
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"armed_request_seq": 17, "latency_s": 0.30}
+
+
+class RecordingControlSession:
+    def __init__(self):
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return FakeControlResponse()
+
+
+def test_smoke_arms_delay_through_cross_process_control_endpoint():
+    session = RecordingControlSession()
+    armed_seq = arm_next_policy_delay(
+        "127.0.0.1", 22086, "smoke-control-token", 0.30,
+        session=session,
+    )
+    assert armed_seq == 17
+    assert session.calls == [(
+        "http://127.0.0.1:22086/test-control/arm-next-delay",
+        {
+            "json": {"token": "smoke-control-token", "latency_s": 0.30},
+            "timeout": 0.5,
+        },
+    )]
 
 
 @pytest.mark.parametrize(
@@ -3532,7 +5069,31 @@ The exact Tyro flags are fixed in `EXPECTED_WBC_ARGS`; there is no implementatio
 
 - [ ] **Step 2: Implement immutable launch-plan validation**
 
-Implement `SmokeConfig`, `ChildSpec`, `LaunchPlan`, and `build_launch_plan()`. Run both Step 1 tests. Do not call `Popen` in this checkbox.
+Implement `SmokeConfig`, `ChildSpec`, `LaunchPlan`, and `build_launch_plan()`. The policy `ChildSpec` must pass the config's exact token/readiness path through `--control-token` and `--ready-json`; reject an empty token, a non-loopback host, a readiness path outside the configured output directory, or an existing readiness file. The production CLI creates `control_token=secrets.token_hex(16)` once when no token is injected by a unit test and never writes it to metrics. Run all Step 1 tests. Do not call `Popen` in this checkbox.
+
+Add the complete control helper used by the timeline:
+
+```python
+def arm_next_policy_delay(host, port, token, latency_s, *, session=requests):
+    if host != "127.0.0.1" or not token:
+        raise SmokeSafetyError("fake-policy control must be authenticated loopback")
+    response = session.post(
+        f"http://{host}:{port}/test-control/arm-next-delay",
+        json={"token": token, "latency_s": latency_s},
+        timeout=0.5,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if type(payload) is not dict or set(payload) != {
+        "armed_request_seq", "latency_s"
+    }:
+        raise SmokeSafetyError("malformed fake-policy control response")
+    if type(payload["armed_request_seq"]) is not int:
+        raise SmokeSafetyError("malformed armed request sequence")
+    if type(payload["latency_s"]) is not float or payload["latency_s"] != latency_s:
+        raise SmokeSafetyError("fake-policy delay acknowledgement mismatch")
+    return payload["armed_request_seq"]
+```
 
 - [ ] **Step 3: Implement process-group ownership and bounded readiness**
 
@@ -3564,7 +5125,7 @@ Implement and unit-test each timeline action separately:
 - [ ] Launch each child through the tested `OwnedChildren` registry.
 - [ ] Wait for each named bounded readiness signal.
 - [ ] Send local `p` through the bridge pseudo-terminal at second 3.
-- [ ] Configure the fake policy's next request for exactly 0.30 seconds at second 11.
+- [ ] At second 11 call `arm_next_policy_delay(...)`, store the acknowledged `armed_request_seq`, and fail the smoke immediately on timeout/non-202/schema mismatch.
 - [ ] Require worker idle at second 13, send Ctrl-C, and finish by second 15.
 - [ ] Reap only owned process groups in `finally`.
 - [ ] Verify terminal restoration and rebind every owned port.
@@ -3583,6 +5144,8 @@ uv run --group sonic python -m decoupled_wbc.control.main.teleop.run_g1_control_
   --no-enable-onscreen \
   --no-enable-offscreen
 ```
+
+After the second-13 worker-idle check, query `GET /test-control/status` with the same token and require exactly one record whose `request_seq` equals the acknowledged sequence and whose `applied_latency_s` is exactly `0.30`. This is the cross-process proof that the intended request, rather than an arbitrary later request, received the injected delay.
 
 - [ ] **Step 5: Write and implement exact metric assertions**
 
@@ -3606,6 +5169,10 @@ def passing_smoke_report():
         "executed_ticks": list(range(100, 172)),
         "blocked_main_loop_max_gap_s": 0.02,
         "delayed_request_started_at": 11.0,
+        "armed_request_seq": 17,
+        "delayed_request_record": {
+            "request_seq": 17, "applied_latency_s": 0.30,
+        },
         "fault_at": 11.12,
         "first_fault_goal_navigation": [0.0, 0.0, 0.0, 0.0],
         "policy_actions_after_fault": 0,
@@ -3633,6 +5200,7 @@ def test_passing_smoke_report_meets_every_bound():
     "field,value",
     [
         ("blocked_main_loop_max_gap_s", 0.061),
+        ("delayed_request_record", {"request_seq": 18, "applied_latency_s": 0.30}),
         ("fault_at", 11.141),
         ("first_fault_goal_navigation", [0.0, 0.0, 0.1, 0.0]),
         ("policy_actions_after_fault", 1),
@@ -3680,7 +5248,7 @@ def test_smoke_rejects_rate_gap_request_spacing_shape_and_tick_discontinuity():
         assert any(expected in failure for failure in result.failures)
 ```
 
-`validate_smoke_report()` computes per-phase mean frequency from first/last time and count, rejects outside 49-51 Hz, rejects any adjacent gap over 0.060 seconds, requires request tick differences of 24, exact `(6,36)` committed arrays, and an uninterrupted executed-tick sequence.
+`validate_smoke_report()` computes per-phase mean frequency from first/last time and count, rejects outside 49-51 Hz, rejects any adjacent gap over 0.060 seconds, requires request tick differences of 24, exact `(6,36)` committed arrays, and an uninterrupted executed-tick sequence. It also requires `delayed_request_record == {"request_seq": armed_request_seq, "applied_latency_s": 0.30}`.
 
 - [ ] **Step 6: Run the driver unit test without starting MuJoCo**
 
@@ -3796,7 +5364,6 @@ class FakeGraph:
 
 def valid_adapter_dependencies():
     return RuntimeDependencyFactories(
-        wbc_config_client=lambda: InMemoryWbcConfigClient({"env_type": "sim"}),
         state_source=lambda: InMemoryStateSource(),
         camera_reader=lambda: InMemoryCameraReader(),
         graph=lambda: FakeGraph(publishers=0, subscriptions=1),
@@ -3899,7 +5466,7 @@ from scripts.benchmark_psi0_rtc_server import (
     write_certification_bundle,
 )
 from simple.deploy.psi0_simple_bridge import PolicyContract
-from tests.psi0_bridge_testkit import policy_payload
+from tests.psi0_bridge_testkit import make_joint_contract, policy_payload
 
 
 FAILURE_KEYS = (
@@ -3976,6 +5543,7 @@ def test_benchmark_discards_ten_warmups_and_certifies_one_hundred_requests(tmp_p
         transport=transport,
         samples=representative_samples(100),
         contract=PolicyContract.from_dict(live_policy_payload()),
+        joint_contract=make_joint_contract(),
         warmup_requests=10,
         measured_requests=100,
     )
@@ -4000,6 +5568,7 @@ def test_p99_uses_higher_method_and_point_101_fails_gate():
         transport=FakeBenchmarkTransport([0.05] * 99 + [0.101]),
         samples=representative_samples(100),
         contract=PolicyContract.from_dict(live_policy_payload()),
+        joint_contract=make_joint_contract(),
         warmup_requests=10,
         measured_requests=100,
     )
@@ -4016,6 +5585,7 @@ def test_every_failure_class_is_counted_and_prevents_certification(failure_kind)
         ),
         samples=representative_samples(100),
         contract=PolicyContract.from_dict(live_policy_payload()),
+        joint_contract=make_joint_contract(),
         warmup_requests=10,
         measured_requests=100,
     )
@@ -4085,23 +5655,207 @@ The bundle writer first verifies the checkpoint and dataset hashes equal the con
 
 - [ ] **Step 3: Implement representative request loading and response classification**
 
-Require an NPZ with arrays `images` (`N,H,W,3`, contiguous `uint8`) and `states` (`N,1,32`, finite `float32`) and `N >= 100`. Fetch `/contract` exactly once before warmup, parse it strictly, and require full equality with the local contract. Implement one classifier for each exact failure key. Each request uses dataset `simple`, empty condition, selected RGB key, R0-only reset, monotonically increasing request sequence/observation ticks, and the full committed prefix. Validate response shape, metadata, bounds, and deadline with the same production functions as the bridge.
+Require an NPZ with arrays `images` (`N,H,W,3`, contiguous `uint8`), `states` (`N,1,32`, finite `float32`), and `instructions` (`N` strings), with `N >= 100`. Define the wire/result types and exact classifier as follows:
+
+```python
+FAILURE_KEYS = (
+    "timeout", "http", "decode", "shape", "metadata", "bounds", "late"
+)
+
+
+class BenchmarkRequestError(RuntimeError):
+    def __init__(self, kind, detail=""):
+        if kind not in FAILURE_KEYS:
+            raise ValueError(f"unknown benchmark failure kind: {kind}")
+        super().__init__(detail or kind)
+        self.kind = kind
+
+
+@dataclass(frozen=True)
+class BenchmarkSample:
+    image: np.ndarray
+    state: np.ndarray
+    instruction: str
+
+
+@dataclass(frozen=True)
+class BenchmarkTransportResponse:
+    action: np.ndarray
+    metadata: dict[str, object]
+    latency_s: float
+
+
+@dataclass(frozen=True)
+class BenchmarkReport:
+    warmup_requests: int
+    measured_requests: int
+    successes: int
+    failures: dict[str, int]
+    p99_latency_s: float
+    latency_limit_s: float
+    certified: bool
+
+
+def load_representative_samples(path):
+    with np.load(path, allow_pickle=False) as payload:
+        if set(payload.files) != {"images", "states", "instructions"}:
+            raise ValueError("sample NPZ keys must be images/states/instructions")
+        images = payload["images"]
+        states = payload["states"]
+        instructions = payload["instructions"]
+    if images.dtype != np.uint8 or images.ndim != 4 or images.shape[-1] != 3:
+        raise ValueError("images must be contiguous uint8 (N,H,W,3)")
+    if not images.flags.c_contiguous:
+        raise ValueError("images must be contiguous")
+    if states.dtype != np.float32 or states.shape != (len(images), 1, 32):
+        raise ValueError("states must be float32 (N,1,32)")
+    if not np.isfinite(states).all():
+        raise ValueError("states must be finite")
+    if instructions.shape != (len(images),) or instructions.dtype.kind not in "US":
+        raise ValueError("instructions must be an N-element string array")
+    if len(images) < 100:
+        raise ValueError("at least 100 representative samples are required")
+    return tuple(
+        BenchmarkSample(images[i].copy(), states[i].copy(), str(instructions[i]))
+        for i in range(len(images))
+    )
+
+
+def expected_metadata(history, contract):
+    return {
+        "session_id": history["session_id"],
+        "request_seq": history["request_seq"],
+        "observation_tick": history["observation_tick"],
+        "prediction_horizon": contract.prediction_horizon,
+        "execution_horizon": contract.execution_horizon,
+        "rtc_delay_steps": contract.rtc_delay_steps,
+        "first_action_tick": (
+            history["observation_tick"] + contract.rtc_delay_steps
+        ),
+    }
+
+
+def classify_response(response, history, contract, joint_contract):
+    if type(response) is not BenchmarkTransportResponse:
+        raise BenchmarkRequestError("decode", "transport response type")
+    action = np.asarray(response.action)
+    expected_shape = (contract.execution_horizon, contract.action_dim)
+    if action.shape != expected_shape or action.dtype != np.float32:
+        raise BenchmarkRequestError("shape", f"expected {expected_shape} float32")
+    metadata = response.metadata
+    expected = expected_metadata(history, contract)
+    if type(metadata) is not dict or set(metadata) != set(expected):
+        raise BenchmarkRequestError("metadata", "metadata key set")
+    for key, value in expected.items():
+        required_type = str if key == "session_id" else int
+        if type(metadata[key]) is not required_type or metadata[key] != value:
+            raise BenchmarkRequestError("metadata", key)
+    try:
+        validate_action_suffix(action, contract.execution_horizon, joint_contract)
+    except ValueError as error:
+        raise BenchmarkRequestError("bounds", str(error)) from error
+    if (
+        type(response.latency_s) is not float
+        or not np.isfinite(response.latency_s)
+        or response.latency_s > contract.rtc_delay_steps / contract.action_frequency_hz
+    ):
+        raise BenchmarkRequestError("late", "RTC response missed r+d")
+    return response.latency_s
+```
+
+The concrete HTTP transport catches `requests.Timeout` as `timeout`, calls `raise_for_status()` and catches `requests.HTTPError` as `http`, and catches JSON/NumPy deserialization or response-construction errors as `decode`; it re-raises an existing `BenchmarkRequestError` unchanged. This assigns transport failures before the response priority `shape → metadata → bounds → late`, so one malformed response always has exactly one category.
+
+Fetch `/contract` exactly once before warmup, parse it with `PolicyContract.from_dict()`, and require full dataclass equality with the local contract. Each request uses dataset `simple`, empty condition, exactly `{contract.image_key: sample.image}`, exactly `{"states": sample.state}`, `gt_action=[]`, R0-only reset, monotonically increasing sequence/observation ticks, and a finite exact `(d,36)` committed prefix.
+
+- [ ] Add NPZ key/dtype/shape/finite validation and run loader cases.
+- [ ] Add strict metadata construction/comparison and run metadata mutations.
+- [ ] Add shape/bounds/late classification in priority order.
+- [ ] Add HTTP exception mapping and prove every attempt yields one category.
 
 - [ ] **Step 4: Implement warmed measurement and higher-method p99**
 
-Issue exactly 10 warmup requests and exclude them from every measured statistic. Select samples deterministically as `samples[request_index % len(samples)]`, so the subsequent 100 measured requests cover every representative sample exactly once. Issue exactly 100 measured requests, never retry, and account for every attempt as exactly one success or one failure category. Compute:
+Implement the full loop below. A warmup failure aborts without creating any bundle; measured failures are counted and the loop continues without retry. The constant committed prefix is a safe stationary input contract, not a prediction reconstructed after a failed response.
 
 ```python
-p99_latency_s = float(np.quantile(success_latencies, 0.99, method="higher"))
-latency_limit_s = (contract.rtc_delay_steps - 1) / contract.action_frequency_hz
-certified = (
-    len(success_latencies) == 100
-    and sum(failures.values()) == 0
-    and p99_latency_s <= latency_limit_s
-)
+def benchmark_server(
+    *, transport, samples, contract, joint_contract,
+    warmup_requests=10, measured_requests=100,
+):
+    if warmup_requests != 10 or measured_requests != 100:
+        raise ValueError("certification requires 10 warmups and 100 measured requests")
+    if len(samples) < 100:
+        raise ValueError("at least 100 representative samples are required")
+    fetched = PolicyContract.from_dict(transport.get_contract())
+    if fetched != contract:
+        raise ValueError("server policy contract differs from local contract")
+
+    committed = np.zeros((contract.rtc_delay_steps, 36), np.float32)
+    committed[:, 31] = 0.74
+    session_id = "benchmark-" + uuid.uuid4().hex
+
+    def make_history(request_index):
+        history = {
+            "session_id": session_id,
+            "request_seq": request_index,
+            "observation_tick": request_index * contract.execution_horizon,
+            "rtc_delay_steps": contract.rtc_delay_steps,
+            "committed_actions": committed.copy(),
+        }
+        if request_index == 0:
+            history["reset"] = True
+        return history
+
+    for request_index in range(warmup_requests):
+        sample = samples[request_index % len(samples)]
+        history = make_history(request_index)
+        try:
+            response = transport.query(request_index, sample, history)
+            classify_response(response, history, contract, joint_contract)
+        except BenchmarkRequestError as error:
+            raise RuntimeError(
+                f"warmup request {request_index} failed: {error.kind}: {error}"
+            ) from error
+
+    failures = {key: 0 for key in FAILURE_KEYS}
+    success_latencies = []
+    for measured_index in range(measured_requests):
+        request_index = warmup_requests + measured_index
+        sample = samples[request_index % len(samples)]
+        history = make_history(request_index)
+        try:
+            response = transport.query(request_index, sample, history)
+            latency = classify_response(
+                response, history, contract, joint_contract
+            )
+        except BenchmarkRequestError as error:
+            failures[error.kind] += 1
+        else:
+            success_latencies.append(latency)
+
+    p99_latency_s = (
+        float(np.quantile(success_latencies, 0.99, method="higher"))
+        if success_latencies else float("inf")
+    )
+    latency_limit_s = (
+        contract.rtc_delay_steps - 1
+    ) / contract.action_frequency_hz
+    certified = (
+        len(success_latencies) == measured_requests
+        and sum(failures.values()) == 0
+        and p99_latency_s <= latency_limit_s
+    )
+    return BenchmarkReport(
+        warmup_requests, measured_requests, len(success_latencies), failures,
+        p99_latency_s, latency_limit_s, certified,
+    )
 ```
 
-Return nonzero from the CLI unless `certified` is true; a failed run may write `latency_report.json` to a separately named diagnostic directory, but must not write a certified bundle.
+Because measured request indices are 10–109, `samples[request_index % 100]` visits samples 10–99 then 0–9 exactly once. Return nonzero from the CLI unless `certified` is true; a failed run may write `latency_report.json` to a separately named diagnostic directory, but must not write a certified bundle.
+
+- [ ] Add exact contract fetch/equality and stationary committed-prefix creation.
+- [ ] Add 10 warmups with abort-on-first-failure behavior.
+- [ ] Add 100 measured attempts with no retry and exact failure accounting.
+- [ ] Add higher-method p99/certification and run all gate mutations.
 
 - [ ] **Step 5: Implement the evidence writer and exact CLI**
 
