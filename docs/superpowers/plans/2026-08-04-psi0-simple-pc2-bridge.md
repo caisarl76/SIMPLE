@@ -52,7 +52,7 @@
 
 ## Plan execution rule
 
-Every test snippet below is literal minimum test code, not pseudocode. Helper names are introduced in the same task before a later test uses them. During implementation, complete one checkbox, run the named focused test, and only then continue; no checkbox may be expanded into an unreviewed multi-hour action. When a code block contains several functions, add and run one function at a time in source order (each is a separate 2-5 minute red/green action).
+Every test snippet below is literal minimum test code, not pseudocode. Helper names are introduced in the same task before a later test uses them. Source blocks targeting the same file are cumulative in task order. A file's first production block owns the imports needed at that task; if a later task explicitly says to extend the import header, move that exact import block to the top of the file rather than inserting it at the current source position. No other production block introduces a mid-file import. During implementation, complete one checkbox, run the named focused test, and only then continue; no checkbox may be expanded into an unreviewed multi-hour action. When a code block contains several functions, add and run one function at a time in source order (each is a separate 2-5 minute red/green action). After assembling each changed Python file, run `ruff format` on that exact file before its listed `ruff format --check`/`ruff check` gate; formatting is mechanical and does not permit behavioral changes.
 
 ## Task 0: Create the isolated implementation worktree
 
@@ -209,9 +209,33 @@ initial_command = np.array(
 
 - [ ] **Step 4: Add a deterministic provenance record to each processed episode**
 
-Add `sha256_file()`, `resolve_converter_commit()`, and this pure helper:
+Extend the existing import header with `import hashlib` and `import re`. Add these complete helpers:
 
 ```python
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def resolve_converter_commit(repository_root: Path) -> str:
+    commit = subprocess.run(
+        [
+            "git", "log", "-1", "--format=%H", "--",
+            "scripts/postprocess_psi0.py",
+        ],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RuntimeError("could not resolve converter source commit")
+    return commit
+
+
 def build_conversion_provenance(
     source_path: Path,
     source_episode_index: int,
@@ -230,7 +254,26 @@ def build_conversion_provenance(
     }
 ```
 
-`resolve_converter_commit()` runs `git log -1 --format=%H -- scripts/postprocess_psi0.py` from the SIMPLE repository root and rejects a malformed result. Resolve it once at CLI startup. Store the returned `conversion_provenance` dictionary in each row written to `meta/episodes.jsonl`, using the exact `data_path`, source `ep_index`, `args.skip`, and `args.downsample` for that row. The later certification tool must not accept provenance supplied only on its command line.
+Immediately after parsing CLI arguments, resolve the identity exactly once:
+
+```python
+repository_root = Path(__file__).resolve().parents[1]
+converter_commit = resolve_converter_commit(repository_root)
+```
+
+Immediately before each `episodes.append(...)`, construct the record from that iteration's real source path/index and add it under the exact `conversion_provenance` key in the episode dictionary:
+
+```python
+conversion_provenance = build_conversion_provenance(
+    source_path=data_path,
+    source_episode_index=ep_index,
+    skip=args.skip,
+    downsample=args.downsample,
+    converter_commit=converter_commit,
+)
+```
+
+The `episodes.append({...})` dictionary includes `"conversion_provenance": conversion_provenance` alongside its existing fields. The later certification tool must not accept provenance supplied only on its command line.
 
 - [ ] **Step 5: Run focused tests and formatting checks**
 
@@ -405,38 +448,165 @@ Expected: collection fails with `ModuleNotFoundError`.
 
 - [ ] **Step 3: Implement and test the same-episode loader**
 
-Create immutable `BoundEpisode` with fields `stored_state`, `history_cmd`, `source_episode_index`, `processed_episode_index`, `raw_episode_sha256`, `processed_episode_sha256`, and `converter_commit`. `load_bound_episode(raw, processed, episodes_jsonl)` must perform these exact checks before returning:
+Create `scripts/certify_psi0_policy_contract.py` with this complete loader. It accepts only Parquet episode files and binds the processed row to the raw source through the converter-written metadata:
 
 ```python
-processed_index = parse_episode_index(processed.name)
-source_index = parse_episode_index(raw.name)
-processed_indices = set(pq.read_table(processed, columns=["episode_index"])["episode_index"].to_pylist())
-if processed_indices != {processed_index}:
-    raise ValueError("processed episode_index does not match filename")
-records = [json.loads(line) for line in episodes_jsonl.read_text().splitlines() if line]
-matches = [record for record in records if record["episode_index"] == processed_index]
-if len(matches) != 1:
-    raise ValueError("expected exactly one processed episode metadata record")
-record = matches[0]
-provenance = record["conversion_provenance"]
-if type(provenance["source_episode_index"]) is not int or provenance["source_episode_index"] != source_index:
-    raise ValueError("source episode index mismatch")
-if provenance["source_parquet_sha256"] != sha256_file(raw):
-    raise ValueError("raw episode hash mismatch")
-if re.fullmatch(r"[0-9a-f]{40}", provenance["converter_commit"]) is None:
-    raise ValueError("invalid converter commit")
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+
+import numpy as np
+import pyarrow.parquet as pq
+
+
+EPISODE_NAME = re.compile(r"episode_(\d{6})\.parquet")
+INITIAL_COMMAND = np.asarray(
+    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.74, 0.74, 0.74],
+    np.float32,
+)
+
+
+@dataclass(frozen=True)
+class BoundEpisode:
+    stored_state: np.ndarray
+    history_cmd: np.ndarray
+    source_episode_index: int
+    processed_episode_index: int
+    raw_episode_sha256: str
+    processed_episode_sha256: str
+    converter_commit: str
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def parse_episode_index(name):
+    match = EPISODE_NAME.fullmatch(name)
+    if match is None:
+        raise ValueError(f"invalid episode parquet filename: {name}")
+    return int(match.group(1))
+
+
+def _metadata_record(path, processed_index):
+    records = []
+    for line_number, line in enumerate(Path(path).read_text().splitlines(), 1):
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"invalid episodes metadata line {line_number}"
+            ) from error
+        if type(record) is not dict:
+            raise ValueError("episode metadata record must be an object")
+        records.append(record)
+    matches = [
+        record for record in records
+        if record.get("episode_index") == processed_index
+    ]
+    if len(matches) != 1:
+        raise ValueError("expected exactly one processed episode metadata record")
+    return matches[0]
+
+
+def load_bound_episode(raw, processed, episodes_jsonl):
+    raw = Path(raw)
+    processed = Path(processed)
+    episodes_jsonl = Path(episodes_jsonl)
+    source_index = parse_episode_index(raw.name)
+    processed_index = parse_episode_index(processed.name)
+    record = _metadata_record(episodes_jsonl, processed_index)
+    provenance = record.get("conversion_provenance")
+    required_provenance = {
+        "source_episode_index", "source_parquet_sha256", "skip",
+        "downsample", "converter_commit",
+    }
+    if type(provenance) is not dict or set(provenance) != required_provenance:
+        raise ValueError("conversion provenance keys")
+    if (
+        type(provenance["source_episode_index"]) is not int
+        or provenance["source_episode_index"] != source_index
+    ):
+        raise ValueError("source episode index mismatch")
+    raw_hash = sha256_file(raw)
+    if provenance["source_parquet_sha256"] != raw_hash:
+        raise ValueError("raw episode hash mismatch")
+    converter_commit = provenance["converter_commit"]
+    if (
+        type(converter_commit) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", converter_commit) is None
+    ):
+        raise ValueError("invalid converter commit")
+    skip = provenance["skip"]
+    downsample = provenance["downsample"]
+    if type(skip) is not int or skip < 0:
+        raise ValueError("conversion skip must be a nonnegative integer")
+    if type(downsample) is not int or downsample <= 0:
+        raise ValueError("conversion downsample must be a positive integer")
+
+    raw_table = pq.read_table(
+        raw, columns=["observation.amo_policy_command"]
+    )
+    command = np.asarray(
+        raw_table["observation.amo_policy_command"].to_pylist(),
+        dtype=np.float32,
+    )
+    if command.ndim != 2 or command.shape[1] != 9:
+        raise ValueError("raw command must have shape (T,9)")
+    if not np.isfinite(command).all() or skip >= len(command):
+        raise ValueError("raw command is non-finite or skip removes all frames")
+    full_history = np.concatenate(
+        [INITIAL_COMMAND[None], command[:-1]], axis=0
+    )
+    history = np.ascontiguousarray(full_history[skip::downsample])
+
+    processed_table = pq.read_table(
+        processed, columns=["states", "episode_index"]
+    )
+    processed_indices = set(
+        processed_table["episode_index"].to_pylist()
+    )
+    if processed_indices != {processed_index}:
+        raise ValueError("processed episode_index does not match filename")
+    stored = np.asarray(
+        processed_table["states"].to_pylist(), dtype=np.float32
+    )
+    if stored.ndim != 2 or stored.shape[1] < 32:
+        raise ValueError("processed states must have shape (T,>=32)")
+    if not np.isfinite(stored).all():
+        raise ValueError("processed states must be finite")
+    if type(record.get("length")) is not int:
+        raise ValueError("processed metadata length must be an integer")
+    if len(stored) != len(history) or len(stored) != record["length"]:
+        raise ValueError("raw history and processed frame counts differ")
+    return BoundEpisode(
+        stored_state=np.ascontiguousarray(stored),
+        history_cmd=history,
+        source_episode_index=source_index,
+        processed_episode_index=processed_index,
+        raw_episode_sha256=raw_hash,
+        processed_episode_sha256=sha256_file(processed),
+        converter_commit=converter_commit,
+    )
 ```
 
-Read raw `observation.amo_policy_command`, reconstruct history with the recorded `skip` and `downsample`, read processed `states`, require equal frame counts and the recorded processed length, then compute both file hashes. Do not accept standalone `.npy` inputs: they cannot prove same-episode provenance.
+The filename parser rejects standalone `.npy` inputs before any array read, because they cannot prove same-episode provenance.
 
 - [ ] **Step 4: Implement the classifier and contract writer**
 
 Create a CLI that accepts `--raw-episode-parquet`, `--processed-episode-parquet`, `--processed-episodes-jsonl`, `--checkpoint`, `--dataset-manifest`, `--server-commit`, `--prediction-horizon`, `--execution-horizon`, `--rtc-delay-steps`, `--rtc-training-max-delay`, and `--output`. It calls `load_bound_episode()` and passes only that result to its core comparison:
 
 ```python
-import re
-
-
 def certify_layout(stored_state: np.ndarray, history_cmd: np.ndarray) -> dict[str, object]:
     stored = np.asarray(stored_state, dtype=np.float32)
     history = np.asarray(history_cmd, dtype=np.float32)
@@ -534,12 +704,83 @@ def build_policy_contract_payload(
     return payload
 ```
 
-Write that exact payload atomically; the causal certification is represented by the strict `converter_layout` field and does not add an unrecognized JSON key. Reject a non-40-character hexadecimal converter or server commit and any RTC tuple that violates the approved inequalities. The writer accepts no `test_only` argument: only the checked-in fake fixture in Task 12 may set it true. Task 9 owns `PolicyContract`; to preserve TDD task order, this task defines an identical private `validate_policy_contract_payload()` key/type/value validator, and Task 9 replaces it with the shared parser without changing the emitted bytes.
+Add the complete atomic writer and CLI below. `os.link()` publishes the completed temporary file without an overwrite race; an existing destination raises `FileExistsError` and is left unchanged:
+
+```python
+def atomic_write_policy_contract(path, payload):
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.tmp"
+    )
+    data = (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    descriptor = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+    )
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(descriptor, view):]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.link(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument("--raw-episode-parquet", required=True)
+    parser.add_argument("--processed-episode-parquet", required=True)
+    parser.add_argument("--processed-episodes-jsonl", required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--dataset-manifest", required=True)
+    parser.add_argument("--server-commit", required=True)
+    parser.add_argument("--prediction-horizon", required=True, type=int)
+    parser.add_argument("--execution-horizon", required=True, type=int)
+    parser.add_argument("--rtc-delay-steps", required=True, type=int)
+    parser.add_argument(
+        "--rtc-training-max-delay", required=True, type=int
+    )
+    parser.add_argument("--output", required=True)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    bound = load_bound_episode(
+        args.raw_episode_parquet,
+        args.processed_episode_parquet,
+        args.processed_episodes_jsonl,
+    )
+    payload = build_policy_contract_payload(
+        bound_episode=bound,
+        checkpoint_sha256=sha256_file(args.checkpoint),
+        dataset_manifest_sha256=sha256_file(args.dataset_manifest),
+        server_commit=args.server_commit,
+        prediction_horizon=args.prediction_horizon,
+        execution_horizon=args.execution_horizon,
+        rtc_delay_steps=args.rtc_delay_steps,
+        rtc_training_max_delay=args.rtc_training_max_delay,
+    )
+    atomic_write_policy_contract(args.output, payload)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+The causal certification is represented by the strict `converter_layout` field and does not add an unrecognized JSON key. Reject a non-40-character hexadecimal converter or server commit and any RTC tuple that violates the approved inequalities. The writer accepts no `test_only` argument: only the checked-in fake fixture in Task 12 may set it true. Task 9 owns `PolicyContract`; to preserve TDD task order, this task defines an identical private `validate_policy_contract_payload()` key/type/value validator, and Task 9 replaces it with the shared parser without changing the emitted bytes.
 
 Complete and run one focused test after each bounded subaction:
 
 - [ ] Add only `certify_layout()` and its three causal-layout cases.
-- [ ] Add only `build_policy_contract(bound_episode, ...)` and assert its exact key/type set.
+- [ ] Add only `build_policy_contract_payload(bound_episode=..., ...)` and assert its exact key/type set.
 - [ ] Add SHA/path validation and atomic new-file writing without CLI parsing.
 - [ ] Add the argparse entry point and verify all required flags with `--help`.
 
@@ -815,18 +1056,95 @@ class HttpActionClient:
         self.timeout = timeout
         self.session = session or requests.Session()
 
+    @property
+    def timestamp(self):
+        return str(datetime.now()).replace(" ", "_").replace(":", "-")
+
     def get_contract(self, timeout: float = 2.0) -> dict[str, Any]:
         response = self.session.get(
             f"http://{self.server_ip}:{self.server_port}/contract", timeout=timeout
         )
         response.raise_for_status()
-        result = response.json()
-        if not isinstance(result, dict):
+        try:
+            result = response.json()
+        except Exception as error:
+            raise RuntimeError(f"invalid policy contract JSON: {error}") from error
+        if type(result) is not dict:
             raise RuntimeError("policy contract response must be a JSON object")
         return result
+
+    def _post(self, path: str, request: RequestMessage) -> dict[str, Any]:
+        response = self.session.post(
+            f"http://{self.server_ip}:{self.server_port}{path}",
+            json=request.serialize(),
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+            payload = convert_numpy_in_dict(payload, numpy_deserialize)
+        except Exception as error:
+            raise RuntimeError(str(error)) from error
+        if type(payload) is not dict:
+            raise RuntimeError("policy response must be a JSON object")
+        return payload
+
+    def query_action(
+        self, image_dict, instruction, state_dict, condition_dict,
+        history=None, dataset="grasp", gt_action=None,
+    ):
+        if history is None:
+            history = {key: [] for key in image_dict}
+        if gt_action is None:
+            gt_action = []
+        request = RequestMessage(
+            image_dict, instruction, history, state_dict, condition_dict,
+            gt_action, dataset, self.timestamp,
+        )
+        try:
+            parsed = ResponseMessage.deserialize(self._post("/act", request))
+        except (requests.Timeout, requests.HTTPError):
+            raise
+        except Exception as error:
+            raise RuntimeError(str(error)) from error
+        trajectory = parsed.traj_image
+        if not isinstance(trajectory, np.ndarray) or trajectory.ndim != 3:
+            trajectory = None
+        return parsed.action, parsed.err, trajectory
+
+    def query_rtc_action(
+        self, image_dict, instruction, state_dict, condition_dict,
+        *, history, dataset="simple",
+    ) -> RtcActionResponse:
+        request = RequestMessage(
+            image_dict, instruction, history, state_dict, condition_dict,
+            [], dataset, self.timestamp,
+        )
+        payload = self._post("/act-rtc-v1", request)
+        if set(payload) != {"action", "metadata"}:
+            raise RuntimeError("RTC response requires action and metadata")
+        metadata = payload["metadata"]
+        metadata_types = {
+            "session_id": str,
+            "request_seq": int,
+            "observation_tick": int,
+            "prediction_horizon": int,
+            "execution_horizon": int,
+            "rtc_delay_steps": int,
+            "first_action_tick": int,
+        }
+        if type(metadata) is not dict or set(metadata) != set(metadata_types):
+            raise RuntimeError("RTC response metadata key set")
+        for key, expected_type in metadata_types.items():
+            if type(metadata[key]) is not expected_type:
+                raise RuntimeError(f"RTC response metadata {key} type")
+        action = payload["action"]
+        if type(action) is not np.ndarray:
+            raise RuntimeError("RTC response action must be a NumPy array")
+        return RtcActionResponse(action=action, metadata=dict(metadata))
 ```
 
-Refactor the existing request serialization into one private `_post(path, request)` method that always passes `timeout=self.timeout`. Keep `query_action()` on `/act` with the same return tuple. Implement `query_rtc_action()` on `/act-rtc-v1`; require JSON keys `action` and `metadata`, deserialize NumPy payloads, require metadata's exact seven-key set shown in `RTC_METADATA` with `str` for `session_id` and exact `int` (not `bool`) for the other six keys, and return `RtcActionResponse` without adding or coercing missing metadata.
+Replace the old `HttpActionClient` class with this class rather than retaining two `query_action()` definitions. `_post()` always passes `timeout=self.timeout`; legacy `/act` keeps the same return tuple. `/act-rtc-v1` requires exactly `action` and `metadata`, deserializes NumPy payloads, requires metadata's exact seven-key set with `str` for `session_id` and exact `int` (not `bool`) for the other six keys, and returns `RtcActionResponse` without adding or coercing missing metadata.
 
 Implement in four bounded subactions, running the matching test after each:
 
@@ -1151,6 +1469,36 @@ def test_model_contract_is_canonical_and_complete():
     assert len(contract["robot_model"]["upper_position_limits"]) == 43
     assert len(contract["robot_model"]["upper_body_joint_names"]) == 31
     assert digest_model_contract(contract) == digest_model_contract(dict(contract))
+
+
+def test_model_contract_rejects_wrong_onnx_feature_signature():
+    def wrong_inspector(path):
+        del path
+        return {
+            "input": {
+                "name": "observations", "shape": ["dynamic", 515],
+                "feature_size": 515,
+            },
+            "output": {
+                "name": "actions", "shape": ["dynamic", 15],
+                "feature_size": 15,
+            },
+        }
+
+    with pytest.raises(ValueError, match="516"):
+        build_model_contract(
+            robot_model=instantiate_g1_robot_model(
+                waist_location="lower_and_upper_body"
+            ),
+            config=ControlLoopConfig(
+                interface="sim", enable_waist=True, domain_id=42
+            ),
+            repository_root=Path(decoupled_wbc.__file__).resolve().parent,
+            git_identity=GitIdentity(
+                commit="a" * 40, working_tree_clean=True
+            ),
+            onnx_inspector=wrong_inspector,
+        )
 ```
 
 Append this executable mutation matrix:
@@ -1195,14 +1543,13 @@ def test_each_identity_mutation_changes_digest_and_is_rejected(valid_contract, p
 Make construction injectable through `_build_attested_components(config, backend, factories)`. Add this complete test to `test_g1_control_loop_contract.py`:
 
 ```python
-from types import SimpleNamespace
-
-from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
-    _build_attested_components,
-)
-
-
 def test_service_is_created_only_after_model_policy_and_attestation():
+    from types import SimpleNamespace
+
+    from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
+        _build_attested_components,
+    )
+
     events = []
     robot_model = object()
     policy = object()
@@ -1235,6 +1582,22 @@ def test_service_is_created_only_after_model_policy_and_attestation():
     assert set(components.service_payload) >= {
         "model_contract", "model_contract_sha256"
     }
+
+
+def test_attested_runtime_cleanup_attempts_every_resource_in_order():
+    from types import SimpleNamespace
+
+    from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
+        _close_attested_runtime,
+    )
+
+    events = []
+    dispatcher = SimpleNamespace(stop=lambda: events.append("dispatcher"))
+    service = SimpleNamespace(close=lambda: events.append("service"))
+    manager = SimpleNamespace(shutdown=lambda: events.append("manager"))
+    environment = SimpleNamespace(close=lambda: events.append("environment"))
+    _close_attested_runtime(dispatcher, service, manager, environment)
+    assert events == ["dispatcher", "service", "manager", "environment"]
 ```
 
 - [ ] **Step 3: Run the nested tests and verify missing helper/order failures**
@@ -1254,7 +1617,22 @@ Expected: collection fails for the absent helper, and after the helper test impo
 Create `control/main/model_contract.py` with these exact public functions:
 
 ```python
+from dataclasses import dataclass
+
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+
+import onnxruntime as ort
+
+
 MODEL_CONTRACT_SCHEMA = "decoupled_wbc.g1-model-contract.v1"
+URDF_RELATIVE_PATH = (
+    "control/robot_model/model_data/g1/g1_29dof_with_hand.urdf"
+)
+ONNX_ROOT = Path("sim2mujoco/resources/robots/g1")
 
 
 @dataclass(frozen=True)
@@ -1277,28 +1655,157 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def inspect_git_identity(repository_root):
+    root = Path(repository_root)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    status = subprocess.run(
+        [
+            "git", "-C", str(root), "status", "--porcelain",
+            "--untracked-files=all",
+        ],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RuntimeError("WBC Git commit is not a full lowercase SHA")
+    if status:
+        raise RuntimeError("WBC working tree is not clean")
+    return GitIdentity(commit=commit, working_tree_clean=True)
+
+
+def _normalized_shape(shape):
+    return [dimension if type(dimension) is int else "dynamic" for dimension in shape]
+
+
+def inspect_onnx_signature(path):
+    session = ort.InferenceSession(
+        str(path), providers=["CPUExecutionProvider"]
+    )
+    inputs = session.get_inputs()
+    outputs = session.get_outputs()
+    if len(inputs) != 1 or len(outputs) != 1:
+        raise ValueError("WBC ONNX must have exactly one input and one output")
+
+    def tensor(node, expected_size):
+        shape = _normalized_shape(node.shape)
+        if not shape or shape[-1] != expected_size:
+            raise ValueError(f"WBC ONNX feature size must be {expected_size}")
+        return {
+            "name": str(node.name), "shape": shape,
+            "feature_size": expected_size,
+        }
+
+    return {
+        "input": tensor(inputs[0], 516),
+        "output": tensor(outputs[0], 15),
+    }
+
+
+def _validated_tensor_signature(value, expected_size):
+    if type(value) is not dict or set(value) != {
+        "name", "shape", "feature_size",
+    }:
+        raise ValueError("ONNX tensor signature key set")
+    if type(value["name"]) is not str or not value["name"]:
+        raise ValueError("ONNX tensor name")
+    if (
+        type(value["shape"]) is not list or not value["shape"]
+        or any(type(dimension) not in (str, int) for dimension in value["shape"])
+        or value["shape"][-1] != expected_size
+        or type(value["feature_size"]) is not int
+        or value["feature_size"] != expected_size
+    ):
+        raise ValueError(f"ONNX tensor feature size must be {expected_size}")
+    return {
+        "name": value["name"], "shape": list(value["shape"]),
+        "feature_size": expected_size,
+    }
+
+
+def build_model_contract(
+    robot_model, config, repository_root, *, git_identity=None,
+    onnx_inspector=inspect_onnx_signature,
+):
+    root = Path(repository_root).resolve()
+    identity = git_identity or inspect_git_identity(root)
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", identity.commit) is None
+        or identity.working_tree_clean is not True
+    ):
+        raise ValueError("invalid clean WBC Git identity")
+    names = tuple(robot_model.joint_names)
+    indices = tuple(robot_model.dof_index(name) for name in names)
+    if len(names) != 43 or len(set(names)) != 43 or indices != tuple(range(43)):
+        raise ValueError("G1 model must expose 43 unique ordered joints")
+    lower = [float(robot_model.lower_joint_limits[index]) for index in indices]
+    upper = [float(robot_model.upper_joint_limits[index]) for index in indices]
+    if any(not low < high for low, high in zip(lower, upper, strict=True)):
+        raise ValueError("G1 effective position limits are invalid")
+    upper_indices = tuple(robot_model.get_joint_group_indices("upper_body"))
+    upper_names = [names[index] for index in upper_indices]
+    if len(upper_names) != 31 or len(set(upper_names)) != 31:
+        raise ValueError("G1 upper body must expose 31 unique joints")
+
+    urdf = root / URDF_RELATIVE_PATH
+    model_paths = tuple(config.wbc_model_path.split(","))
+    if model_paths != (
+        "policy/GR00T-WholeBodyControl-Balance.onnx",
+        "policy/GR00T-WholeBodyControl-Walk.onnx",
+    ):
+        raise ValueError("unexpected WBC ONNX model paths")
+    onnx_models = []
+    for role, relative in zip(("balance", "walk"), model_paths, strict=True):
+        model_path = root / ONNX_ROOT / relative
+        signature = onnx_inspector(model_path)
+        if type(signature) is not dict or set(signature) != {"input", "output"}:
+            raise ValueError("ONNX inspector key set")
+        onnx_models.append({
+            "role": role,
+            "relative_path": (ONNX_ROOT / relative).as_posix(),
+            "sha256": sha256_file(model_path),
+            "input": _validated_tensor_signature(signature["input"], 516),
+            "output": _validated_tensor_signature(signature["output"], 15),
+        })
+    return {
+        "schema": MODEL_CONTRACT_SCHEMA,
+        "git": {
+            "commit": identity.commit,
+            "working_tree_clean": identity.working_tree_clean,
+        },
+        "robot_model": {
+            "name": "g1_29dof_with_hand",
+            "joint_names": list(names),
+            "lower_position_limits": lower,
+            "upper_position_limits": upper,
+            "upper_body_joint_names": upper_names,
+        },
+        "urdf": {
+            "relative_path": URDF_RELATIVE_PATH,
+            "sha256": sha256_file(urdf),
+        },
+        "onnx_models": onnx_models,
+    }
+
+
+def validate_expected_model_contract(actual, expected):
+    if canonical_json(actual) != canonical_json(expected):
+        raise ValueError("connected WBC model contract mismatch")
+
+
+def build_model_contract_payload(config, robot_model):
+    repository_root = Path(__file__).resolve().parents[2]
+    contract = build_model_contract(robot_model, config, repository_root)
+    payload = config.to_dict()
+    payload["model_contract"] = contract
+    payload["model_contract_sha256"] = digest_model_contract(contract)
+    return payload
 ```
 
-`build_model_contract(robot_model, config, repository_root)` must:
-
-1. call `inspect_git_identity(repository_root)` when no test identity is injected; it runs `git -C repository_root rev-parse HEAD`, requires a 40-character SHA, runs `git -C repository_root status --porcelain --untracked-files=all`, and requires empty output;
-2. permit tests to inject immutable `GitIdentity(commit, working_tree_clean)` so TDD can run while the not-yet-committed nested files are intentionally dirty;
-3. obtain all 43 names from `robot_model.joint_names` and use `robot_model.dof_index(name)` to read effective lower/upper values in that same order;
-4. obtain the 31 upper names by filtering the ordered 43-name list through `get_joint_group_indices("upper_body")`;
-5. hash `g1_29dof_with_hand.urdf`;
-6. resolve both configured ONNX paths under `sim2mujoco/resources/robots/g1`, hash them, and inspect their first input/output shapes with CPU ONNX Runtime;
-7. emit exactly the nested key schema asserted in Step 1: Git identity under `git`; model name/names/limits under `robot_model`; URDF identity under `urdf`; and ONNX identities under `onnx_models`. Normalize dynamic ONNX dimensions to the literal string `"dynamic"` and emit JSON-native strings, lists, integers, floats, and booleans only.
-
-Add `validate_expected_model_contract(actual, expected)` that compares canonical JSON and raises `ValueError("connected WBC model contract mismatch")` on any difference. Add `build_model_contract_payload(config, robot_model)` that returns:
-
-```python
-repository_root = Path(__file__).resolve().parents[2]
-contract = build_model_contract(robot_model, config, repository_root)
-payload = config.to_dict()
-payload["model_contract"] = contract
-payload["model_contract_sha256"] = digest_model_contract(contract)
-return payload
-```
+The injected Git identity and ONNX inspector are test seams only; production uses the clean nested checkout and CPU ONNX Runtime paths shown above. Every emitted value is JSON-native, and dynamic ONNX dimensions normalize to the literal string `"dynamic"`.
 
 Complete this step through the following bounded subactions, running the relevant single test each time:
 
@@ -1311,33 +1818,117 @@ Complete this step through the following bounded subactions, running the relevan
 
 - [ ] **Step 5: Add the injectable attested-component constructor**
 
-Add immutable `AttestedComponents` and `ProductionFactories`. Implement `_build_attested_components()` with exactly the ordering in the Step 2 test, and return the environment, model, policy, service payload, and service server. Keep each factory call on its own line so a construction exception prevents every later call.
+Extend the existing import header with the two imports at the start of this block, then add the complete constructor and cleanup helper to `run_g1_control_loop.py`. Keep each factory call on its own line so a construction exception prevents every later call:
+
+```python
+from dataclasses import dataclass
+
+from decoupled_wbc.control.main.model_contract import (
+    build_model_contract_payload,
+)
+
+
+@dataclass(frozen=True)
+class AttestedComponents:
+    environment: object
+    robot_model: object
+    wbc_policy: object
+    service_payload: dict[str, object]
+    robot_config_server: object
+
+
+class ProductionFactories:
+    def robot_model(self, **kwargs):
+        return instantiate_g1_robot_model(**kwargs)
+
+    def environment(self, **kwargs):
+        return G1Env(**kwargs)
+
+    def policy(self, *args, **kwargs):
+        return get_wbc_policy(*args, **kwargs)
+
+    def model_contract_payload(self, config, model):
+        return build_model_contract_payload(config, model)
+
+    def service_server(self, backend, topic, payload):
+        return create_service_server(backend, topic, payload)
+
+
+def _build_attested_components(config, backend, factories=None):
+    factories = factories or ProductionFactories()
+    wbc_config = config.load_wbc_yaml()
+    waist_location = (
+        "lower_and_upper_body" if config.enable_waist else "lower_body"
+    )
+    robot_model = factories.robot_model(
+        waist_location=waist_location,
+        high_elbow_pose=config.high_elbow_pose,
+    )
+    environment = factories.environment(
+        env_name=config.env_name,
+        robot_model=robot_model,
+        config=wbc_config,
+        wbc_version=config.wbc_version,
+        messaging_backend=backend,
+    )
+    if environment.sim and not config.sim_sync_mode:
+        environment.start_simulator()
+    wbc_policy = factories.policy(
+        "g1", robot_model, wbc_config, config.upper_body_joint_speed
+    )
+    service_payload = factories.model_contract_payload(config, robot_model)
+    robot_config_server = factories.service_server(
+        backend, ROBOT_CONFIG_TOPIC, service_payload
+    )
+    return AttestedComponents(
+        environment=environment,
+        robot_model=robot_model,
+        wbc_policy=wbc_policy,
+        service_payload=service_payload,
+        robot_config_server=robot_config_server,
+    )
+
+
+def _close_attested_runtime(dispatcher, service, manager, environment):
+    operations = [("dispatcher", dispatcher.stop)]
+    close_service = getattr(service, "close", None)
+    if callable(close_service):
+        operations.append(("service", close_service))
+    operations.extend((
+        ("manager", manager.shutdown),
+        ("environment", environment.close),
+    ))
+    errors = []
+    for name, operation in operations:
+        try:
+            operation()
+        except Exception as error:
+            errors.append(f"{name}: {error}")
+    if errors:
+        raise RuntimeError("WBC cleanup failed: " + "; ".join(errors))
+```
 
 - [ ] **Step 6: Move main-loop service publication behind the tested constructor**
 
-In `run_g1_control_loop.main()` preserve manager creation, call `_build_attested_components()`, unpack it, and retain the following production construction order inside the helper:
+Delete the old early `create_service_server(...)` call and the old inline WBC/model/environment/policy construction. Immediately after manager creation, insert this exact replacement in `run_g1_control_loop.main()`:
 
 ```python
-wbc_config = config.load_wbc_yaml()
-waist_location = "lower_and_upper_body" if config.enable_waist else "lower_body"
-robot_model = instantiate_g1_robot_model(
-    waist_location=waist_location, high_elbow_pose=config.high_elbow_pose
-)
-env = G1Env(
-    env_name=config.env_name,
-    robot_model=robot_model,
-    config=wbc_config,
-    wbc_version=config.wbc_version,
-    messaging_backend=backend,
-)
-if env.sim and not config.sim_sync_mode:
-    env.start_simulator()
-wbc_policy = get_wbc_policy("g1", robot_model, wbc_config, config.upper_body_joint_speed)
-service_payload = build_model_contract_payload(config, robot_model)
-robot_config_server = create_service_server(backend, ROBOT_CONFIG_TOPIC, service_payload)
+components = _build_attested_components(config, backend)
+env = components.environment
+robot_model = components.robot_model
+wbc_policy = components.wbc_policy
+robot_config_server = components.robot_config_server
 ```
 
-Keep `robot_config_server` alive for the function lifetime and close it in `finally` when the backend exposes `close()`.
+Keep `robot_config_server` alive for the function lifetime. Replace the existing `finally` body with a single `_close_attested_runtime(dispatcher, robot_config_server, manager, env)` call at the existing indentation. The helper attempts every cleanup operation, closes the attestation service before its messaging manager, supports backends without a service `close()`, and reports accumulated failures:
+
+```python
+_close_attested_runtime(
+    dispatcher, robot_config_server, manager, env
+)
+```
+
+Run Ruff against the complete modified file, not these insertion fragments in isolation. The existing file already owns the imports for `G1Env`, `ROBOT_CONFIG_TOPIC`, `get_wbc_policy`, `instantiate_g1_robot_model`, and `create_service_server`; Step 5 adds only the new `dataclass` and model-contract imports.
 
 - [ ] **Step 7: Run all nested contract/limit tests**
 
@@ -1562,6 +2153,12 @@ Expected: collection fails with `ModuleNotFoundError: simple.deploy`.
 Create in `psi0_simple_bridge.py`:
 
 ```python
+from dataclasses import dataclass
+from enum import Enum
+
+import numpy as np
+
+
 class BridgeMode(str, Enum):
     SHADOW = "shadow"
     SIM_CONTROL = "sim-control"
@@ -1595,22 +2192,104 @@ Export these plus the mapping functions from `src/simple/deploy/__init__.py`.
 
 - [ ] **Step 5: Implement mapping exclusively by joint name**
 
-Define `PSI0_STATE_JOINT_NAMES` and `PSI0_ACTION_JOINT_NAMES` as explicit tuples. Implement:
+Define the joint tuples and all three transforms literally:
 
 ```python
+PSI0_STATE_JOINT_NAMES = (
+    "left_hand_thumb_0_joint", "left_hand_thumb_1_joint",
+    "left_hand_thumb_2_joint", "left_hand_middle_0_joint",
+    "left_hand_middle_1_joint", "left_hand_index_0_joint",
+    "left_hand_index_1_joint", "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
+    "right_hand_index_0_joint", "right_hand_index_1_joint",
+    "right_hand_middle_0_joint", "right_hand_middle_1_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint",
+    "left_wrist_roll_joint", "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint", "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+    "right_elbow_joint", "right_wrist_roll_joint",
+    "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+)
+PSI0_ACTION_JOINT_NAMES = PSI0_STATE_JOINT_NAMES
+PSI0_WAIST_ACTION_NAMES = (
+    "waist_roll_joint", "waist_pitch_joint", "waist_yaw_joint",
+)
+PSI0_UPPER_ACTION_NAMES = frozenset(
+    (*PSI0_ACTION_JOINT_NAMES, *PSI0_WAIST_ACTION_NAMES)
+)
+
+
+def _upper_names(value):
+    names = tuple(value)
+    if (
+        len(names) != 31
+        or len(set(names)) != 31
+        or set(names) != PSI0_UPPER_ACTION_NAMES
+    ):
+        raise ValueError("expected one-to-one 31-joint upper body")
+    return names
+
+
 def build_psi0_observation(q, joint_names, command_history_rpyh):
     q = np.asarray(q, dtype=np.float32)
-    name_to_index = {name: index for index, name in enumerate(joint_names)}
-    if q.shape != (43,) or len(name_to_index) != 43:
+    names = tuple(joint_names)
+    name_to_index = {name: index for index, name in enumerate(names)}
+    if q.shape != (43,) or len(names) != 43 or len(name_to_index) != 43:
         raise ValueError("expected one-to-one 43-joint state")
+    if not np.isfinite(q).all() or any(
+        name not in name_to_index for name in PSI0_STATE_JOINT_NAMES
+    ):
+        raise ValueError("state is non-finite or missing a PSI0 joint")
     history = np.asarray(command_history_rpyh, dtype=np.float32)
-    if history.shape != (4,):
+    if history.shape != (4,) or not np.isfinite(history).all():
         raise ValueError("expected [roll,pitch,yaw,height] history")
     values = [q[name_to_index[name]] for name in PSI0_STATE_JOINT_NAMES]
-    return np.concatenate([np.asarray(values, np.float32), history])[None]
+    result = np.concatenate([np.asarray(values, np.float32), history])[None]
+    return np.ascontiguousarray(result, dtype=np.float32)
+
+
+def map_psi0_action_to_goal(action, upper_body_joint_names, now):
+    action = np.asarray(action, dtype=np.float32)
+    if action.shape != (36,) or not np.isfinite(action).all():
+        raise ValueError("expected finite 36-D PSI0 action")
+    names = _upper_names(upper_body_joint_names)
+    named = dict(zip(PSI0_ACTION_JOINT_NAMES, action[:28], strict=True))
+    named.update(dict(zip(PSI0_WAIST_ACTION_NAMES, action[28:31], strict=True)))
+    timestamp = float(now)
+    if not np.isfinite(timestamp):
+        raise ValueError("goal timestamp must be finite")
+    return Goal(
+        target_upper_body_pose=np.asarray(
+            [named[name] for name in names], dtype=np.float32
+        ),
+        base_height_command=np.ascontiguousarray(action[31:32]),
+        navigate_cmd=np.ascontiguousarray(action[32:36]),
+        timestamp=timestamp,
+        target_time=timestamp + 0.02,
+    )
+
+
+def goal_to_psi0_action(goal, upper_body_joint_names):
+    names = _upper_names(upper_body_joint_names)
+    upper = np.asarray(goal.target_upper_body_pose, dtype=np.float32)
+    height = np.asarray(goal.base_height_command, dtype=np.float32)
+    navigation = np.asarray(goal.navigate_cmd, dtype=np.float32)
+    if upper.shape != (31,) or height.shape != (1,) or navigation.shape != (4,):
+        raise ValueError("goal arrays must have shapes (31,), (1,), and (4,)")
+    if not all(np.isfinite(value).all() for value in (upper, height, navigation)):
+        raise ValueError("goal arrays must be finite")
+    named = dict(zip(names, upper, strict=True))
+    action = np.concatenate([
+        np.asarray([named[name] for name in PSI0_ACTION_JOINT_NAMES], np.float32),
+        np.asarray([named[name] for name in PSI0_WAIST_ACTION_NAMES], np.float32),
+        height,
+        navigation,
+    ])
+    return np.ascontiguousarray(action, dtype=np.float32)
 ```
 
-`map_psi0_action_to_goal(action, upper_body_joint_names, now)` must create a named action dictionary for 28 limb joints plus waist roll/pitch/yaw, gather it in the supplied 31-name order, and return finite float32 arrays with shapes `(31,)`, `(1,)`, `(4,)`. `goal_to_psi0_action()` performs the exact named inverse and forces no implicit clipping.
+Neither direction clips or reorders by numeric slice; every reordering is performed through the explicit joint-name dictionaries above.
 
 - [ ] **Step 6: Run mapping tests and commit**
 
@@ -2643,7 +3322,16 @@ Expected: failures identify absent `PolicyContract`, `RtcRequest`, `RtcResult`, 
 
 - [ ] **Step 5: Define strict policy-contract parsing and validation**
 
-Add `import re` with the other core imports, then add:
+Extend the existing import header (not the current insertion point) with these exact imports. They are all used by the completed Task 9 file:
+
+```python
+import re
+import threading
+from typing import Protocol
+import uuid
+```
+
+Then add:
 
 ```python
 @dataclass(frozen=True)
@@ -3332,7 +4020,7 @@ import pytest
 
 from decoupled_wbc.control.main.model_contract import digest_model_contract
 from scripts.psi0_simple_real_bridge import (
-    BoundedWbcConfigClient, PreflightError,
+    BoundedWbcConfigClient, GoalOwnershipGuard, PreflightError,
     compare_policy_contracts, establish_goal_ownership, run_preflight,
     validate_connected_wbc, validate_then_create_publisher,
 )
@@ -3349,6 +4037,9 @@ def test_matching_test_contract_is_accepted_only_for_sim_wbc():
     result = compare_policy_contracts(local, server, BridgeMode.SIM_CONTROL, "sim")
     assert result.policy_certified is True
     assert result.mismatched_fields == ()
+    shadow = compare_policy_contracts(local, server, BridgeMode.SHADOW, "sim")
+    assert shadow.policy_certified is False
+    assert shadow.mismatched_fields == ()
     with pytest.raises(PreflightError, match="test-only.*sim"):
         compare_policy_contracts(local, server, BridgeMode.SIM_CONTROL, "real")
 
@@ -3390,6 +4081,33 @@ def test_shadow_contract_failure_never_calls_publisher_factory():
     )
     assert result.policy_certified is False
     assert result.publisher_required is False
+
+
+def test_shadow_reports_wbc_differences_but_keeps_structural_joint_contract():
+    payload = copy.deepcopy(valid_wbc_payload())
+    payload["env_type"] = "real"
+    payload["interface"] = "robot0"
+    payload["model_contract"]["git"]["commit"] = "9" * 40
+    payload["model_contract_sha256"] = digest_model_contract(
+        payload["model_contract"]
+    )
+    graph = FakeGraph(publishers=2, subscriptions=1)
+    result = run_preflight(
+        mode=BridgeMode.SHADOW,
+        local_policy=policy_payload(),
+        server_policy=policy_payload(),
+        wbc_payload=payload,
+        graph=graph,
+        expected_model_contract=valid_model_contract(),
+        expected_gitlink_sha="1" * 40,
+    )
+    assert result.policy_certified is False
+    assert result.publisher_required is False
+    assert result.goal_counts_at_preflight == (2, 1)
+    assert result.joint_contract.joint_names == make_joint_contract().joint_names
+    assert result.wbc_mismatched_fields == (
+        "config.env_type", "config.interface", "model_contract.git.commit",
+    )
 ```
 
 No fixture is implicit: `valid_wbc_payload()` and `FakeGraph` are defined literally in Steps 2-3 of this same file.
@@ -3625,6 +4343,17 @@ def test_shadow_never_constructs_a_publisher_or_changes_counts():
     ) is None
     assert graph.counts("ControlPolicy/upper_body_pose") == (2, 1)
     assert calls == []
+
+
+def test_shadow_goal_counts_are_checked_during_and_at_end_of_lifetime():
+    graph = FakeGraph(2, 1)
+    guard = GoalOwnershipGuard(BridgeMode.SHADOW, graph, (2, 1))
+    guard.check()
+    graph.publishers = 3
+    with pytest.raises(PreflightError, match="counts changed"):
+        guard.check()
+    with pytest.raises(PreflightError, match="counts changed"):
+        guard.close()
 ```
 
 Create `tests/test_psi0_bridge_camera.py` with the real codec and explicit RGB default:
@@ -3697,24 +4426,97 @@ Expected: collection fails for missing runtime adapters.
 
 - [ ] **Step 5: Define an argparse surface with no real-control path**
 
-Expose exactly these operational options:
+Add these complete definitions to `scripts/psi0_simple_real_bridge.py`:
 
-```text
---mode {shadow,sim-control}
---server-host HOST
---server-port PORT
---instruction TEXT
---policy-contract PATH
---camera-host HOST
---camera-port PORT
---camera-source-key KEY
---camera-color-order {rgb,bgr}  # argparse choices=("rgb","bgr"), default="rgb"
---ros-domain-id 42
---unitree-domain-id 42
---metrics-jsonl PATH
+```python
+import argparse
+import base64
+from dataclasses import dataclass
+import ipaddress
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import select
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from typing import Callable
+
+import msgpack
+import msgpack_numpy as mnp
+import numpy as np
+import rclpy
+from rclpy.executors import SingleThreadedExecutor
+from std_msgs.msg import ByteMultiArray
+from std_srvs.srv import Trigger
+import zmq
+
+import decoupled_wbc
+from decoupled_wbc.control.main.model_contract import (
+    build_model_contract, digest_model_contract,
+)
+from decoupled_wbc.control.main.teleop.configs.configs import ControlLoopConfig
+from decoupled_wbc.control.robot_model.instantiation.g1 import (
+    instantiate_g1_robot_model,
+)
+from decoupled_wbc.control.sensor.sensor_server import ImageMessageSchema
+from simple.baselines.client import HttpActionClient
+from simple.deploy.psi0_simple_bridge import (
+    BridgeMode, BridgeState, JointContract, PolicyContract, Psi0SimpleBridge,
+    RtcResult, TimedCameraFrame, TimedRobotState,
+)
+
+
+CONTROL_GOAL_TOPIC = "ControlPolicy/upper_body_pose"
+
+
+class PreflightError(RuntimeError):
+    pass
+
+
+def _tcp_port(value):
+    port = int(value)
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be in [1,65535]")
+    return port
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument(
+        "--mode", required=True,
+        choices=(BridgeMode.SHADOW.value, BridgeMode.SIM_CONTROL.value),
+    )
+    parser.add_argument("--server-host", required=True)
+    parser.add_argument("--server-port", required=True, type=_tcp_port)
+    parser.add_argument("--instruction", required=True)
+    parser.add_argument("--policy-contract", required=True)
+    parser.add_argument("--camera-host", required=True)
+    parser.add_argument("--camera-port", required=True, type=_tcp_port)
+    parser.add_argument("--camera-source-key", required=True)
+    parser.add_argument(
+        "--camera-color-order", choices=("rgb", "bgr"), default="rgb",
+    )
+    parser.add_argument("--ros-domain-id", type=int, default=42)
+    parser.add_argument("--unitree-domain-id", type=int, default=42)
+    parser.add_argument("--metrics-jsonl", required=True)
+    return parser
+
+
+def build_policy_client(host, port):
+    if type(host) is not str or not host:
+        raise ValueError("policy host must be a non-empty string")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError("policy port must be an integer in [1,65535]")
+    return HttpActionClient(host, port, timeout=5.0)
 ```
 
-Validate `BridgeMode(args.mode)` and ensure no parser branch accepts `real`, `real-control`, a robot NIC, or a low-level DDS topic.
+`main()` immediately constructs `BridgeMode(args.mode)`. The parser has no branch for `real`, `real-control`, a robot NIC, or a low-level DDS topic, and `build_policy_client()` is the only production construction site for the bridge HTTP client.
 
 - [ ] **Step 6: Implement strict local/server policy comparison**
 
@@ -3764,7 +4566,8 @@ def compare_policy_contracts(local, server, mode, wbc_env_type):
         raise PreflightError(
             "policy contract mismatch: " + ",".join(mismatches)
         )
-    return PolicyPreflightResult(not mismatches, mismatches)
+    certified = mode is BridgeMode.SIM_CONTROL and not mismatches
+    return PolicyPreflightResult(certified, mismatches)
 ```
 
 The tuple is the canonical wire order; never use set iteration for error order.
@@ -3842,17 +4645,7 @@ def create_ros_wbc_config_client(service_name, domain_id):
     )
 ```
 
-The temporary client uses its own rclpy context, so its unconditional `context.shutdown()` cannot stop the runtime context created later. Read the expected nested SHA with:
-
-```python
-subprocess.run(
-    ["git", "rev-parse", "HEAD:third_party/decoupled_wbc"],
-    cwd=repository_root,
-    check=True,
-    capture_output=True,
-    text=True,
-)
-```
+The temporary client uses its own rclpy context, so its unconditional `context.shutdown()` cannot stop the runtime context created later. The complete `_git_stdout()` and `build_local_wbc_identity()` definitions in Step 10 own the root-gitlink lookup; there is no bare subprocess fragment in this step.
 
 Use this exact digest-first validator; nested field tests recompute the digest specifically to reach `_first_difference()`:
 
@@ -3905,9 +4698,7 @@ def _first_difference(actual, expected, path="model_contract"):
     return None if actual == expected else path
 
 
-def validate_connected_wbc(
-    *, actual, expected_contract, expected_gitlink_sha, required_domain_id,
-):
+def _extract_attested_joint_contract(actual):
     if type(actual) is not dict:
         raise PreflightError("WBC payload must be a dictionary")
     contract = actual.get("model_contract")
@@ -3920,7 +4711,100 @@ def validate_connected_wbc(
         raise PreflightError(f"model contract digest input: {error}") from error
     if transmitted != recomputed:
         raise PreflightError("model contract digest mismatch")
+    if set(contract) != {
+        "schema", "git", "robot_model", "urdf", "onnx_models",
+    } or contract.get("schema") != "decoupled_wbc.g1-model-contract.v1":
+        raise PreflightError("connected WBC model contract schema")
+    git = contract.get("git")
+    if (
+        type(git) is not dict or set(git) != {"commit", "working_tree_clean"}
+        or type(git.get("commit")) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", git["commit"]) is None
+        or type(git.get("working_tree_clean")) is not bool
+    ):
+        raise PreflightError("connected WBC Git identity schema")
+    urdf = contract.get("urdf")
+    if (
+        type(urdf) is not dict or set(urdf) != {"relative_path", "sha256"}
+        or type(urdf.get("relative_path")) is not str
+        or type(urdf.get("sha256")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", urdf["sha256"]) is None
+    ):
+        raise PreflightError("connected WBC URDF identity schema")
+    onnx_models = contract.get("onnx_models")
+    if type(onnx_models) is not list or len(onnx_models) != 2:
+        raise PreflightError("connected WBC ONNX identity schema")
+    for model_entry, role in zip(onnx_models, ("balance", "walk"), strict=True):
+        if (
+            type(model_entry) is not dict
+            or set(model_entry) != {
+                "role", "relative_path", "sha256", "input", "output",
+            }
+            or model_entry.get("role") != role
+            or type(model_entry.get("relative_path")) is not str
+            or type(model_entry.get("sha256")) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", model_entry["sha256"]) is None
+        ):
+            raise PreflightError("connected WBC ONNX identity schema")
+        for direction, size in (("input", 516), ("output", 15)):
+            tensor = model_entry.get(direction)
+            if (
+                type(tensor) is not dict
+                or set(tensor) != {"name", "shape", "feature_size"}
+                or type(tensor.get("name")) is not str
+                or type(tensor.get("shape")) is not list
+                or not tensor["shape"]
+                or any(type(dim) not in (str, int) for dim in tensor["shape"])
+                or type(tensor.get("feature_size")) is not int
+                or tensor["feature_size"] != size
+                or tensor["shape"][-1] != size
+            ):
+                raise PreflightError("connected WBC ONNX tensor schema")
+    try:
+        model = contract["robot_model"]
+        if (
+            type(model) is not dict
+            or set(model) != {
+                "name", "joint_names", "lower_position_limits",
+                "upper_position_limits", "upper_body_joint_names",
+            }
+            or type(model.get("name")) is not str
+            or any(
+                type(model.get(key)) is not list
+                for key in (
+                    "joint_names", "lower_position_limits",
+                    "upper_position_limits", "upper_body_joint_names",
+                )
+            )
+        ):
+            raise TypeError("robot model identity schema")
+        names = tuple(model["joint_names"])
+        upper = tuple(model["upper_body_joint_names"])
+        lower = np.asarray(model["lower_position_limits"], np.float32)
+        high = np.asarray(model["upper_position_limits"], np.float32)
+    except (KeyError, TypeError, ValueError) as error:
+        raise PreflightError(f"connected WBC joint contract: {error}") from error
+    if (
+        len(names) != 43 or len(set(names)) != 43
+        or len(upper) != 31 or len(set(upper)) != 31
+        or any(type(name) is not str for name in names)
+        or any(type(name) is not str for name in upper)
+        or any(name not in names for name in upper)
+    ):
+        raise PreflightError("connected WBC joint_names/upper_body dimensions")
+    if (
+        lower.shape != (43,) or high.shape != (43,)
+        or not np.isfinite(lower).all() or not np.isfinite(high).all()
+        or not np.all(lower < high)
+    ):
+        raise PreflightError("connected WBC effective limits")
+    return ValidatedWbc(JointContract(names, upper, lower, high)), contract
 
+
+def validate_connected_wbc(
+    *, actual, expected_contract, expected_gitlink_sha, required_domain_id,
+):
+    validated, contract = _extract_attested_joint_contract(actual)
     required = {**EXPECTED_WBC_FIELDS, "domain_id": required_domain_id}
     for key, expected in required.items():
         if key not in actual or type(actual[key]) is not type(expected):
@@ -3932,17 +4816,24 @@ def validate_connected_wbc(
     difference = _first_difference(contract, expected_contract)
     if difference is not None:
         raise PreflightError(f"connected WBC {difference} mismatch")
+    return validated
 
-    model = contract["robot_model"]
-    names = tuple(model["joint_names"])
-    upper = tuple(model["upper_body_joint_names"])
-    lower = np.asarray(model["lower_position_limits"], np.float32)
-    high = np.asarray(model["upper_position_limits"], np.float32)
-    if len(names) != 43 or len(set(names)) != 43 or len(upper) != 31:
-        raise PreflightError("connected WBC joint_names/upper_body dimensions")
-    if lower.shape != (43,) or high.shape != (43,) or not np.all(lower < high):
-        raise PreflightError("connected WBC effective limits")
-    return ValidatedWbc(JointContract(names, upper, lower, high))
+
+def inspect_shadow_wbc(
+    *, actual, expected_contract, expected_gitlink_sha, required_domain_id,
+):
+    validated, contract = _extract_attested_joint_contract(actual)
+    mismatches = []
+    required = {**EXPECTED_WBC_FIELDS, "domain_id": required_domain_id}
+    for key, expected in required.items():
+        if type(actual.get(key)) is not type(expected) or actual.get(key) != expected:
+            mismatches.append(f"config.{key}")
+    difference = _first_difference(contract, expected_contract)
+    if difference is not None:
+        mismatches.append(difference)
+    elif contract.get("git", {}).get("commit") != expected_gitlink_sha:
+        mismatches.append("model_contract.git.commit")
+    return validated, tuple(mismatches)
 
 
 def validate_then_create_publisher(
@@ -4035,13 +4926,16 @@ class RosGoalPublisher:
 
 
 def validate_goal_ownership_preflight(mode, graph):
-    if mode is BridgeMode.SHADOW:
-        return
-    before = graph.counts(CONTROL_GOAL_TOPIC)
-    if before != (0, 1):
+    before = tuple(graph.counts(CONTROL_GOAL_TOPIC))
+    if (
+        len(before) != 2 or any(type(value) is not int or value < 0 for value in before)
+    ):
+        raise PreflightError("goal publisher/subscription counts are invalid")
+    if mode is BridgeMode.SIM_CONTROL and before != (0, 1):
         raise PreflightError(
             f"expected 0 publishers/1 subscription before bridge, got {before}"
         )
+    return before
 
 
 def establish_goal_ownership(mode, graph, publisher_factory):
@@ -4058,6 +4952,26 @@ def establish_goal_ownership(mode, graph, publisher_factory):
             f"expected 1 publisher/1 subscription after bridge, got {after}"
         )
     return publisher
+
+
+class GoalOwnershipGuard:
+    def __init__(self, mode, graph, expected_counts):
+        self.mode = BridgeMode(mode)
+        self.graph = graph
+        self.expected_counts = tuple(expected_counts)
+
+    def check(self):
+        if self.mode is not BridgeMode.SHADOW:
+            return
+        current = tuple(self.graph.counts(CONTROL_GOAL_TOPIC))
+        if current != self.expected_counts:
+            raise PreflightError(
+                "shadow goal publisher counts changed: "
+                f"{self.expected_counts} -> {current}"
+            )
+
+    def close(self, timeout_s=0.0):
+        self.check()
 ```
 
 Run the graph tests and prove rejected preflight never invokes the publisher factory.
@@ -4073,8 +4987,8 @@ Create concrete `RosStateSource` and `ComposedCameraReader` classes in the scrip
 ```python
 @dataclass(frozen=True)
 class RuntimeAdapters:
-    state_source: RosStateSource
-    camera_reader: ComposedCameraReader
+    state_source: "RosStateSource"
+    camera_reader: "ComposedCameraReader"
     goal_publisher: RosGoalPublisher | None
     ros_runtime: RosRuntime | None = None
 
@@ -4092,6 +5006,12 @@ def build_runtime_adapters(
     if preflight_result.publisher_required != (mode is BridgeMode.SIM_CONTROL):
         raise PreflightError("preflight publisher requirement does not match mode")
     graph = test_dependencies.graph()
+    if (
+        mode is BridgeMode.SHADOW
+        and tuple(graph.counts(CONTROL_GOAL_TOPIC))
+        != tuple(preflight_result.goal_counts_at_preflight)
+    ):
+        raise PreflightError("shadow goal counts changed after preflight")
     publisher = establish_goal_ownership(mode, graph, publisher_factory)
     state_source = None
     camera_reader = None
@@ -4107,7 +5027,7 @@ def build_runtime_adapters(
         raise
 ```
 
-Production creates one `RosRuntime`, then passes factories closing over it; after construction, replace the returned value with `dataclasses.replace(adapters, ros_runtime=runtime)`. `RuntimeAdapters.close()` is not added: the shutdown coordinator owns and closes each field once in its defined order.
+Production creates one `RosRuntime`, then passes factories closing over it; after construction, it reconstructs `RuntimeAdapters(adapters.state_source, adapters.camera_reader, adapters.goal_publisher, runtime)` exactly as shown in `run_bridge()` below. `RuntimeAdapters.close()` is not added: the shutdown coordinator owns and closes each field once in its defined order.
 
 `RosStateSource.poll()` returns `TimedRobotState | None`. Add this complete implementation, including the callback-time receive timestamp rather than a poll-time timestamp:
 
@@ -4269,8 +5189,10 @@ Implement the preflight as a pure orchestrator with the exact call order below. 
 class PreflightResult:
     policy_certified: bool
     policy_mismatched_fields: tuple[str, ...]
+    wbc_mismatched_fields: tuple[str, ...]
     joint_contract: JointContract
     publisher_required: bool
+    goal_counts_at_preflight: tuple[int, int]
 
 
 def run_preflight(
@@ -4279,12 +5201,21 @@ def run_preflight(
 ):
     mode = BridgeMode(mode)
     local = PolicyContract.from_dict(local_policy)
-    validated_wbc = validate_connected_wbc(
-        actual=wbc_payload,
-        expected_contract=expected_model_contract,
-        expected_gitlink_sha=expected_gitlink_sha,
-        required_domain_id=required_domain_id,
-    )
+    if mode is BridgeMode.SHADOW:
+        validated_wbc, wbc_mismatches = inspect_shadow_wbc(
+            actual=wbc_payload,
+            expected_contract=expected_model_contract,
+            expected_gitlink_sha=expected_gitlink_sha,
+            required_domain_id=required_domain_id,
+        )
+    else:
+        validated_wbc = validate_connected_wbc(
+            actual=wbc_payload,
+            expected_contract=expected_model_contract,
+            expected_gitlink_sha=expected_gitlink_sha,
+            required_domain_id=required_domain_id,
+        )
+        wbc_mismatches = ()
     try:
         server = PolicyContract.from_dict(server_policy)
         policy_result = compare_policy_contracts(
@@ -4294,12 +5225,17 @@ def run_preflight(
         if mode is not BridgeMode.SHADOW:
             raise
         policy_result = PolicyPreflightResult(False, (str(error),))
-    validate_goal_ownership_preflight(mode, graph)
+    goal_counts = validate_goal_ownership_preflight(mode, graph)
     return PreflightResult(
-        policy_certified=policy_result.policy_certified,
+        policy_certified=(
+            policy_result.policy_certified
+            if mode is BridgeMode.SIM_CONTROL else False
+        ),
         policy_mismatched_fields=policy_result.mismatched_fields,
+        wbc_mismatched_fields=wbc_mismatches,
         joint_contract=validated_wbc.joint_contract,
         publisher_required=(mode is BridgeMode.SIM_CONTROL),
+        goal_counts_at_preflight=goal_counts,
     )
 ```
 
@@ -4308,17 +5244,6 @@ The real `run_bridge()` calls: parser/mode validation; `create_ros_wbc_config_cl
 Construct the local WBC identity with this exact helper; it proves the root gitlink, nested HEAD, nested cleanliness, and locally hashed model all describe one checkout:
 
 ```python
-from pathlib import Path
-import subprocess
-
-import decoupled_wbc
-from decoupled_wbc.control.main.model_contract import build_model_contract
-from decoupled_wbc.control.main.teleop.configs.configs import ControlLoopConfig
-from decoupled_wbc.control.robot_model.instantiation.g1 import (
-    instantiate_g1_robot_model,
-)
-
-
 @dataclass(frozen=True)
 class LocalWbcIdentity:
     root_gitlink_sha: str
@@ -4393,19 +5318,25 @@ Expected: all preflight/camera tests pass, including proof that rejected preflig
 Create `tests/test_psi0_bridge_runtime.py` with these literal ownership cases:
 
 ```python
+import json
 import os
 import pty
 import termios
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from scripts.psi0_simple_real_bridge import (
-    FiftyHzLoop, HttpInferenceWorker, LocalKeyboard, ShutdownCoordinator,
+    ConnectionEvidenceRecorder, FiftyHzLoop, HttpInferenceWorker,
+    JsonlMetrics, LocalKeyboard, PreflightError,
+    count_real_interface_connections,
 )
 from simple.baselines.client import RtcActionResponse
-from simple.deploy.psi0_simple_bridge import PolicyContract, RtcRequest
+from simple.deploy.psi0_simple_bridge import (
+    BridgeMode, BridgeState, PolicyContract, RtcRequest, TimedCameraFrame,
+)
 from tests.psi0_bridge_testkit import ManualClock, policy_payload
 
 
@@ -4488,6 +5419,70 @@ def test_one_blocked_worker_never_blocks_tick_thread_or_allows_replacement():
     worker.close(timeout_s=0.5)
     assert worker.busy is False
     assert worker.thread.ident == thread_identity
+
+
+def test_every_shadow_metric_and_preview_is_uncertified(tmp_path):
+    path = tmp_path / "shadow.jsonl"
+    bridge = SimpleNamespace(
+        state=BridgeState.PAUSED, generation=3,
+    )
+    metrics = JsonlMetrics(
+        path, mode=BridgeMode.SHADOW, policy_certified=False,
+        clock=lambda: 1.25,
+    )
+    metrics.write_event("request", request_seq=7)
+    metrics.write_event("result", request_seq=7)
+    metrics.write_event("preview", navigate_cmd=[0.0] * 4)
+    metrics.write("tick", bridge, published=False, previewed=True)
+    with pytest.raises(ValueError, match="owned by JsonlMetrics"):
+        metrics.write_event("override", policy_certified=True)
+    metrics.close()
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["event"] for record in records] == [
+        "request", "result", "preview", "tick",
+    ]
+    assert all(record["policy_certified"] is False for record in records)
+
+
+def test_connection_evidence_requires_successful_runtime_observations():
+    times = iter((1.0, 1.1, 1.2, 2.0, 2.1, 2.2))
+    recorder = ConnectionEvidenceRecorder(clock=lambda: next(times))
+    with pytest.raises(PreflightError, match="missing observed"):
+        recorder.snapshot(required_components={"wbc", "camera", "policy"})
+    recorder.observe_wbc_response({"env_type": "sim", "interface": "lo"})
+    recorder.observe_camera_frame(
+        "127.0.0.1",
+        TimedCameraFrame(
+            np.zeros((8, 8, 3), np.uint8), received_at=1.05,
+            producer_timestamp=1.0,
+        ),
+    )
+    recorder.observe_policy_contract("localhost", policy_payload())
+    evidence = recorder.snapshot(
+        required_components={"wbc", "camera", "policy"}
+    )
+    assert [record["component"] for record in evidence] == [
+        "wbc", "camera", "policy",
+    ]
+    assert count_real_interface_connections(evidence) == 0
+    assert all(type(record["observed_at"]) is float for record in evidence)
+    with pytest.raises(PreflightError, match="duplicate"):
+        recorder.observe_policy_contract("localhost", policy_payload())
+
+    remote = ConnectionEvidenceRecorder(clock=lambda: next(times))
+    remote.observe_wbc_response({"env_type": "sim", "interface": "lo"})
+    remote.observe_camera_frame(
+        "127.0.0.1",
+        TimedCameraFrame(
+            np.zeros((8, 8, 3), np.uint8), received_at=2.05,
+            producer_timestamp=2.0,
+        ),
+    )
+    remote.observe_policy_contract("192.0.2.10", policy_payload())
+    evidence = remote.snapshot(
+        required_components={"wbc", "camera", "policy"}
+    )
+    assert count_real_interface_connections(evidence) == 1
 ```
 
 No pytest fixture is implicit in these tests.
@@ -4507,6 +5502,8 @@ import sys
 import time
 
 import numpy as np
+
+from scripts.psi0_simple_real_bridge import ShutdownCoordinator
 
 
 def wait_for(path, timeout_s=2.0):
@@ -4643,12 +5640,13 @@ def test_every_cleanup_timeout_shares_one_absolute_long_path_deadline():
     sink = BudgetedSink(clock)
     camera = BudgetedCloser(clock, consume=0.5)
     worker = BudgetedCloser(clock, consume=5.5, busy=True)
-    remaining_resources = [BudgetedCloser(clock) for _ in range(4)]
+    remaining_resources = [BudgetedCloser(clock) for _ in range(5)]
     coordinator = ShutdownCoordinator(
         bridge=ShutdownBridge(hold=object()), command_sink=sink,
         camera=camera, worker=worker, state_source=remaining_resources[0],
-        keyboard=remaining_resources[1], ros_runtime=remaining_resources[2],
-        metrics=remaining_resources[3], clock=clock, sleep=clock.sleep,
+        keyboard=remaining_resources[1], ownership_guard=remaining_resources[2],
+        ros_runtime=remaining_resources[3], metrics=remaining_resources[4],
+        clock=clock, sleep=clock.sleep,
     )
     report = coordinator.close()
     assert sink.published == 25
@@ -4662,12 +5660,13 @@ def test_every_cleanup_timeout_shares_one_absolute_long_path_deadline():
 def test_no_state_cleanup_uses_one_half_second_deadline():
     clock = AdvancingClock()
     sink = BudgetedSink(clock)
-    resources = [BudgetedCloser(clock) for _ in range(6)]
+    resources = [BudgetedCloser(clock) for _ in range(7)]
     coordinator = ShutdownCoordinator(
         bridge=ShutdownBridge(hold=None), command_sink=sink,
         camera=resources[0], worker=resources[1], state_source=resources[2],
-        keyboard=resources[3], ros_runtime=resources[4], metrics=resources[5],
-        clock=clock, sleep=clock.sleep,
+        keyboard=resources[3], ownership_guard=resources[4],
+        ros_runtime=resources[5], metrics=resources[6], clock=clock,
+        sleep=clock.sleep,
     )
     report = coordinator.close()
     assert sink.published == 0
@@ -4682,6 +5681,12 @@ def test_no_state_cleanup_uses_one_half_second_deadline():
 `HttpInferenceWorker` owns one daemon thread and one `HttpActionClient(timeout=5.0)`. Add this complete implementation; `contract` and `instruction` are constructor arguments in production, while the runtime unit test may inject their defaults:
 
 ```python
+@dataclass
+class WorkerMetrics:
+    requests_submitted: int = 0
+    first_request_started_at: float | None = None
+
+
 class HttpInferenceWorker:
     def __init__(
         self, *, client, clock, contract, instruction="instruction",
@@ -4759,7 +5764,6 @@ class HttpInferenceWorker:
                     {},
                     history=self._serialize_history(request),
                     dataset="simple",
-                    gt_action=[],
                 )
                 result = RtcResult(
                     generation=request.generation,
@@ -4848,21 +5852,26 @@ class LocalKeyboard:
 
 
 class JsonlMetrics:
-    def __init__(self, path, *, mode, clock=time.monotonic):
+    def __init__(
+        self, path, *, mode, policy_certified, clock=time.monotonic,
+    ):
         self._file = Path(path).open("x", encoding="utf-8")
         self._mode = mode.value
+        self._policy_certified = bool(policy_certified)
         self._clock = clock
         self._closed = False
         self._lock = threading.Lock()
 
-    def write(self, event, bridge, *, published, policy_certified, **fields):
+    def write(self, event, bridge, *, published, **fields):
         if self._closed:
             raise RuntimeError("metrics writer is closed")
+        if "policy_certified" in fields:
+            raise ValueError("policy certification is owned by JsonlMetrics")
         payload = {
             "event": event, "mode": self._mode, "state": bridge.state.value,
             "generation": bridge.generation, "monotonic_s": self._clock(),
             "published": bool(published),
-            "policy_certified": bool(policy_certified), **fields,
+            "policy_certified": self._policy_certified, **fields,
         }
         with self._lock:
             self._file.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -4871,9 +5880,12 @@ class JsonlMetrics:
     def write_event(self, event, **fields):
         if self._closed:
             raise RuntimeError("metrics writer is closed")
+        if "policy_certified" in fields:
+            raise ValueError("policy certification is owned by JsonlMetrics")
         payload = {
             "event": event, "mode": self._mode,
-            "monotonic_s": self._clock(), **fields,
+            "monotonic_s": self._clock(),
+            "policy_certified": self._policy_certified, **fields,
         }
         with self._lock:
             self._file.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -4910,16 +5922,19 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
-import requests
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from scripts.psi0_simple_real_bridge import HttpInferenceWorker, ShutdownCoordinator
-from simple.baselines.client import (
+from scripts.psi0_simple_real_bridge import (  # noqa: E402
+    HttpInferenceWorker, ShutdownCoordinator,
+)
+from simple.baselines.client import (  # noqa: E402
     HttpActionClient, convert_numpy_in_dict, numpy_serialize,
 )
-from simple.deploy.psi0_simple_bridge import PolicyContract, RtcRequest
+from simple.deploy.psi0_simple_bridge import (  # noqa: E402
+    PolicyContract, RtcRequest,
+)
 
 
 class FixtureBridge:
@@ -5112,10 +6127,11 @@ def main(argv=None):
     ros = ClosingResource()
     keyboard = ClosingResource()
     metrics = ClosingResource()
+    ownership_guard = ClosingResource()
     coordinator = ShutdownCoordinator(
         bridge=bridge, command_sink=sink, camera=camera, worker=worker,
-        state_source=state, ros_runtime=ros, keyboard=keyboard,
-        metrics=metrics,
+        state_source=state, ownership_guard=ownership_guard,
+        ros_runtime=ros, keyboard=keyboard, metrics=metrics,
     )
 
     interrupted = threading.Event()
@@ -5193,13 +6209,15 @@ class ShutdownReport:
 class ShutdownCoordinator:
     def __init__(
         self, *, bridge, command_sink, camera, worker, state_source,
-        ros_runtime, keyboard, metrics, clock=time.monotonic, sleep=time.sleep,
+        ownership_guard, ros_runtime, keyboard, metrics,
+        clock=time.monotonic, sleep=time.sleep,
     ):
         self.bridge = bridge
         self.command_sink = command_sink
         self.camera = camera
         self.worker = worker
         self.state_source = state_source
+        self.ownership_guard = ownership_guard
         self.ros_runtime = ros_runtime
         self.keyboard = keyboard
         self.metrics = metrics
@@ -5259,6 +6277,7 @@ class ShutdownCoordinator:
         close_resource("worker", self.worker, 5.5)
         close_resource("state", self.state_source)
         close_resource("keyboard", self.keyboard)
+        close_resource("ownership_guard", self.ownership_guard)
         close_resource("ros", self.ros_runtime)
         close_resource("metrics", self.metrics)
         finished_at = self.clock()
@@ -5291,12 +6310,15 @@ class FiftyHzLoop:
         self._next = first + count * 0.02
 
 
-def run_runtime(bridge, adapters, keyboard, coordinator, metrics, certified):
+def run_runtime(
+    bridge, adapters, keyboard, coordinator, metrics, ownership_guard,
+):
     latest_state = None
     latest_camera = None
 
     def one_tick(_scheduled):
         nonlocal latest_state, latest_camera
+        ownership_guard.check()
         state = adapters.state_source.poll()
         camera = adapters.camera_reader.poll()
         latest_state = state if state is not None else latest_state
@@ -5311,8 +6333,7 @@ def run_runtime(bridge, adapters, keyboard, coordinator, metrics, certified):
             published=(
                 adapters.goal_publisher is not None and result.goal is not None
             ),
-            policy_certified=certified, tick=result.tick,
-            source_kind=result.source_kind,
+            tick=result.tick, source_kind=result.source_kind,
             previewed=(
                 adapters.goal_publisher is None and result.goal is not None
             ),
@@ -5358,6 +6379,103 @@ class ShadowPreviewSink:
         self.closed = True
 
 
+def _is_loopback_host(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class ConnectionEvidenceRecorder:
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._records = {}
+
+    def _observe(self, component, transport, endpoint, real_interface):
+        if component in self._records:
+            raise PreflightError(f"duplicate observed connection: {component}")
+        if type(endpoint) is not str or not endpoint:
+            raise PreflightError(f"invalid observed endpoint: {component}")
+        self._records[component] = {
+            "component": component,
+            "transport": transport,
+            "endpoint": endpoint,
+            "real_interface": bool(real_interface),
+            "observed_at": float(self._clock()),
+        }
+
+    def observe_wbc_response(self, payload):
+        if type(payload) is not dict:
+            raise PreflightError("WBC response observation requires payload")
+        interface = payload.get("interface")
+        env_type = payload.get("env_type")
+        if type(interface) is not str or type(env_type) is not str:
+            raise PreflightError("WBC response lacks interface identity")
+        self._observe(
+            "wbc", "dds-service-response", interface,
+            not (env_type == "sim" and interface == "lo"),
+        )
+
+    def observe_camera_frame(self, host, frame):
+        if (
+            type(frame) is not TimedCameraFrame
+            or type(frame.image) is not np.ndarray
+            or frame.image.dtype != np.uint8
+            or frame.image.ndim != 3
+            or frame.image.shape[2] != 3
+        ):
+            raise PreflightError("camera observation requires a decoded frame")
+        self._observe(
+            "camera", "decoded-frame", host, not _is_loopback_host(host)
+        )
+
+    def observe_policy_contract(self, host, payload):
+        if type(payload) is not dict or not payload:
+            raise PreflightError("policy observation requires contract response")
+        self._observe(
+            "policy", "http-contract-response", host,
+            not _is_loopback_host(host),
+        )
+
+    def snapshot(self, required_components):
+        required = set(required_components)
+        missing = required - set(self._records)
+        if missing:
+            raise PreflightError(
+                "missing observed connections: " + ",".join(sorted(missing))
+            )
+        order = ("wbc", "camera", "policy")
+        evidence = [dict(self._records[name]) for name in order if name in self._records]
+        count_real_interface_connections(evidence)
+        return evidence
+
+
+def count_real_interface_connections(evidence):
+    expected_keys = {
+        "component", "transport", "endpoint", "real_interface", "observed_at",
+    }
+    allowed_components = {"wbc", "camera", "policy"}
+    if type(evidence) is not list or not 1 <= len(evidence) <= 3:
+        raise PreflightError("connection evidence record count")
+    components = [record.get("component") for record in evidence]
+    if len(set(components)) != len(components) or not set(components) <= allowed_components:
+        raise PreflightError("connection evidence component set")
+    for record in evidence:
+        if type(record) is not dict or set(record) != expected_keys:
+            raise PreflightError("connection evidence record schema")
+        if (
+            type(record["transport"]) is not str
+            or type(record["endpoint"]) is not str
+            or type(record["real_interface"]) is not bool
+            or type(record["observed_at"]) is not float
+            or not np.isfinite(record["observed_at"])
+        ):
+            raise PreflightError("connection evidence record types")
+    return sum(record["real_interface"] for record in evidence)
+
+
 def _close_partial(resources):
     errors = []
     seen = set()
@@ -5381,16 +6499,21 @@ def run_bridge(args):
     repository_root = Path(__file__).resolve().parents[1]
     resources = []
     coordinator = None
+    connection_recorder = ConnectionEvidenceRecorder()
     try:
         runtime = RosRuntime(args.ros_domain_id)
         resources.append(("ros", runtime))
         wbc_payload = create_ros_wbc_config_client(
             "WBCPolicy/robot_config", args.ros_domain_id
         ).get_config(3.0)
+        connection_recorder.observe_wbc_response(wbc_payload)
         local_policy_payload = json.loads(Path(args.policy_contract).read_text())
         policy_client = build_policy_client(args.server_host, args.server_port)
         try:
             server_policy_payload = policy_client.get_contract(timeout=2.0)
+            connection_recorder.observe_policy_contract(
+                args.server_host, server_policy_payload
+            )
         except Exception:
             if mode is not BridgeMode.SHADOW:
                 raise
@@ -5427,7 +6550,18 @@ def run_bridge(args):
             ("state", adapters.state_source),
             ("camera", adapters.camera_reader),
         ))
-        metrics = JsonlMetrics(args.metrics_jsonl, mode=mode)
+        observed_camera = adapters.camera_reader.wait_for_frame(timeout_s=1.0)
+        connection_recorder.observe_camera_frame(
+            args.camera_host, observed_camera
+        )
+        ownership_guard = GoalOwnershipGuard(
+            mode, runtime, preflight.goal_counts_at_preflight
+        )
+        resources.append(("ownership_guard", ownership_guard))
+        metrics = JsonlMetrics(
+            args.metrics_jsonl, mode=mode,
+            policy_certified=preflight.policy_certified,
+        )
         resources.append(("metrics", metrics))
         command_sink = (
             adapters.goal_publisher
@@ -5449,21 +6583,35 @@ def run_bridge(args):
         keyboard = LocalKeyboard(sys.stdin.fileno())
         keyboard.__enter__()
         resources.append(("keyboard", keyboard))
+        required_connections = {"wbc", "camera"}
+        if mode is BridgeMode.SIM_CONTROL:
+            required_connections.add("policy")
+        connection_evidence = connection_recorder.snapshot(
+            required_components=required_connections
+        )
         metrics.write_event(
             "preflight_complete",
-            policy_certified=preflight.policy_certified,
             policy_mismatched_fields=list(preflight.policy_mismatched_fields),
+            wbc_mismatched_fields=list(preflight.wbc_mismatched_fields),
             publisher_required=preflight.publisher_required,
+            goal_counts_at_preflight=list(
+                preflight.goal_counts_at_preflight
+            ),
+            connection_evidence=connection_evidence,
+            real_interface_connections=count_real_interface_connections(
+                connection_evidence
+            ),
         )
         coordinator = ShutdownCoordinator(
             bridge=bridge, command_sink=command_sink,
             camera=adapters.camera_reader, worker=worker,
-            state_source=adapters.state_source, ros_runtime=runtime,
+            state_source=adapters.state_source,
+            ownership_guard=ownership_guard, ros_runtime=runtime,
             keyboard=keyboard, metrics=metrics,
         )
         report = run_runtime(
             bridge, adapters, keyboard, coordinator, metrics,
-            preflight.policy_certified,
+            ownership_guard,
         )
         if report.cleanup_errors:
             raise RuntimeError(
@@ -5493,7 +6641,7 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ```
 
-In shadow, the command sink's `publish()` records a preview and returns true but never owns a ROS publisher; its `close()` only closes that recorder. If no bounded hold exists, the loop above performs zero final calls. If it exists, the coordinator calls `publish()` exactly 25 times with the same `Goal` object, closes the sink immediately afterward, and has no code path for a 26th call. The runtime never signals or terminates the WBC, simulator, policy server, or any robot process.
+In shadow, the command sink's `publish()` records a preview and returns true but never owns a ROS publisher; its `close()` only closes that recorder. The preflight accepts attested structural joint data while reporting configuration/model differences, `JsonlMetrics` stamps `policy_certified=false` onto every event, and `GoalOwnershipGuard` checks the initial publisher count on every tick and again before ROS teardown. If no bounded hold exists, the loop above performs zero final calls. If it exists, the coordinator calls `publish()` exactly 25 times with the same `Goal` object, closes the sink immediately afterward, and has no code path for a 26th call. The runtime never signals or terminates the WBC, simulator, policy server, or any robot process.
 
 - [ ] Add idempotence rejection and bridge-stop/hold capture only.
 - [ ] Add the exact 25-tick publisher branch and run the fake-clock unit case.
@@ -6264,7 +7412,8 @@ import scripts.tests.smoke_psi0_simple_bridge as smoke_driver
 from scripts.tests.smoke_psi0_simple_bridge import (
     OwnedChildren, SmokeConfig, SmokeSafetyError, arm_next_policy_delay,
     allocate_smoke_run_directory, build_launch_plan, collect_smoke_report,
-    default_wbc_preflight, launch, validate_smoke_report,
+    default_wbc_preflight, launch, measured_real_interface_connections,
+    validate_smoke_report,
 )
 
 EXPECTED_WBC_ARGS = (
@@ -6444,6 +7593,27 @@ def test_collector_uses_lowercase_fault_and_old_generation_counter():
     zero = np.zeros(36, np.float32).tolist()
     records = [
         {
+            "event": "preflight_complete",
+            "connection_evidence": [
+                {
+                    "component": "wbc", "transport": "dds-service-response",
+                    "endpoint": "lo", "real_interface": False,
+                    "observed_at": 0.5,
+                },
+                {
+                    "component": "camera", "transport": "decoded-frame",
+                    "endpoint": "127.0.0.1", "real_interface": False,
+                    "observed_at": 0.6,
+                },
+                {
+                    "component": "policy", "transport": "http-contract-response",
+                    "endpoint": "127.0.0.1", "real_interface": False,
+                    "observed_at": 0.7,
+                },
+            ],
+            "real_interface_connections": 0,
+        },
+        {
             "event": "request", "request_seq": 17,
             "observation_tick": 100,
             "committed_actions": np.zeros((6, 36), np.float32).tolist(),
@@ -6474,6 +7644,9 @@ def test_collector_uses_lowercase_fault_and_old_generation_counter():
     assert report["fault_at"] == 11.02
     assert report["old_generation_results_discarded"] == 1
     assert report["late_results_discarded"] == 0
+    records[0]["connection_evidence"][2]["real_interface"] = True
+    with pytest.raises(SmokeSafetyError, match="differs from evidence"):
+        measured_real_interface_connections(records)
 
 
 @pytest.mark.parametrize(
@@ -6505,14 +7678,27 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import pty
 import secrets
+import signal
+import socket
+import subprocess
 import sys
+import termios
+import threading
+import time
 from types import MappingProxyType
 
 import numpy as np
+import requests
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from scripts.psi0_simple_real_bridge import (  # noqa: E402
+    CONTROL_GOAL_TOPIC, RosRuntime, count_real_interface_connections,
+    create_ros_wbc_config_client,
+)
 
 
 class SmokeSafetyError(RuntimeError):
@@ -6679,17 +7865,47 @@ def test_cleanup_signals_and_reaps_only_recorded_process_groups():
         ("killpg", 202, signal.SIGINT), ("waitpid", 202, 0),
         ("killpg", 101, signal.SIGINT), ("waitpid", 101, 0),
     ]
+
+
+def test_real_child_cleanup_uses_one_shared_absolute_deadline():
+    now = [0.0]
+    terminated = set()
+    events = []
+
+    class Process:
+        def __init__(self, pgid):
+            self.pgid = pgid
+
+        def poll(self):
+            return 0 if self.pgid in terminated else None
+
+    def killpg(pgid, sig):
+        events.append((pgid, sig, now[0]))
+        if sig == signal.SIGTERM:
+            terminated.add(pgid)
+
+    owner = OwnedChildren(
+        killpg=killpg, clock=lambda: now[0],
+        sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+    )
+    for pid in (101, 202, 303):
+        owner.record(
+            pid=pid, pgid=pid, name=str(pid), argv=(str(pid),),
+            started_at=0.0, process=Process(pid),
+        )
+    owner.close(deadline=1.0)
+    assert now[0] <= 1.0
+    assert terminated == {101, 202, 303}
+    assert [event[:2] for event in events] == [
+        (303, signal.SIGINT), (202, signal.SIGINT), (101, signal.SIGINT),
+        (303, signal.SIGTERM), (202, signal.SIGTERM),
+        (101, signal.SIGTERM),
+    ]
 ```
 
-Use this exact owner and readiness helper. Launch each child with `start_new_session=True`, record it immediately, and walk only that list in reverse. Real `Popen` records receive bounded INT→TERM→KILL escalation; the injection-only unit branch preserves the exact `waitpid` assertion above:
+Use this exact owner and readiness helper. Launch each child with `start_new_session=True`, record it immediately, and walk only that list in reverse. `close(deadline=...)` signals each escalation phase to all still-live process groups before waiting concurrently against the same absolute deadline; it never grants a fresh timeout per child. The injection-only unit branch preserves the exact `waitpid` assertion above:
 
 ```python
-from dataclasses import dataclass
-import signal
-import subprocess
-import time
-
-
 @dataclass
 class ChildRecord:
     pid: int
@@ -6701,9 +7917,14 @@ class ChildRecord:
 
 
 class OwnedChildren:
-    def __init__(self, killpg=os.killpg, waitpid=os.waitpid):
+    def __init__(
+        self, killpg=os.killpg, waitpid=os.waitpid,
+        clock=time.monotonic, sleep=time.sleep,
+    ):
         self._killpg = killpg
         self._waitpid = waitpid
+        self._clock = clock
+        self._sleep = sleep
         self.records = []
         self._closed = False
 
@@ -6714,28 +7935,48 @@ class OwnedChildren:
             pid, pgid, name, tuple(argv), float(started_at), process
         ))
 
-    def close(self):
+    def _wait_live_until(self, records, deadline):
+        while True:
+            live = [record for record in records if record.process.poll() is None]
+            if not live or self._clock() >= deadline:
+                return live
+            self._sleep(min(0.01, deadline - self._clock()))
+
+    def close(self, deadline=None):
         if self._closed:
             return
         self._closed = True
-        for record in reversed(self.records):
-            if record.process is not None and record.process.poll() is not None:
-                continue
+        injected = [record for record in reversed(self.records) if record.process is None]
+        real = [record for record in reversed(self.records) if record.process is not None]
+        for record in injected:
             self._killpg(record.pgid, signal.SIGINT)
-            if record.process is None:
-                self._waitpid(record.pid, 0)
-                continue
-            try:
-                record.process.wait(timeout=0.7)
-                continue
-            except subprocess.TimeoutExpired:
-                self._killpg(record.pgid, signal.SIGTERM)
-            try:
-                record.process.wait(timeout=0.2)
-                continue
-            except subprocess.TimeoutExpired:
+            self._waitpid(record.pid, 0)
+        if not real:
+            return
+        live = [record for record in real if record.process.poll() is None]
+        if type(deadline) not in (int, float):
+            raise TypeError("real child cleanup requires an absolute deadline")
+        if deadline <= self._clock():
+            for record in live:
                 self._killpg(record.pgid, signal.SIGKILL)
-                record.process.wait(timeout=0.1)
+                record.process.poll()
+            raise TimeoutError("shared child cleanup deadline already exhausted")
+        for record in live:
+            self._killpg(record.pgid, signal.SIGINT)
+        live = self._wait_live_until(
+            live, min(deadline, self._clock() + 0.5)
+        )
+        for record in live:
+            self._killpg(record.pgid, signal.SIGTERM)
+        live = self._wait_live_until(
+            live, min(deadline, self._clock() + 0.2)
+        )
+        for record in live:
+            self._killpg(record.pgid, signal.SIGKILL)
+        live = self._wait_live_until(live, deadline)
+        if live:
+            names = ",".join(record.name for record in live)
+            raise TimeoutError(f"children missed shared cleanup deadline: {names}")
 
 
 def wait_ready_json(path, expected_host, expected_port, deadline, clock=time.monotonic):
@@ -6756,19 +7997,6 @@ def wait_ready_json(path, expected_host, expected_port, deadline, clock=time.mon
 Implement the timeline with these literal helpers and `launch()`; the injectable hooks keep the unit test free of process creation, while the CLI uses the defaults:
 
 ```python
-import os
-import pty
-import socket
-import subprocess
-import termios
-import threading
-import time
-
-from scripts.psi0_simple_real_bridge import (
-    CONTROL_GOAL_TOPIC, RosRuntime, create_ros_wbc_config_client,
-)
-
-
 def sleep_until(deadline, clock=time.monotonic, sleep=time.sleep):
     sleep(max(0.0, deadline - clock()))
 
@@ -6866,6 +8094,33 @@ def _spawn(spec, owner, log, *, stdin=None):
     return process
 
 
+def measured_real_interface_connections(records):
+    preflight = [
+        record for record in records
+        if record.get("event") == "preflight_complete"
+    ]
+    if len(preflight) != 1:
+        raise SmokeSafetyError("expected one preflight connection record")
+    record = preflight[0]
+    evidence = record.get("connection_evidence")
+    if (
+        type(evidence) is not list
+        or not all(type(item) is dict for item in evidence)
+        or {item.get("component") for item in evidence}
+        != {"wbc", "camera", "policy"}
+    ):
+        raise SmokeSafetyError(
+            "smoke requires observed WBC, camera, and policy connections"
+        )
+    measured = count_real_interface_connections(evidence)
+    if (
+        type(record.get("real_interface_connections")) is not int
+        or record["real_interface_connections"] != measured
+    ):
+        raise SmokeSafetyError("real-interface count differs from evidence")
+    return measured
+
+
 def collect_smoke_report(
     records, *, scenario_started_at, armed_seq, delayed_record,
     worker_idle_at_s, goal_counts_before, goal_counts_running,
@@ -6932,7 +8187,9 @@ def collect_smoke_report(
         ],
         "terminal_restored": terminal_restored,
         "ports_rebound": ports_rebound,
-        "real_interface_connections": 0,
+        "real_interface_connections": measured_real_interface_connections(
+            records
+        ),
         "extra_goal_publishers": max(0, goal_counts_running[0] - 1),
     }
 
@@ -6942,11 +8199,12 @@ def launch(config, hooks=None):
     hooks = hooks or DefaultSmokeHooks()
     output = Path(config.output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    owner = OwnedChildren()
+    owner = OwnedChildren(clock=hooks.clock, sleep=hooks.sleep)
     logs = []
     bridge_master = bridge_slave = None
     bridge_original = None
     report = None
+    smoke_deadline = None
     try:
         def start(spec, stdin=None):
             log = (output / f"psi0-smoke-{spec.name}.log").open("x")
@@ -6985,6 +8243,7 @@ def launch(config, hooks=None):
             config.bridge_metrics_jsonl, hooks.clock() + 3.0, hooks.clock
         )
         scenario_started_at = hooks.clock()
+        smoke_deadline = scenario_started_at + 15.0
         sleep_until(scenario_started_at + 3.0, hooks.clock, hooks.sleep)
         os.write(bridge_master, b"p")
         goal_counts_running = hooks.goal_counts()
@@ -7009,7 +8268,7 @@ def launch(config, hooks=None):
 
         os.killpg(os.getpgid(bridge_process.pid), signal.SIGINT)
         bridge_process.wait(timeout=max(
-            0.0, scenario_started_at + 15.0 - hooks.clock()
+            0.0, smoke_deadline - hooks.clock()
         ))
         goal_counts_after = hooks.goal_counts()
         if goal_counts_after != [0, 1]:
@@ -7022,7 +8281,11 @@ def launch(config, hooks=None):
             goal_counts_after, terminal_restored,
         )
     finally:
-        owner.close()
+        cleanup_deadline = (
+            smoke_deadline if smoke_deadline is not None
+            else hooks.clock() + 1.0
+        )
+        owner.close(deadline=cleanup_deadline)
         for descriptor in (bridge_master, bridge_slave):
             if descriptor is not None:
                 os.close(descriptor)
@@ -7046,6 +8309,8 @@ def launch(config, hooks=None):
     Path(config.smoke_report_json).write_text(json.dumps(report, indent=2))
     if not validation.ok:
         raise SmokeSafetyError("; ".join(validation.failures))
+    if smoke_deadline is None or hooks.clock() > smoke_deadline:
+        raise SmokeSafetyError("smoke cleanup exceeded shared second-15 deadline")
     return report
 
 
@@ -7403,7 +8668,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.psi0_simple_real_bridge import (
-    LocalKeyboard, RuntimeDependencyFactories, build_parser,
+    LocalKeyboard, PreflightError, RuntimeDependencyFactories, build_parser,
     build_policy_client, build_runtime_adapters,
 )
 from simple.baselines.client import HttpActionClient
@@ -7480,11 +8745,32 @@ def test_shadow_factory_never_calls_goal_publisher():
     calls = []
     adapters = build_runtime_adapters(
         mode=BridgeMode.SHADOW,
-        preflight_result=SimpleNamespace(publisher_required=False),
+        preflight_result=SimpleNamespace(
+            publisher_required=False, goal_counts_at_preflight=(0, 1)
+        ),
         publisher_factory=lambda: calls.append("publisher"),
         test_dependencies=valid_adapter_dependencies(),
     )
     assert adapters.goal_publisher is None
+    assert calls == []
+
+
+def test_shadow_rejects_publisher_count_change_after_preflight():
+    calls = []
+    dependencies = RuntimeDependencyFactories(
+        state_source=lambda: calls.append("state"),
+        camera_reader=lambda: calls.append("camera"),
+        graph=lambda: FakeGraph(publishers=1, subscriptions=1),
+    )
+    with pytest.raises(PreflightError, match="changed after preflight"):
+        build_runtime_adapters(
+            mode=BridgeMode.SHADOW,
+            preflight_result=SimpleNamespace(
+                publisher_required=False, goal_counts_at_preflight=(0, 1)
+            ),
+            publisher_factory=lambda: calls.append("publisher"),
+            test_dependencies=dependencies,
+        )
     assert calls == []
 
 
@@ -7805,6 +9091,28 @@ The bundle writer first verifies the checkpoint and dataset hashes equal the con
 Require an NPZ with arrays `images` (`N,H,W,3`, contiguous `uint8`), `states` (`N,1,32`, finite `float32`), and `instructions` (`N` strings), with `N >= 100`. Define the wire/result types and exact classifier as follows:
 
 ```python
+import argparse
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import tempfile
+import time
+from urllib.parse import urlparse
+import uuid
+
+import numpy as np
+import requests
+
+from decoupled_wbc.control.robot_model.instantiation.g1 import (
+    instantiate_g1_robot_model,
+)
+from simple.baselines.client import (
+    RequestMessage, convert_numpy_in_dict, numpy_deserialize,
+)
 from simple.deploy.psi0_simple_bridge import (
     JointContract, PolicyContract, PSI0_ACTION_JOINT_NAMES,
     validate_action_suffix,
@@ -7923,15 +9231,6 @@ Fetch `/contract` exactly once before warmup, parse it with `PolicyContract.from
 Use this complete concrete transport:
 
 ```python
-from urllib.parse import urlparse
-
-import requests
-
-from simple.baselines.client import (
-    RequestMessage, convert_numpy_in_dict, numpy_deserialize,
-)
-
-
 class HttpBenchmarkTransport:
     def __init__(
         self, server_url, image_key, timeout_s=5.0,
@@ -8118,21 +9417,6 @@ Because measured request indices are 10–109, `samples[request_index % 100]` vi
 Implement the evidence writer, local effective-limit loader, parser, and entry point exactly:
 
 ```python
-import argparse
-from dataclasses import asdict
-import hashlib
-import json
-import os
-from pathlib import Path
-import re
-import shutil
-import tempfile
-
-from decoupled_wbc.control.robot_model.instantiation.g1 import (
-    instantiate_g1_robot_model,
-)
-
-
 def sha256_file(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -8231,7 +9515,9 @@ def write_certification_bundle(
 
 
 def build_local_joint_contract():
-    model = instantiate_g1_robot_model(waist_location="upper_body")
+    model = instantiate_g1_robot_model(
+        waist_location="lower_and_upper_body"
+    )
     names = tuple(model.joint_names)
     upper_indices = model.get_joint_group_indices("upper_body")
     upper_names = tuple(names[index] for index in upper_indices)
@@ -8389,6 +9675,18 @@ uv run --group dev ruff format --check src/simple/deploy scripts/psi0_simple_rea
   scripts/benchmark_psi0_rtc_server.py tests
 uv run --group dev ruff check --select E9,F63,F7,F82 \
   src/simple/baselines/client.py scripts/postprocess_psi0.py
+uv run --group dev ruff check \
+  third_party/decoupled_wbc/control/main/model_contract.py \
+  third_party/decoupled_wbc/control/main/teleop/run_g1_control_loop.py \
+  third_party/decoupled_wbc/tests/control/main/test_model_contract.py \
+  third_party/decoupled_wbc/tests/control/main/teleop/test_g1_control_loop_contract.py \
+  third_party/decoupled_wbc/tests/control/robot_model/test_g1_effective_limits.py
+uv run --group dev ruff format --check \
+  third_party/decoupled_wbc/control/main/model_contract.py \
+  third_party/decoupled_wbc/control/main/teleop/run_g1_control_loop.py \
+  third_party/decoupled_wbc/tests/control/main/test_model_contract.py \
+  third_party/decoupled_wbc/tests/control/main/teleop/test_g1_control_loop_contract.py \
+  third_party/decoupled_wbc/tests/control/robot_model/test_g1_effective_limits.py
 git diff --check main...HEAD
 git -C third_party/decoupled_wbc diff --check
 ```
