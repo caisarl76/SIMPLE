@@ -13,6 +13,7 @@
 ## Non-negotiable safety boundaries
 
 - This plan implements only `shadow` and `sim-control`. Do not add a `real-control` enum value, CLI option, network-interface fallback, or Unitree low-level publisher.
+- `sim-control` alone is locked to loopback/domain 42. `shadow` may use explicitly selected valid ROS/Unitree domains to observe a later real system, but it never creates a goal publisher; if neither local nor server policy contract is usable it remains observation-only and refuses `p` without exiting.
 - Do not start a real WBC, real DDS loop, or robot process while implementing or running unit tests.
 - Run the simulation smoke test only with ROS domain 42, Unitree domain 42, Linux loopback, and zero pre-existing goal publishers.
 - The current live PSI0 checkpoint and `/act` endpoint remain ineligible for `sim-control`. Root-repository tests use the explicitly test-only `/act-rtc-v1` fake.
@@ -1584,6 +1585,68 @@ def test_service_is_created_only_after_model_policy_and_attestation():
     }
 
 
+def test_attested_construction_rolls_back_every_created_resource():
+    from types import SimpleNamespace
+
+    import pytest
+
+    from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
+        _build_attested_components,
+    )
+
+    cases = (
+        ("policy", ["environment.close"]),
+        ("model_contract", ["policy.close", "environment.close"]),
+        ("service", ["policy.close", "environment.close"]),
+    )
+    for failure, expected_tail in cases:
+        events = []
+        environment = SimpleNamespace(
+            sim=True,
+            start_simulator=lambda: events.append("simulator.start"),
+            close=lambda: events.append("environment.close"),
+        )
+        policy = SimpleNamespace(
+            close=lambda: events.append("policy.close")
+        )
+
+        def make_policy(*_args, **_kwargs):
+            events.append("policy")
+            if failure == "policy":
+                raise RuntimeError("policy failed")
+            return policy
+
+        def make_contract(_config, _model):
+            events.append("model_contract")
+            if failure == "model_contract":
+                raise RuntimeError("attestation failed")
+            return {
+                "model_contract": {},
+                "model_contract_sha256": "d" * 64,
+            }
+
+        def make_service(_backend, _topic, _payload):
+            events.append("service")
+            raise RuntimeError("service failed")
+
+        factories = SimpleNamespace(
+            robot_model=lambda **_kwargs: object(),
+            environment=lambda **_kwargs: environment,
+            policy=make_policy,
+            model_contract_payload=make_contract,
+            service_server=make_service,
+        )
+        with pytest.raises(RuntimeError, match="failed"):
+            _build_attested_components(
+                ControlLoopConfig(
+                    interface="sim", enable_waist=True, domain_id=42
+                ),
+                backend=object(),
+                factories=factories,
+            )
+        assert events[-len(expected_tail):] == expected_tail
+
+
 def test_attested_runtime_cleanup_attempts_every_resource_in_order():
     from types import SimpleNamespace
 
@@ -1856,37 +1919,63 @@ class ProductionFactories:
 
 def _build_attested_components(config, backend, factories=None):
     factories = factories or ProductionFactories()
-    wbc_config = config.load_wbc_yaml()
-    waist_location = (
-        "lower_and_upper_body" if config.enable_waist else "lower_body"
-    )
-    robot_model = factories.robot_model(
-        waist_location=waist_location,
-        high_elbow_pose=config.high_elbow_pose,
-    )
-    environment = factories.environment(
-        env_name=config.env_name,
-        robot_model=robot_model,
-        config=wbc_config,
-        wbc_version=config.wbc_version,
-        messaging_backend=backend,
-    )
-    if environment.sim and not config.sim_sync_mode:
-        environment.start_simulator()
-    wbc_policy = factories.policy(
-        "g1", robot_model, wbc_config, config.upper_body_joint_speed
-    )
-    service_payload = factories.model_contract_payload(config, robot_model)
-    robot_config_server = factories.service_server(
-        backend, ROBOT_CONFIG_TOPIC, service_payload
-    )
-    return AttestedComponents(
-        environment=environment,
-        robot_model=robot_model,
-        wbc_policy=wbc_policy,
-        service_payload=service_payload,
-        robot_config_server=robot_config_server,
-    )
+    created = []
+    try:
+        wbc_config = config.load_wbc_yaml()
+        waist_location = (
+            "lower_and_upper_body" if config.enable_waist else "lower_body"
+        )
+        robot_model = factories.robot_model(
+            waist_location=waist_location,
+            high_elbow_pose=config.high_elbow_pose,
+        )
+        environment = factories.environment(
+            env_name=config.env_name,
+            robot_model=robot_model,
+            config=wbc_config,
+            wbc_version=config.wbc_version,
+            messaging_backend=backend,
+        )
+        created.append(("environment", environment))
+        if environment.sim and not config.sim_sync_mode:
+            environment.start_simulator()
+        wbc_policy = factories.policy(
+            "g1", robot_model, wbc_config, config.upper_body_joint_speed
+        )
+        created.append(("policy", wbc_policy))
+        service_payload = factories.model_contract_payload(config, robot_model)
+        robot_config_server = factories.service_server(
+            backend, ROBOT_CONFIG_TOPIC, service_payload
+        )
+        created.append(("service", robot_config_server))
+        return AttestedComponents(
+            environment=environment,
+            robot_model=robot_model,
+            wbc_policy=wbc_policy,
+            service_payload=service_payload,
+            robot_config_server=robot_config_server,
+        )
+    except Exception as error:
+        rollback_errors = _rollback_attested_construction(created)
+        if rollback_errors:
+            raise RuntimeError(
+                f"{error}; construction rollback: "
+                + "; ".join(rollback_errors)
+            ) from error
+        raise
+
+
+def _rollback_attested_construction(created):
+    errors = []
+    for name, resource in reversed(created):
+        close = getattr(resource, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception as error:
+            errors.append(f"{name}: {error}")
+    return tuple(errors)
 
 
 def _close_attested_runtime(dispatcher, service, manager, environment):
@@ -2368,6 +2457,19 @@ def test_invalid_state_never_replaces_last_valid(contract, sample, error):
     assert error in reason
 
 
+@pytest.mark.parametrize("received_at", [9.899, 10.001])
+def test_stale_or_future_state_never_replaces_last_valid(
+    contract, received_at,
+):
+    prior = state(np.full(43, 0.25), received_at=9.99)
+    candidate = state(np.full(43, 0.5), received_at=received_at)
+    accepted, reason = accept_measured_state(
+        prior, candidate, contract, now=10.0
+    )
+    assert accepted is prior
+    assert reason == "measured state stale"
+
+
 def test_state_tolerance_accepts_point_05_and_rejects_beyond(contract):
     q = np.zeros(43, np.float32)
     q[0] = 2.05
@@ -2556,6 +2658,13 @@ Implement these pure functions and run only the state/freshness cases from Step 
 def validate_measured_state(sample, contract, now, tolerance=0.05):
     if type(sample) is not TimedRobotState:
         raise ValueError("measured state type")
+    if type(now) not in (float, int) or not np.isfinite(now):
+        raise ValueError("measured validation time")
+    if type(sample.received_at) not in (float, int) or not np.isfinite(sample.received_at):
+        raise ValueError("measured receive time")
+    age = float(now) - float(sample.received_at)
+    if age < 0.0 or age > 0.10:
+        raise ValueError("measured state stale")
     q = np.asarray(sample.q)
     if q.shape != (43,):
         raise ValueError("measured state shape")
@@ -2570,8 +2679,6 @@ def validate_measured_state(sample, contract, now, tolerance=0.05):
     q32 = q.astype(np.float32, copy=True)
     if np.any(q32 < lower - tolerance) or np.any(q32 > upper + tolerance):
         raise ValueError("measured joint bounds")
-    if type(sample.received_at) not in (float, int) or not np.isfinite(sample.received_at):
-        raise ValueError("measured receive time")
     return TimedRobotState(q32, float(sample.received_at))
 
 
@@ -3110,6 +3217,7 @@ import numpy as np
 import pytest
 
 from simple.deploy.psi0_simple_bridge import (
+    ActivationRefused,
     BridgeState,
     Psi0SimpleBridge,
     RtcResult,
@@ -3172,7 +3280,7 @@ def test_startup_requires_one_consumed_paused_hold():
     inference = BlockingInference()
     bridge, _ = ready_bridge(inference)
     assert bridge.state is BridgeState.PAUSED
-    with pytest.raises(RuntimeError, match="paused hold"):
+    with pytest.raises(ActivationRefused, match="paused hold"):
         bridge.handle_toggle()
     assert inference.requests == []
     hold = bridge.tick()
@@ -3209,7 +3317,7 @@ def test_fault_holds_zero_navigation_and_rearm_waits_for_physical_idle():
     fault_tick = bridge.tick()
     assert bridge.state is BridgeState.FAULT
     np.testing.assert_array_equal(fault_tick.goal.navigate_cmd, np.zeros(4, np.float32))
-    with pytest.raises(RuntimeError, match="worker busy"):
+    with pytest.raises(ActivationRefused, match="worker busy"):
         bridge.handle_toggle()
     late = RtcResult(
         generation=old_request.generation,
@@ -3510,6 +3618,10 @@ class InferencePort(Protocol):
 
     def poll(self) -> RtcResult | None:
         raise NotImplementedError
+
+
+class ActivationRefused(RuntimeError):
+    """Expected fail-closed refusal of a local activation request."""
 ```
 
 These protocol bodies define the injected boundary only; no production I/O belongs in the core file. Add the exact validator and run only the protocol/deadline cases:
@@ -3790,12 +3902,15 @@ Add these methods to the class. This fixes R0's observation tick, first-action t
             if self.state not in (BridgeState.PAUSED, BridgeState.FAULT):
                 raise RuntimeError("bridge is not paused or faulted")
             if not self._hold_consumed:
-                raise RuntimeError("one consumed paused hold is required")
-            self._snapshot_locked()
+                raise ActivationRefused("one consumed paused hold is required")
+            try:
+                self._snapshot_locked()
+            except ValueError as error:
+                raise ActivationRefused(str(error)) from error
             if self.inference.busy:
-                raise RuntimeError("physical worker busy")
+                raise ActivationRefused("physical worker busy")
             if self._captured_hold is None:
-                raise RuntimeError("no bounded hold action")
+                raise ActivationRefused("no bounded hold action")
             committed_action = np.asarray(
                 self._captured_hold.psi0_action, np.float32
             ).copy()
@@ -4081,6 +4196,54 @@ def test_shadow_contract_failure_never_calls_publisher_factory():
     )
     assert result.policy_certified is False
     assert result.publisher_required is False
+    assert result.runtime_policy_contract is not None
+
+
+def test_shadow_missing_local_contract_uses_uncertified_server_contract():
+    result = run_preflight(
+        mode=BridgeMode.SHADOW,
+        local_policy=None,
+        server_policy=policy_payload(),
+        wbc_payload=valid_wbc_payload(),
+        graph=FakeGraph(publishers=0, subscriptions=1),
+        expected_model_contract=valid_model_contract(),
+        expected_gitlink_sha="1" * 40,
+    )
+    assert result.policy_certified is False
+    assert result.runtime_policy_contract == PolicyContract.from_dict(
+        policy_payload()
+    )
+    assert result.policy_mismatched_fields == (
+        "local policy contract unavailable",
+    )
+
+
+def test_shadow_with_no_usable_contract_remains_observation_only():
+    result = run_preflight(
+        mode=BridgeMode.SHADOW,
+        local_policy=None,
+        server_policy=None,
+        wbc_payload=valid_wbc_payload(),
+        graph=FakeGraph(publishers=0, subscriptions=1),
+        expected_model_contract=valid_model_contract(),
+        expected_gitlink_sha="1" * 40,
+    )
+    assert result.policy_certified is False
+    assert result.runtime_policy_contract is None
+    assert result.publisher_required is False
+
+
+def test_sim_control_rejects_missing_local_contract():
+    with pytest.raises(PreflightError, match="local policy contract unavailable"):
+        run_preflight(
+            mode=BridgeMode.SIM_CONTROL,
+            local_policy=None,
+            server_policy=policy_payload(),
+            wbc_payload=valid_wbc_payload(),
+            graph=FakeGraph(publishers=0, subscriptions=1),
+            expected_model_contract=valid_model_contract(),
+            expected_gitlink_sha="1" * 40,
+        )
 
 
 def test_shadow_reports_wbc_differences_but_keeps_structural_joint_contract():
@@ -4467,8 +4630,9 @@ from decoupled_wbc.control.robot_model.instantiation.g1 import (
 from decoupled_wbc.control.sensor.sensor_server import ImageMessageSchema
 from simple.baselines.client import HttpActionClient
 from simple.deploy.psi0_simple_bridge import (
-    BridgeMode, BridgeState, JointContract, PolicyContract, Psi0SimpleBridge,
-    RtcResult, TimedCameraFrame, TimedRobotState,
+    ActivationRefused, BridgeMetrics, BridgeMode, BridgeState, JointContract,
+    PolicyContract, Psi0SimpleBridge, RtcResult, TickResult,
+    TimedCameraFrame, TimedRobotState,
 )
 
 
@@ -4495,7 +4659,7 @@ def build_parser():
     parser.add_argument("--server-host", required=True)
     parser.add_argument("--server-port", required=True, type=_tcp_port)
     parser.add_argument("--instruction", required=True)
-    parser.add_argument("--policy-contract", required=True)
+    parser.add_argument("--policy-contract")
     parser.add_argument("--camera-host", required=True)
     parser.add_argument("--camera-port", required=True, type=_tcp_port)
     parser.add_argument("--camera-source-key", required=True)
@@ -5193,6 +5357,7 @@ class PreflightResult:
     joint_contract: JointContract
     publisher_required: bool
     goal_counts_at_preflight: tuple[int, int]
+    runtime_policy_contract: PolicyContract | None
 
 
 def run_preflight(
@@ -5200,7 +5365,6 @@ def run_preflight(
     expected_model_contract, expected_gitlink_sha, required_domain_id=42,
 ):
     mode = BridgeMode(mode)
-    local = PolicyContract.from_dict(local_policy)
     if mode is BridgeMode.SHADOW:
         validated_wbc, wbc_mismatches = inspect_shadow_wbc(
             actual=wbc_payload,
@@ -5216,15 +5380,33 @@ def run_preflight(
             required_domain_id=required_domain_id,
         )
         wbc_mismatches = ()
-    try:
-        server = PolicyContract.from_dict(server_policy)
-        policy_result = compare_policy_contracts(
-            local, server, mode, wbc_payload.get("env_type")
-        )
-    except (TypeError, ValueError, PreflightError) as error:
+    parsed = {}
+    policy_errors = []
+    for label, payload in (
+        ("local", local_policy), ("server", server_policy)
+    ):
+        if payload is None:
+            policy_errors.append(f"{label} policy contract unavailable")
+            continue
+        try:
+            parsed[label] = PolicyContract.from_dict(payload)
+        except (TypeError, ValueError) as error:
+            policy_errors.append(f"{label} policy contract: {error}")
+    if policy_errors:
         if mode is not BridgeMode.SHADOW:
-            raise
-        policy_result = PolicyPreflightResult(False, (str(error),))
+            raise PreflightError(policy_errors[0])
+        policy_result = PolicyPreflightResult(False, tuple(policy_errors))
+    else:
+        try:
+            policy_result = compare_policy_contracts(
+                parsed["local"], parsed["server"], mode,
+                wbc_payload.get("env_type"),
+            )
+        except PreflightError as error:
+            if mode is not BridgeMode.SHADOW:
+                raise
+            policy_result = PolicyPreflightResult(False, (str(error),))
+    runtime_contract = parsed.get("local") or parsed.get("server")
     goal_counts = validate_goal_ownership_preflight(mode, graph)
     return PreflightResult(
         policy_certified=(
@@ -5236,6 +5418,7 @@ def run_preflight(
         joint_contract=validated_wbc.joint_contract,
         publisher_required=(mode is BridgeMode.SIM_CONTROL),
         goal_counts_at_preflight=goal_counts,
+        runtime_policy_contract=runtime_contract,
     )
 ```
 
@@ -5329,13 +5512,15 @@ import numpy as np
 import pytest
 
 from scripts.psi0_simple_real_bridge import (
-    ConnectionEvidenceRecorder, FiftyHzLoop, HttpInferenceWorker,
-    JsonlMetrics, LocalKeyboard, PreflightError,
+    ConnectionEvidenceRecorder, DisabledInferenceWorker, FiftyHzLoop,
+    HttpInferenceWorker, JsonlMetrics, LocalKeyboard,
+    ObservationOnlyShadowBridge, PreflightError, handle_keyboard_events,
     count_real_interface_connections,
 )
 from simple.baselines.client import RtcActionResponse
 from simple.deploy.psi0_simple_bridge import (
-    BridgeMode, BridgeState, PolicyContract, RtcRequest, TimedCameraFrame,
+    ActivationRefused, BridgeMode, BridgeState, PolicyContract, RtcRequest,
+    TimedCameraFrame,
 )
 from tests.psi0_bridge_testkit import ManualClock, policy_payload
 
@@ -5442,6 +5627,65 @@ def test_every_shadow_metric_and_preview_is_uncertified(tmp_path):
         "request", "result", "preview", "tick",
     ]
     assert all(record["policy_certified"] is False for record in records)
+
+
+def test_rejected_activation_is_reported_and_next_local_p_is_accepted():
+    class ToggleBridge:
+        state = BridgeState.PAUSED
+
+        def __init__(self):
+            self.calls = 0
+
+        def handle_toggle(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise ActivationRefused("physical worker busy")
+            self.state = BridgeState.ACTIVE
+
+    class Keyboard:
+        def poll(self, _timeout_s):
+            return ("p",)
+
+    class Metrics:
+        def __init__(self):
+            self.events = []
+
+        def write_event(self, event, **fields):
+            self.events.append((event, fields))
+
+    bridge = ToggleBridge()
+    metrics = Metrics()
+    handle_keyboard_events(bridge, Keyboard(), metrics)
+    assert bridge.state is BridgeState.PAUSED
+    assert metrics.events == [(
+        "activation_refused",
+        {"state": "paused", "reason": "physical worker busy"},
+    )]
+    handle_keyboard_events(bridge, Keyboard(), metrics)
+    assert bridge.state is BridgeState.ACTIVE
+    assert bridge.calls == 2
+
+
+def test_missing_shadow_contract_disables_inference_without_exiting():
+    class Metrics:
+        def __init__(self):
+            self.events = []
+
+        def write_event(self, event, **fields):
+            self.events.append((event, fields))
+
+    worker = DisabledInferenceWorker()
+    bridge = ObservationOnlyShadowBridge(
+        worker, ManualClock(100), start_tick=100
+    )
+    metrics = Metrics()
+    keyboard = SimpleNamespace(poll=lambda _timeout_s: ("p",))
+    handle_keyboard_events(bridge, keyboard, metrics)
+    result = bridge.tick()
+    assert bridge.state is BridgeState.PAUSED
+    assert result.goal is None
+    assert worker.busy is False
+    assert metrics.events[0][0] == "activation_refused"
 
 
 def test_connection_evidence_requires_successful_runtime_observations():
@@ -5635,6 +5879,14 @@ class ShutdownBridge:
         return self.hold
 
 
+class FailingShutdownBridge(ShutdownBridge):
+    def stop(self):
+        raise RuntimeError("stop failed")
+
+    def build_bounded_shutdown_hold(self):
+        raise RuntimeError("hold failed")
+
+
 def test_every_cleanup_timeout_shares_one_absolute_long_path_deadline():
     clock = AdvancingClock()
     sink = BudgetedSink(clock)
@@ -5654,7 +5906,9 @@ def test_every_cleanup_timeout_shares_one_absolute_long_path_deadline():
     assert report.finished_at <= report.deadline_at
     for resource in [sink, camera, worker, *remaining_resources]:
         for called_at, timeout_s in resource.calls:
-            assert 0.0 < timeout_s <= report.deadline_at - called_at
+            assert 0.0 <= timeout_s <= max(
+                0.0, report.deadline_at - called_at
+            )
 
 
 def test_no_state_cleanup_uses_one_half_second_deadline():
@@ -5672,6 +5926,46 @@ def test_no_state_cleanup_uses_one_half_second_deadline():
     assert sink.published == 0
     assert report.deadline_at == 0.5
     assert report.finished_at <= 0.5
+
+
+def test_exhausted_deadline_still_attempts_terminal_and_all_cleanup():
+    clock = AdvancingClock()
+    sink = BudgetedSink(clock)
+    camera = BudgetedCloser(clock, consume=0.5)
+    worker = BudgetedCloser(clock)
+    state = BudgetedCloser(clock)
+    keyboard = BudgetedCloser(clock)
+    ownership = BudgetedCloser(clock)
+    ros = BudgetedCloser(clock)
+    metrics = BudgetedCloser(clock)
+    coordinator = ShutdownCoordinator(
+        bridge=ShutdownBridge(hold=None), command_sink=sink,
+        camera=camera, worker=worker, state_source=state,
+        keyboard=keyboard, ownership_guard=ownership,
+        ros_runtime=ros, metrics=metrics, clock=clock, sleep=clock.sleep,
+    )
+    report = coordinator.close()
+    assert camera.calls == [(0.0, 0.5)]
+    for resource in (worker, state, keyboard, ownership, ros, metrics):
+        assert resource.calls == [(0.5, 0.0)]
+    assert any("deadline exhausted" in error for error in report.cleanup_errors)
+
+
+def test_bridge_stop_failure_cannot_skip_terminal_or_metrics_cleanup():
+    clock = AdvancingClock()
+    resources = [BudgetedCloser(clock) for _ in range(7)]
+    coordinator = ShutdownCoordinator(
+        bridge=FailingShutdownBridge(hold=None),
+        command_sink=BudgetedSink(clock), camera=resources[0],
+        worker=resources[1], state_source=resources[2],
+        keyboard=resources[3], ownership_guard=resources[4],
+        ros_runtime=resources[5], metrics=resources[6],
+        clock=clock, sleep=clock.sleep,
+    )
+    report = coordinator.close()
+    assert all(len(resource.calls) == 1 for resource in resources)
+    assert any(error == "bridge_stop: stop failed" for error in report.cleanup_errors)
+    assert any(error == "bounded_hold: hold failed" for error in report.cleanup_errors)
 ```
 
 `publish_attempts == 25` is the explicit no-26th assertion. The report is flushed only after publisher closure, so closure ordering is observable rather than inferred.
@@ -6231,9 +6525,21 @@ class ShutdownCoordinator:
         self._closed = True
         started_at = self.clock()
         errors = []
-        self.bridge.stop()
-        hold = self.bridge.build_bounded_shutdown_hold()
-        long_path = hold is not None or self.worker.busy
+        try:
+            self.bridge.stop()
+        except Exception as error:
+            errors.append(f"bridge_stop: {error}")
+        hold = None
+        try:
+            hold = self.bridge.build_bounded_shutdown_hold()
+        except Exception as error:
+            errors.append(f"bounded_hold: {error}")
+        try:
+            worker_busy = bool(self.worker.busy)
+        except Exception as error:
+            errors.append(f"worker_busy: {error}")
+            worker_busy = True
+        long_path = hold is not None or worker_busy
         deadline_at = started_at + (6.5 if long_path else 0.5)
 
         def remaining(cap=None):
@@ -6246,7 +6552,6 @@ class ShutdownCoordinator:
             budget = remaining(cap)
             if budget <= 0.0:
                 errors.append(f"{name}: overall shutdown deadline exhausted")
-                return
             try:
                 resource.close(timeout_s=budget)
             except Exception as error:
@@ -6310,6 +6615,20 @@ class FiftyHzLoop:
         self._next = first + count * 0.02
 
 
+def handle_keyboard_events(bridge, keyboard, metrics):
+    for key in keyboard.poll(0.0):
+        if key != "p":
+            continue
+        try:
+            bridge.handle_toggle()
+        except ActivationRefused as error:
+            metrics.write_event(
+                "activation_refused",
+                state=bridge.state.value,
+                reason=str(error),
+            )
+
+
 def run_runtime(
     bridge, adapters, keyboard, coordinator, metrics, ownership_guard,
 ):
@@ -6325,8 +6644,7 @@ def run_runtime(
         latest_camera = camera if camera is not None else latest_camera
         if latest_state is not None and latest_camera is not None:
             bridge.update_inputs(latest_state, latest_camera)
-        for _ in keyboard.poll(0.0):
-            bridge.handle_toggle()
+        handle_keyboard_events(bridge, keyboard, metrics)
         result = bridge.tick()
         metrics.write(
             "tick", bridge,
@@ -6377,6 +6695,49 @@ class ShadowPreviewSink:
 
     def close(self, timeout_s=0.0):
         self.closed = True
+
+
+class DisabledInferenceWorker:
+    busy = False
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self, timeout_s=0.0):
+        self.closed = True
+
+
+class ObservationOnlyShadowBridge:
+    def __init__(self, inference, clock, *, start_tick):
+        self.inference = inference
+        self.clock = clock
+        self.tick_index = start_tick
+        self.state = BridgeState.PAUSED
+        self.generation = 0
+        self.metrics = BridgeMetrics()
+
+    def update_inputs(self, state, camera):
+        del state, camera
+
+    def handle_toggle(self):
+        raise ActivationRefused(
+            "no usable policy contract; shadow remains observation-only"
+        )
+
+    def tick(self):
+        result = TickResult(
+            self.tick_index, None, None, None, "none"
+        )
+        self.tick_index += 1
+        return result
+
+    def stop(self):
+        if self.state is not BridgeState.STOPPED:
+            self.generation += 1
+            self.state = BridgeState.STOPPED
+
+    def build_bounded_shutdown_hold(self):
+        return None
 
 
 def _is_loopback_host(host):
@@ -6490,10 +6851,41 @@ def _close_partial(resources):
     return tuple(errors)
 
 
+def validate_domain_selection(mode, ros_domain_id, unitree_domain_id):
+    mode = BridgeMode(mode)
+    for label, value in (
+        ("ROS", ros_domain_id), ("Unitree", unitree_domain_id)
+    ):
+        if type(value) is not int or not 0 <= value <= 232:
+            raise PreflightError(f"{label} domain must be an integer in [0,232]")
+    if (
+        mode is BridgeMode.SIM_CONTROL
+        and (ros_domain_id, unitree_domain_id) != (42, 42)
+    ):
+        raise PreflightError("sim-control requires isolated domain 42")
+    return ros_domain_id, unitree_domain_id
+
+
+def load_local_policy_payload(path, mode):
+    mode = BridgeMode(mode)
+    if path is None:
+        if mode is BridgeMode.SIM_CONTROL:
+            raise PreflightError("--policy-contract is required in sim-control")
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        if mode is BridgeMode.SIM_CONTROL:
+            raise PreflightError(f"cannot read local policy contract: {error}") from error
+        return None
+    return payload
+
+
 def run_bridge(args):
     mode = BridgeMode(args.mode)
-    if args.ros_domain_id != 42 or args.unitree_domain_id != 42:
-        raise PreflightError("this milestone requires isolated domain 42")
+    validate_domain_selection(
+        mode, args.ros_domain_id, args.unitree_domain_id
+    )
     os.environ["ROS_DOMAIN_ID"] = str(args.ros_domain_id)
     os.environ["UNITREE_DOMAIN_ID"] = str(args.unitree_domain_id)
     repository_root = Path(__file__).resolve().parents[1]
@@ -6507,7 +6899,9 @@ def run_bridge(args):
             "WBCPolicy/robot_config", args.ros_domain_id
         ).get_config(3.0)
         connection_recorder.observe_wbc_response(wbc_payload)
-        local_policy_payload = json.loads(Path(args.policy_contract).read_text())
+        local_policy_payload = load_local_policy_payload(
+            args.policy_contract, mode
+        )
         policy_client = build_policy_client(args.server_host, args.server_port)
         try:
             server_policy_payload = policy_client.get_contract(timeout=2.0)
@@ -6517,7 +6911,7 @@ def run_bridge(args):
         except Exception:
             if mode is not BridgeMode.SHADOW:
                 raise
-            server_policy_payload = {}
+            server_policy_payload = None
         local_wbc = build_local_wbc_identity(repository_root)
         preflight = run_preflight(
             mode=mode, local_policy=local_policy_payload,
@@ -6569,17 +6963,26 @@ def run_bridge(args):
             else ShadowPreviewSink(metrics)
         )
         resources.append(("command_sink", command_sink))
-        contract = PolicyContract.from_dict(local_policy_payload)
-        worker = HttpInferenceWorker(
-            client=policy_client, clock=time.monotonic, contract=contract,
-            instruction=args.instruction, event_sink=metrics.write_event,
-        )
+        contract = preflight.runtime_policy_contract
+        if contract is None:
+            worker = DisabledInferenceWorker()
+            bridge = ObservationOnlyShadowBridge(
+                worker, time.monotonic,
+                start_tick=int(time.monotonic() * 50),
+            )
+        else:
+            worker = HttpInferenceWorker(
+                client=policy_client, clock=time.monotonic, contract=contract,
+                instruction=args.instruction, event_sink=metrics.write_event,
+            )
+            bridge = Psi0SimpleBridge(
+                contract, preflight.joint_contract, worker, time.monotonic,
+                start_tick=int(
+                    time.monotonic() * contract.action_frequency_hz
+                ),
+                consume_goal=command_sink.publish,
+            )
         resources.append(("worker", worker))
-        bridge = Psi0SimpleBridge(
-            contract, preflight.joint_contract, worker, time.monotonic,
-            start_tick=int(time.monotonic() * contract.action_frequency_hz),
-            consume_goal=command_sink.publish,
-        )
         keyboard = LocalKeyboard(sys.stdin.fileno())
         keyboard.__enter__()
         resources.append(("keyboard", keyboard))
@@ -7412,8 +7815,8 @@ import scripts.tests.smoke_psi0_simple_bridge as smoke_driver
 from scripts.tests.smoke_psi0_simple_bridge import (
     OwnedChildren, SmokeConfig, SmokeSafetyError, arm_next_policy_delay,
     allocate_smoke_run_directory, build_launch_plan, collect_smoke_report,
-    default_wbc_preflight, launch, measured_real_interface_connections,
-    validate_smoke_report,
+    default_wbc_preflight, launch, measured_bridge_worker_idle_at,
+    measured_real_interface_connections, validate_smoke_report,
 )
 
 EXPECTED_WBC_ARGS = (
@@ -7623,6 +8026,7 @@ def test_collector_uses_lowercase_fault_and_old_generation_counter():
             "event": "tick", "tick": 100, "published": True,
             "state": "active", "source_kind": "hold",
             "psi0_action": zero, "monotonic_s": 11.00,
+            "worker_busy": True,
             "discarded_late_results": 0,
             "discarded_old_generation_results": 0,
         },
@@ -7630,16 +8034,30 @@ def test_collector_uses_lowercase_fault_and_old_generation_counter():
             "event": "tick", "tick": 101, "published": True,
             "state": "fault", "source_kind": "hold",
             "psi0_action": zero, "monotonic_s": 11.02,
+            "worker_busy": True,
+            "discarded_late_results": 0,
+            "discarded_old_generation_results": 1,
+        },
+        {
+            "event": "tick", "tick": 199, "published": True,
+            "state": "fault", "source_kind": "hold",
+            "psi0_action": zero, "monotonic_s": 12.98,
+            "worker_busy": False,
             "discarded_late_results": 0,
             "discarded_old_generation_results": 1,
         },
     ]
+    assert measured_bridge_worker_idle_at(records, 0.0) == 12.98
     report = collect_smoke_report(
         records, scenario_started_at=0.0, armed_seq=17,
         delayed_record={"request_seq": 17, "applied_latency_s": 0.30},
-        worker_idle_at_s=12.0, goal_counts_before=[0, 1],
+        goal_counts_before=[0, 1],
         goal_counts_running=[1, 1], goal_counts_after=[0, 1],
-        terminal_restored=True, ports_rebound=True,
+        terminal_restored=True, ports_rebound=True, bridge_exit_code=0,
+        live_children_after=[],
+        child_exit_codes={
+            "wbc": -2, "camera": 0, "policy": 0, "bridge": 0,
+        },
     )
     assert report["fault_at"] == 11.02
     assert report["old_generation_results_discarded"] == 1
@@ -7896,6 +8314,8 @@ def test_real_child_cleanup_uses_one_shared_absolute_deadline():
     owner.close(deadline=1.0)
     assert now[0] <= 1.0
     assert terminated == {101, 202, 303}
+    assert owner.live_pids() == []
+    assert owner.exit_codes() == {"101": 0, "202": 0, "303": 0}
     assert [event[:2] for event in events] == [
         (303, signal.SIGINT), (202, signal.SIGINT), (101, signal.SIGINT),
         (303, signal.SIGTERM), (202, signal.SIGTERM),
@@ -7941,6 +8361,18 @@ class OwnedChildren:
             if not live or self._clock() >= deadline:
                 return live
             self._sleep(min(0.01, deadline - self._clock()))
+
+    def live_pids(self):
+        return [
+            record.pid for record in self.records
+            if record.process is not None and record.process.poll() is None
+        ]
+
+    def exit_codes(self):
+        return {
+            record.name: record.process.poll()
+            for record in self.records if record.process is not None
+        }
 
     def close(self, deadline=None):
         if self._closed:
@@ -8121,10 +8553,26 @@ def measured_real_interface_connections(records):
     return measured
 
 
+def measured_bridge_worker_idle_at(records, scenario_started_at):
+    candidates = [
+        record for record in records
+        if record.get("event") == "tick"
+        and type(record.get("monotonic_s")) in (int, float)
+        and 12.9 <= record["monotonic_s"] - scenario_started_at <= 13.0
+    ]
+    if not candidates:
+        raise SmokeSafetyError("no bridge tick measured near second 13")
+    latest = max(candidates, key=lambda record: record["monotonic_s"])
+    if latest.get("worker_busy") is not False:
+        raise SmokeSafetyError("bridge-owned worker is not idle at second 13")
+    return latest["monotonic_s"] - scenario_started_at
+
+
 def collect_smoke_report(
     records, *, scenario_started_at, armed_seq, delayed_record,
-    worker_idle_at_s, goal_counts_before, goal_counts_running,
-    goal_counts_after, terminal_restored, ports_rebound,
+    goal_counts_before, goal_counts_running, goal_counts_after,
+    terminal_restored, ports_rebound, bridge_exit_code,
+    live_children_after, child_exit_codes,
 ):
     ticks = [record for record in records if record.get("event") == "tick"]
     publishes = [record for record in ticks if record.get("published") is True]
@@ -8175,11 +8623,15 @@ def collect_smoke_report(
             final_tick["discarded_old_generation_results"]
         ),
         "late_results_discarded": final_tick["discarded_late_results"],
-        "worker_idle_at_s": worker_idle_at_s,
+        "worker_idle_at_s": measured_bridge_worker_idle_at(
+            records, scenario_started_at
+        ),
         "goal_counts_before": goal_counts_before,
         "goal_counts_running": goal_counts_running,
         "goal_counts_after": goal_counts_after,
-        "live_children_after": [],
+        "live_children_after": list(live_children_after),
+        "child_exit_codes": dict(child_exit_codes),
+        "bridge_exit_code": bridge_exit_code,
         "live_threads_after": [
             thread.name for thread in threading.enumerate()
             if thread is not threading.current_thread()
@@ -8257,17 +8709,15 @@ def launch(config, hooks=None):
         sleep_until(scenario_started_at + 13.0, hooks.clock, hooks.sleep)
         status = hooks.policy_status(config)
         if status["active_requests"] != 0:
-            raise SmokeSafetyError("worker is not idle at second 13")
+            raise SmokeSafetyError("fake policy still has an active request")
         matches = [
             record for record in status["records"]
             if record == {"request_seq": armed_seq, "applied_latency_s": 0.30}
         ]
         if len(matches) != 1:
             raise SmokeSafetyError("one-shot delay did not reach armed request")
-        worker_idle_at_s = hooks.clock() - scenario_started_at
-
         os.killpg(os.getpgid(bridge_process.pid), signal.SIGINT)
-        bridge_process.wait(timeout=max(
+        bridge_exit_code = bridge_process.wait(timeout=max(
             0.0, smoke_deadline - hooks.clock()
         ))
         goal_counts_after = hooks.goal_counts()
@@ -8277,8 +8727,8 @@ def launch(config, hooks=None):
         records = read_jsonl(config.bridge_metrics_jsonl)
         report_args = (
             records, scenario_started_at, armed_seq, matches[0],
-            worker_idle_at_s, goal_counts_before, goal_counts_running,
-            goal_counts_after, terminal_restored,
+            goal_counts_before, goal_counts_running, goal_counts_after,
+            terminal_restored, bridge_exit_code,
         )
     finally:
         cleanup_deadline = (
@@ -8298,9 +8748,12 @@ def launch(config, hooks=None):
     report = collect_smoke_report(
         report_args[0], scenario_started_at=report_args[1],
         armed_seq=report_args[2], delayed_record=report_args[3],
-        worker_idle_at_s=report_args[4], goal_counts_before=report_args[5],
-        goal_counts_running=report_args[6], goal_counts_after=report_args[7],
-        terminal_restored=report_args[8], ports_rebound=ports_rebound,
+        goal_counts_before=report_args[4],
+        goal_counts_running=report_args[5], goal_counts_after=report_args[6],
+        terminal_restored=report_args[7], ports_rebound=ports_rebound,
+        bridge_exit_code=report_args[8],
+        live_children_after=owner.live_pids(),
+        child_exit_codes=owner.exit_codes(),
     )
     validation = validate_smoke_report(report)
     report["validation"] = {
@@ -8433,6 +8886,10 @@ def passing_smoke_report():
         "goal_counts_running": [1, 1],
         "goal_counts_after": [0, 1],
         "live_children_after": [],
+        "child_exit_codes": {
+            "wbc": -2, "camera": 0, "policy": 0, "bridge": 0,
+        },
+        "bridge_exit_code": 0,
         "live_threads_after": [],
         "terminal_restored": True,
         "ports_rebound": True,
@@ -8460,6 +8917,10 @@ def test_passing_smoke_report_meets_every_bound():
         ("worker_idle_at_s", 13.01),
         ("goal_counts_after", [1, 1]),
         ("live_children_after", [123]),
+        ("bridge_exit_code", 1),
+        ("child_exit_codes", {
+            "wbc": -2, "camera": 0, "policy": None, "bridge": 0,
+        }),
         ("terminal_restored", False),
         ("ports_rebound", False),
         ("real_interface_connections", 1),
@@ -8591,6 +9052,7 @@ def validate_smoke_report(report):
         "goal_counts_running": [1, 1],
         "goal_counts_after": [0, 1],
         "live_children_after": [],
+        "bridge_exit_code": 0,
         "live_threads_after": [],
         "terminal_restored": True,
         "ports_rebound": True,
@@ -8600,6 +9062,13 @@ def validate_smoke_report(report):
     for field, expected in exact.items():
         if report.get(field) != expected:
             failures.append(f"{field}: expected {expected!r}")
+    child_exit_codes = report.get("child_exit_codes")
+    if (
+        type(child_exit_codes) is not dict
+        or set(child_exit_codes) != {"wbc", "camera", "policy", "bridge"}
+        or any(type(code) is not int for code in child_exit_codes.values())
+    ):
+        failures.append("child_exit_codes: every owned child must be reaped")
     if report.get("blocked_main_loop_max_gap_s", float("inf")) > 0.060:
         failures.append("blocked_main_loop_max_gap_s: over 0.060")
     started = report.get("delayed_request_started_at")
@@ -8669,7 +9138,8 @@ import pytest
 
 from scripts.psi0_simple_real_bridge import (
     LocalKeyboard, PreflightError, RuntimeDependencyFactories, build_parser,
-    build_policy_client, build_runtime_adapters,
+    build_policy_client, build_runtime_adapters, load_local_policy_payload,
+    validate_domain_selection,
 )
 from simple.baselines.client import HttpActionClient
 from simple.deploy.psi0_simple_bridge import BridgeMode
@@ -8692,6 +9162,30 @@ def test_cli_rgb_default_and_no_low_level_interface_options():
         "robot_interface", "network_interface", "low_level_topic",
         "real_control", "dds_topic",
     }
+    assert parser.get_default("policy_contract") is None
+
+
+def test_only_sim_control_is_locked_to_isolated_domain_42():
+    assert validate_domain_selection(BridgeMode.SIM_CONTROL, 42, 42) == (
+        42, 42
+    )
+    with pytest.raises(PreflightError, match="isolated domain 42"):
+        validate_domain_selection(BridgeMode.SIM_CONTROL, 7, 9)
+    assert validate_domain_selection(BridgeMode.SHADOW, 7, 9) == (7, 9)
+    with pytest.raises(PreflightError, match=r"\[0,232\]"):
+        validate_domain_selection(BridgeMode.SHADOW, -1, 9)
+
+
+def test_shadow_does_not_require_or_unconditionally_read_local_contract(
+    tmp_path,
+):
+    missing = tmp_path / "missing-contract.json"
+    assert load_local_policy_payload(None, BridgeMode.SHADOW) is None
+    assert load_local_policy_payload(missing, BridgeMode.SHADOW) is None
+    with pytest.raises(PreflightError, match="required in sim-control"):
+        load_local_policy_payload(None, BridgeMode.SIM_CONTROL)
+    with pytest.raises(PreflightError, match="cannot read"):
+        load_local_policy_payload(missing, BridgeMode.SIM_CONTROL)
 
 
 def test_bridge_http_factory_uses_five_seconds_but_generic_default_is_none():
@@ -8789,6 +9283,8 @@ Document:
 - WBC command with `--interface sim --enable-waist --with-hands --domain-id 42`;
 - fake server/camera commands and the bridge shadow/sim-control commands;
 - startup PAUSED, local `p` transitions, FAULT rearm behavior, Ctrl-C conditional final hold, and WBC ownership after bridge exit;
+- `--policy-contract` is mandatory for `sim-control` but optional in `shadow`; shadow uses a valid server contract as uncertified runtime structure when the local file is missing, and becomes observation-only if neither contract is usable;
+- domain 42/loopback is mandatory for `sim-control` and its smoke test, while shadow accepts explicit domain IDs for observation of a real system without ever creating a publisher;
 - camera key/color validation and saved-sample gate;
 - the current checkpoint/RTX 3060 latency failure and why `/act` is ineligible;
 - the required external `/act-rtc-v1` request/response metadata and policy-contract fields;
@@ -8804,7 +9300,6 @@ PYTHONPATH=third_party/decoupled_wbc uv run --group sonic python \
   --server-host 127.0.0.1 \
   --server-port 22086 \
   --instruction "pick up the object" \
-  --policy-contract scripts/tests/fixtures/psi0_policy_contract_test_v2.json \
   --camera-host 127.0.0.1 \
   --camera-port 15555 \
   --camera-source-key rgb_head_stereo_left \
@@ -9748,6 +10243,7 @@ Expected: feature worktree status is clean, commits are atomic and ordered, and 
 | WBC env/domain serialization and 31-joint configuration | Task 4 |
 | Correct hand limits with shoulder allowlist | Task 4 |
 | Connected WBC Git/joint/limit/URDF/ONNX attestation | Tasks 5-6, 10 |
+| WBC partial-construction rollback before service publication | Task 5 |
 | Exact named 43→32 and 36→31+1+4 mapping | Task 7 |
 | RGB/BGR codec and viewpoint key contract | Tasks 10, 12 |
 | State bounds, freshness, skew, and last-valid behavior | Task 8 |
@@ -9756,11 +10252,14 @@ Expected: feature worktree status is clean, commits are atomic and ordered, and 
 | 103/108 sentinel handoffs and post-slew prefix | Task 9 |
 | Whole-suffix bounds and per-tick slew limits | Task 8 |
 | PAUSED/ACTIVE/FAULT/STOPPED and local `p` | Tasks 9, 11 |
+| Nonfatal local activation refusal and later retry | Tasks 9, 11 |
 | Single asynchronous worker, deadlines, late generation discard | Tasks 9, 11-12 |
 | Publisher ownership and shadow no-publisher guarantee | Task 10 |
+| Optional shadow contract, observation-only fallback, and selectable domains | Tasks 10-11, 14 |
 | Exact 25-message shutdown and no 26th message | Task 11 |
 | Short smoke stall and separate long shutdown test | Tasks 11-13 |
 | Isolated loopback/domain-42 MuJoCo smoke test | Task 13 |
+| Measured worker idleness, bridge exit, and reaped child processes | Task 13 |
 | Live gate: 10 warmups, 100 measured, failure counts, higher-method p99, evidence bundle | Task 15 |
 | Reachable nested commit and clean recursive checkout | Tasks 6, 16 |
 | No real-control path and documented later gates | Tasks 0, 10, 14-16 |
