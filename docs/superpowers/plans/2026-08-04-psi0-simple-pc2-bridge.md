@@ -1187,6 +1187,7 @@ git commit -m "feat: add versioned PSI0 RTC client"
 Test the actual dataclass and actual YAML override:
 
 ```python
+import pytest
 import tyro
 
 from decoupled_wbc.control.main.teleop.configs.configs import ControlLoopConfig
@@ -1647,20 +1648,246 @@ def test_attested_construction_rolls_back_every_created_resource():
         assert events[-len(expected_tail):] == expected_tail
 
 
-def test_attested_runtime_cleanup_attempts_every_resource_in_order():
+def make_runtime_factories(failure=None):
     from types import SimpleNamespace
 
-    from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
-        _close_attested_runtime,
+    events = []
+
+    def start_simulator():
+        events.append("simulator.start")
+        raise RuntimeError("simulator start failed")
+
+    environment = SimpleNamespace(
+        sim=failure == "simulator_start",
+        start_simulator=start_simulator,
+        close=lambda: events.append("environment.close"),
+    )
+    policy = SimpleNamespace(close=lambda: events.append("policy.close"))
+    service = SimpleNamespace(close=lambda: events.append("service.close"))
+    manager = SimpleNamespace(
+        shutdown=lambda: events.append("manager.shutdown"),
     )
 
-    events = []
-    dispatcher = SimpleNamespace(stop=lambda: events.append("dispatcher"))
-    service = SimpleNamespace(close=lambda: events.append("service"))
-    manager = SimpleNamespace(shutdown=lambda: events.append("manager"))
-    environment = SimpleNamespace(close=lambda: events.append("environment"))
-    _close_attested_runtime(dispatcher, service, manager, environment)
-    assert events == ["dispatcher", "service", "manager", "environment"]
+    def create_rate(_frequency):
+        events.append("rate")
+        if failure == "rate":
+            raise RuntimeError("rate failed")
+        return SimpleNamespace()
+
+    manager.create_rate = create_rate
+
+    def robot_model(**_kwargs):
+        events.append("robot_model")
+        if failure == "robot_model":
+            raise RuntimeError("robot model failed")
+        return object()
+
+    def environment_factory(**_kwargs):
+        events.append("environment")
+        if failure == "environment":
+            raise RuntimeError("environment failed")
+        return environment
+
+    def policy_factory(*_args, **_kwargs):
+        events.append("policy")
+        if failure == "policy":
+            raise RuntimeError("policy failed")
+        return policy
+
+    def model_contract_payload(_config, _model):
+        events.append("model_contract")
+        if failure == "model_contract":
+            raise RuntimeError("model contract failed")
+        return {
+            "model_contract": {}, "model_contract_sha256": "d" * 64,
+        }
+
+    def service_server(_backend, _topic, _payload):
+        events.append("service")
+        if failure == "service":
+            raise RuntimeError("service failed")
+        return service
+
+    def publisher(_backend, topic):
+        events.append(f"publisher:{topic}")
+        if failure == "publisher":
+            raise RuntimeError("publisher failed")
+        return SimpleNamespace()
+
+    class Dispatcher:
+        def register(self, _listener):
+            events.append("dispatcher.register")
+            if failure == "dispatcher_register":
+                raise RuntimeError("dispatcher register failed")
+
+        def start(self):
+            events.append("dispatcher.start")
+            if failure == "dispatcher_start":
+                raise RuntimeError("dispatcher start failed")
+
+        def stop(self):
+            events.append("dispatcher.stop")
+
+    def subscriber(_backend, _topic, **_kwargs):
+        events.append("subscriber")
+        if failure == "subscriber":
+            raise RuntimeError("subscriber failed")
+        return SimpleNamespace()
+
+    def make_simple(stage):
+        events.append(stage)
+        if failure == stage:
+            raise RuntimeError(f"{stage} failed")
+        return SimpleNamespace()
+
+    def dispatcher_factory(_kind):
+        events.append("dispatcher")
+        if failure == "dispatcher":
+            raise RuntimeError("dispatcher failed")
+        return Dispatcher()
+
+    factories = SimpleNamespace(
+        loop_manager=lambda _backend, **_kwargs: (
+            events.append("manager") or manager
+        ),
+        robot_model=robot_model,
+        environment=environment_factory,
+        policy=policy_factory,
+        model_contract_payload=model_contract_payload,
+        service_server=service_server,
+        publisher=publisher,
+        telemetry=lambda **_kwargs: make_simple("telemetry"),
+        keyboard_listener=lambda: make_simple("keyboard_listener"),
+        keyboard_estop=lambda: make_simple("keyboard_estop"),
+        dispatcher=dispatcher_factory,
+        subscriber=subscriber,
+    )
+    return factories, events
+
+
+@pytest.mark.parametrize(
+    "failure,expected_cleanup",
+    [
+        ("robot_model", ["manager.shutdown"]),
+        ("environment", ["manager.shutdown"]),
+        ("simulator_start", ["environment.close", "manager.shutdown"]),
+        ("policy", ["environment.close", "manager.shutdown"]),
+        (
+            "model_contract",
+            ["policy.close", "environment.close", "manager.shutdown"],
+        ),
+        (
+            "service",
+            ["policy.close", "environment.close", "manager.shutdown"],
+        ),
+        (
+            "publisher",
+            ["service.close", "policy.close", "environment.close",
+             "manager.shutdown"],
+        ),
+        (
+            "telemetry",
+            ["service.close", "policy.close", "environment.close",
+             "manager.shutdown"],
+        ),
+        (
+            "keyboard_listener",
+            ["service.close", "policy.close", "environment.close",
+             "manager.shutdown"],
+        ),
+        (
+            "keyboard_estop",
+            ["service.close", "policy.close", "environment.close",
+             "manager.shutdown"],
+        ),
+        (
+            "dispatcher",
+            ["service.close", "policy.close", "environment.close",
+             "manager.shutdown"],
+        ),
+        (
+            "dispatcher_register",
+            ["dispatcher.stop", "service.close", "policy.close",
+             "environment.close", "manager.shutdown"],
+        ),
+        (
+            "dispatcher_start",
+            ["dispatcher.stop", "service.close", "policy.close",
+             "environment.close", "manager.shutdown"],
+        ),
+        (
+            "rate",
+            ["dispatcher.stop", "service.close", "policy.close",
+             "environment.close", "manager.shutdown"],
+        ),
+        (
+            "subscriber",
+            ["dispatcher.stop", "service.close", "policy.close",
+             "environment.close", "manager.shutdown"],
+        ),
+    ],
+)
+def test_every_complete_startup_failure_rolls_back_all_owned_resources(
+    failure, expected_cleanup,
+):
+    from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
+        _build_owned_runtime,
+    )
+
+    factories, events = make_runtime_factories(failure)
+    with pytest.raises(RuntimeError, match="failed"):
+        _build_owned_runtime(
+            ControlLoopConfig(
+                interface="sim", enable_waist=True, domain_id=42
+            ),
+            factories=factories,
+        )
+    assert events[-len(expected_cleanup):] == expected_cleanup
+    assert events.count("manager.shutdown") == 1
+
+
+def test_successful_runtime_cleanup_is_reverse_order_complete_and_idempotent():
+    from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
+        _build_owned_runtime,
+    )
+
+    factories, events = make_runtime_factories()
+    runtime = _build_owned_runtime(
+        ControlLoopConfig(interface="sim", enable_waist=True, domain_id=42),
+        factories=factories,
+    )
+    runtime.close()
+    first_close_events = list(events)
+    runtime.close()
+    assert events == first_close_events
+    assert events[-5:] == [
+        "dispatcher.stop", "service.close", "policy.close",
+        "environment.close", "manager.shutdown",
+    ]
+
+
+def test_runtime_cleanup_failure_cannot_skip_later_owned_resources():
+    from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
+        _build_owned_runtime,
+    )
+
+    factories, events = make_runtime_factories()
+    runtime = _build_owned_runtime(
+        ControlLoopConfig(interface="sim", enable_waist=True, domain_id=42),
+        factories=factories,
+    )
+
+    def fail_service_close():
+        events.append("service.close.failed")
+        raise RuntimeError("service close failed")
+
+    runtime.components.robot_config_server.close = fail_service_close
+    with pytest.raises(RuntimeError, match="service close failed"):
+        runtime.close()
+    assert events[-5:] == [
+        "dispatcher.stop", "service.close.failed", "policy.close",
+        "environment.close", "manager.shutdown",
+    ]
 ```
 
 - [ ] **Step 3: Run the nested tests and verify missing helper/order failures**
@@ -1901,6 +2128,9 @@ class AttestedComponents:
 
 
 class ProductionFactories:
+    def loop_manager(self, backend, **kwargs):
+        return create_loop_manager(backend, **kwargs)
+
     def robot_model(self, **kwargs):
         return instantiate_g1_robot_model(**kwargs)
 
@@ -1915,6 +2145,30 @@ class ProductionFactories:
 
     def service_server(self, backend, topic, payload):
         return create_service_server(backend, topic, payload)
+
+    def publisher(self, backend, topic):
+        return create_publisher(backend, topic)
+
+    def telemetry(self, **kwargs):
+        return Telemetry(**kwargs)
+
+    def keyboard_listener(self):
+        return KeyboardListenerPublisher()
+
+    def keyboard_estop(self):
+        return KeyboardEStop()
+
+    def dispatcher(self, kind):
+        if kind == "raw":
+            return KeyboardDispatcher()
+        if kind == "ros":
+            return ROSKeyboardDispatcher()
+        raise ValueError(
+            f"Invalid keyboard dispatcher: {kind}, use 'raw' or 'ros'"
+        )
+
+    def subscriber(self, backend, topic, **kwargs):
+        return create_subscriber(backend, topic, **kwargs)
 
 
 def _build_attested_components(config, backend, factories=None):
@@ -1978,46 +2232,170 @@ def _rollback_attested_construction(created):
     return tuple(errors)
 
 
-def _close_attested_runtime(dispatcher, service, manager, environment):
-    operations = [("dispatcher", dispatcher.stop)]
-    close_service = getattr(service, "close", None)
-    if callable(close_service):
-        operations.append(("service", close_service))
-    operations.extend((
-        ("manager", manager.shutdown),
-        ("environment", environment.close),
-    ))
+def _close_attested_components(components):
     errors = []
-    for name, operation in operations:
+    for name, resource in (
+        ("service", components.robot_config_server),
+        ("policy", components.wbc_policy),
+        ("environment", components.environment),
+    ):
+        operation = getattr(resource, "close", None)
+        if not callable(operation):
+            continue
         try:
             operation()
         except Exception as error:
             errors.append(f"{name}: {error}")
     if errors:
-        raise RuntimeError("WBC cleanup failed: " + "; ".join(errors))
+        raise RuntimeError("attested cleanup failed: " + "; ".join(errors))
+
+
+class CleanupOwner:
+    def __init__(self):
+        self._operations = []
+        self._closed = False
+
+    def own(self, name, operation):
+        if self._closed:
+            raise RuntimeError("cannot add a resource to a closed owner")
+        self._operations.append((name, operation))
+
+    def close(self):
+        if self._closed:
+            return ()
+        self._closed = True
+        errors = []
+        for name, operation in reversed(self._operations):
+            try:
+                operation()
+            except Exception as error:
+                errors.append(f"{name}: {error}")
+        return tuple(errors)
+
+
+@dataclass(frozen=True)
+class WbcRuntime:
+    manager: object
+    components: AttestedComponents
+    data_exp_pub: object
+    lower_body_policy_status_pub: object
+    joint_safety_status_pub: object
+    telemetry: object
+    keyboard_listener_pub: object
+    keyboard_estop: object
+    dispatcher: object
+    rate: object
+    upper_body_policy_subscriber: object
+    owner: CleanupOwner
+
+    def close(self):
+        errors = self.owner.close()
+        if errors:
+            raise RuntimeError("WBC cleanup failed: " + "; ".join(errors))
+
+
+def _build_owned_runtime(config, factories=None):
+    factories = factories or ProductionFactories()
+    backend = config.messaging_backend
+    if backend == "zmq" and config.keyboard_dispatcher_type == "ros":
+        print(
+            "ZMQ backend: forcing keyboard_dispatcher_type='raw' "
+            "(ROS dispatcher unavailable)"
+        )
+        config.keyboard_dispatcher_type = "raw"
+    owner = CleanupOwner()
+    try:
+        manager = factories.loop_manager(
+            backend, node_name=CONTROL_NODE_NAME
+        )
+        owner.own("manager", manager.shutdown)
+
+        components = _build_attested_components(
+            config, backend, factories=factories
+        )
+        owner.own(
+            "attested_components",
+            lambda: _close_attested_components(components),
+        )
+
+        data_exp_pub = factories.publisher(backend, STATE_TOPIC_NAME)
+        lower_body_policy_status_pub = factories.publisher(
+            backend, LOWER_BODY_POLICY_STATUS_TOPIC
+        )
+        joint_safety_status_pub = factories.publisher(
+            backend, JOINT_SAFETY_STATUS_TOPIC
+        )
+        telemetry = factories.telemetry(window_size=100)
+        keyboard_listener_pub = factories.keyboard_listener()
+        keyboard_estop = factories.keyboard_estop()
+
+        dispatcher = factories.dispatcher(config.keyboard_dispatcher_type)
+        owner.own("dispatcher", dispatcher.stop)
+        for listener in (
+            components.environment,
+            components.wbc_policy,
+            keyboard_listener_pub,
+            keyboard_estop,
+        ):
+            dispatcher.register(listener)
+        dispatcher.start()
+
+        rate = manager.create_rate(config.control_frequency)
+        zmq_kw = {"host": config.zmq_host} if backend == "zmq" else {}
+        upper_body_policy_subscriber = factories.subscriber(
+            backend, CONTROL_GOAL_TOPIC, **zmq_kw
+        )
+        return WbcRuntime(
+            manager=manager,
+            components=components,
+            data_exp_pub=data_exp_pub,
+            lower_body_policy_status_pub=lower_body_policy_status_pub,
+            joint_safety_status_pub=joint_safety_status_pub,
+            telemetry=telemetry,
+            keyboard_listener_pub=keyboard_listener_pub,
+            keyboard_estop=keyboard_estop,
+            dispatcher=dispatcher,
+            rate=rate,
+            upper_body_policy_subscriber=upper_body_policy_subscriber,
+            owner=owner,
+        )
+    except Exception as error:
+        rollback_errors = owner.close()
+        if rollback_errors:
+            raise RuntimeError(
+                f"{error}; complete startup rollback: "
+                + "; ".join(rollback_errors)
+            ) from error
+        raise
 ```
 
-- [ ] **Step 6: Move main-loop service publication behind the tested constructor**
+- [ ] **Step 6: Put the complete WBC startup lifecycle behind one tested owner**
 
-Delete the old early `create_service_server(...)` call and the old inline WBC/model/environment/policy construction. Immediately after manager creation, insert this exact replacement in `run_g1_control_loop.main()`:
+Delete every resource construction statement from `main()`—including manager, service, publishers, telemetry, environment/simulator, policy, keyboard resources, dispatcher, rate, and subscriber. The first resource-owning statement must be the following call; nothing with a `close()`, `shutdown()`, `stop()`, child thread, ROS/DDS/ZMQ handle, or simulator may be constructed before it:
 
 ```python
-components = _build_attested_components(config, backend)
+runtime = _build_owned_runtime(config)
+manager = runtime.manager
+components = runtime.components
 env = components.environment
 robot_model = components.robot_model
 wbc_policy = components.wbc_policy
-robot_config_server = components.robot_config_server
+data_exp_pub = runtime.data_exp_pub
+lower_body_policy_status_pub = runtime.lower_body_policy_status_pub
+joint_safety_status_pub = runtime.joint_safety_status_pub
+telemetry = runtime.telemetry
+dispatcher = runtime.dispatcher
+rate = runtime.rate
+upper_body_policy_subscriber = runtime.upper_body_policy_subscriber
 ```
 
-Keep `robot_config_server` alive for the function lifetime. Replace the existing `finally` body with a single `_close_attested_runtime(dispatcher, robot_config_server, manager, env)` call at the existing indentation. The helper attempts every cleanup operation, closes the attestation service before its messaging manager, supports backends without a service `close()`, and reports accumulated failures:
+Keep the existing control-loop body after these assignments. Replace its `finally` body with this single owner close:
 
 ```python
-_close_attested_runtime(
-    dispatcher, robot_config_server, manager, env
-)
+runtime.close()
 ```
 
-Run Ruff against the complete modified file, not these insertion fragments in isolation. The existing file already owns the imports for `G1Env`, `ROBOT_CONFIG_TOPIC`, `get_wbc_policy`, `instantiate_g1_robot_model`, and `create_service_server`; Step 5 adds only the new `dataclass` and model-contract imports.
+`_build_owned_runtime()` registers manager shutdown immediately after manager creation, delegates component construction to the internally rollback-safe attested constructor, then registers the component cleanup before it constructs any publisher, dispatcher, or subscriber. It registers `dispatcher.stop` before the first dispatcher callback or thread is started. Any later failure closes all registered resources in reverse ownership order and continues through cleanup failures. `main()` therefore has no partial-startup path outside the owner. Run Ruff against the complete modified file, not these insertion fragments in isolation. The existing file already owns the imports used by `ProductionFactories`; Step 5 adds only the new `dataclass` and model-contract imports.
 
 - [ ] **Step 7: Run all nested contract/limit tests**
 
@@ -2486,6 +2864,8 @@ def test_state_tolerance_accepts_point_05_and_rejects_beyond(contract):
         (9.899, 10.0, 10.0, "state stale"),
         (10.0, 9.749, 10.0, "camera stale"),
         (10.0, 9.899, 10.0, "receive-time skew"),
+        (10.0, np.nan, 10.0, "camera receive time"),
+        (10.0, "not-a-time", 10.0, "camera receive time"),
     ],
 )
 def test_snapshot_freshness_and_skew_are_independent(
@@ -2691,12 +3071,32 @@ def accept_measured_state(last_valid, candidate, contract, now):
 
 
 def validate_synchronized_snapshot(state, camera, now):
-    if state is None:
-        raise ValueError("state missing")
-    if camera is None:
-        raise ValueError("camera missing")
-    state_age = now - state.received_at
-    camera_age = now - camera.received_at
+    if type(state) is not TimedRobotState:
+        raise ValueError("state missing or wrong type")
+    if type(camera) is not TimedCameraFrame:
+        raise ValueError("camera missing or wrong type")
+    if type(now) not in (float, int) or not np.isfinite(now):
+        raise ValueError("snapshot validation time")
+    if (
+        type(state.received_at) not in (float, int)
+        or not np.isfinite(state.received_at)
+    ):
+        raise ValueError("state receive time")
+    if (
+        type(camera.received_at) not in (float, int)
+        or not np.isfinite(camera.received_at)
+    ):
+        raise ValueError("camera receive time")
+    if (
+        camera.producer_timestamp is not None
+        and (
+            type(camera.producer_timestamp) not in (float, int)
+            or not np.isfinite(camera.producer_timestamp)
+        )
+    ):
+        raise ValueError("camera producer time")
+    state_age = float(now) - float(state.received_at)
+    camera_age = float(now) - float(camera.received_at)
     if state_age < 0.0 or state_age > 0.10:
         raise ValueError("state stale")
     if camera_age < 0.0 or camera_age > 0.25:
@@ -3221,6 +3621,7 @@ from simple.deploy.psi0_simple_bridge import (
     BridgeState,
     Psi0SimpleBridge,
     RtcResult,
+    TimedCameraFrame,
     TimedRobotState,
 )
 from tests.psi0_bridge_testkit import (
@@ -3240,7 +3641,7 @@ class BlockingInference:
 
     @property
     def busy(self):
-        return self.physical_busy
+        return self.physical_busy or self.result is not None
 
     def submit(self, request):
         if self.physical_busy:
@@ -3332,6 +3733,10 @@ def test_fault_holds_zero_navigation_and_rearm_waits_for_physical_idle():
         },
     )
     inference.release(late)
+    with pytest.raises(ActivationRefused, match="worker busy"):
+        bridge.handle_toggle()
+    assert bridge.state is BridgeState.FAULT
+    assert len(inference.requests) == 1
     bridge.update_inputs(*fresh_inputs(clock))
     bridge.tick()
     assert bridge.metrics.discarded_old_generation_results == 1
@@ -3356,6 +3761,25 @@ def test_active_invalid_state_latches_one_stable_fault_reason():
     assert bridge.metrics.fault_transitions == 1
     np.testing.assert_array_equal(first.goal.navigate_cmd, np.zeros(4, np.float32))
     np.testing.assert_array_equal(second.goal.navigate_cmd, np.zeros(4, np.float32))
+
+
+@pytest.mark.parametrize("received_at", [np.nan, "not-a-time"])
+def test_invalid_camera_receive_time_becomes_active_fault(received_at):
+    inference = BlockingInference()
+    bridge, clock = ready_bridge(inference)
+    bridge.tick()
+    clock.set_tick(100)
+    bridge.update_inputs(*fresh_inputs(clock))
+    bridge.activate()
+    state, _ = fresh_inputs(clock)
+    bad_camera = TimedCameraFrame(
+        np.zeros((8, 8, 3), np.uint8), received_at, None
+    )
+    bridge.update_inputs(state, bad_camera)
+    result = bridge.tick()
+    assert bridge.state is BridgeState.FAULT
+    assert bridge.fault_reason == "camera receive time"
+    assert result.source_kind == "hold"
 
 
 def test_paused_hold_is_captured_once_and_ignores_later_measurements():
@@ -4632,7 +5056,8 @@ from simple.baselines.client import HttpActionClient
 from simple.deploy.psi0_simple_bridge import (
     ActivationRefused, BridgeMetrics, BridgeMode, BridgeState, JointContract,
     PolicyContract, Psi0SimpleBridge, RtcResult, TickResult,
-    TimedCameraFrame, TimedRobotState,
+    TimedCameraFrame, TimedRobotState, accept_measured_state,
+    validate_synchronized_snapshot,
 )
 
 
@@ -5520,9 +5945,11 @@ from scripts.psi0_simple_real_bridge import (
 from simple.baselines.client import RtcActionResponse
 from simple.deploy.psi0_simple_bridge import (
     ActivationRefused, BridgeMode, BridgeState, PolicyContract, RtcRequest,
-    TimedCameraFrame,
+    TimedCameraFrame, TimedRobotState,
 )
-from tests.psi0_bridge_testkit import ManualClock, policy_payload
+from tests.psi0_bridge_testkit import (
+    ManualClock, make_joint_contract, policy_payload,
+)
 
 
 def valid_runtime_request(generation=1):
@@ -5606,6 +6033,33 @@ def test_one_blocked_worker_never_blocks_tick_thread_or_allows_replacement():
     assert worker.thread.ident == thread_identity
 
 
+def test_queued_result_keeps_worker_busy_until_main_thread_drains_it():
+    class ImmediateHttpClient:
+        def query_rtc_action(self, *args, **kwargs):
+            return valid_http_rtc_response()
+
+    result_recorded = threading.Event()
+
+    def record_event(event, **_fields):
+        if event == "result":
+            result_recorded.set()
+
+    worker = HttpInferenceWorker(
+        client=ImmediateHttpClient(), clock=ManualClock(100),
+        contract=PolicyContract.from_dict(policy_payload(
+            prediction_horizon=30, execution_horizon=24,
+            rtc_delay_steps=6, rtc_training_max_delay=7,
+        )),
+        event_sink=record_event,
+    )
+    worker.submit(valid_runtime_request())
+    assert result_recorded.wait(0.2)
+    assert worker.busy is True
+    assert worker.poll() is not None
+    assert worker.busy is False
+    worker.close(timeout_s=0.5)
+
+
 def test_every_shadow_metric_and_preview_is_uncertified(tmp_path):
     path = tmp_path / "shadow.jsonl"
     bridge = SimpleNamespace(
@@ -5676,7 +6130,7 @@ def test_missing_shadow_contract_disables_inference_without_exiting():
 
     worker = DisabledInferenceWorker()
     bridge = ObservationOnlyShadowBridge(
-        worker, ManualClock(100), start_tick=100
+        worker, make_joint_contract(), ManualClock(100), start_tick=100
     )
     metrics = Metrics()
     keyboard = SimpleNamespace(poll=lambda _timeout_s: ("p",))
@@ -5686,6 +6140,47 @@ def test_missing_shadow_contract_disables_inference_without_exiting():
     assert result.goal is None
     assert worker.busy is False
     assert metrics.events[0][0] == "activation_refused"
+
+
+def test_contractless_shadow_validates_state_camera_freshness_and_skew():
+    clock = ManualClock(500)
+    worker = DisabledInferenceWorker()
+    bridge = ObservationOnlyShadowBridge(
+        worker, make_joint_contract(), clock, start_tick=500
+    )
+    state = TimedRobotState(np.zeros(43, np.float32), clock())
+    camera = TimedCameraFrame(
+        np.zeros((8, 8, 3), np.uint8), clock(), None
+    )
+    bridge.update_inputs(state, camera)
+    assert bridge.observation_valid is True
+    assert bridge.input_error is None
+    accepted_state = bridge.last_valid_state
+    accepted_snapshot = bridge.last_snapshot
+
+    bad_shape = TimedRobotState(np.zeros(42, np.float32), clock())
+    bridge.update_inputs(bad_shape, camera)
+    assert bridge.observation_valid is False
+    assert bridge.input_error == "measured state shape"
+    assert bridge.last_valid_state is accepted_state
+    assert bridge.last_snapshot is accepted_snapshot
+
+    clock.set_tick(510)
+    fresh_state = TimedRobotState(np.zeros(43, np.float32), clock())
+    skewed_camera = TimedCameraFrame(
+        np.zeros((8, 8, 3), np.uint8), 10.0, None
+    )
+    bridge.update_inputs(fresh_state, skewed_camera)
+    assert bridge.observation_valid is False
+    assert bridge.input_error == "receive-time skew"
+    assert bridge.last_snapshot is accepted_snapshot
+
+    invalid_time_camera = TimedCameraFrame(
+        np.zeros((8, 8, 3), np.uint8), np.nan, None
+    )
+    bridge.update_inputs(fresh_state, invalid_time_camera)
+    assert bridge.observation_valid is False
+    assert bridge.input_error == "camera receive time"
 
 
 def test_connection_evidence_requires_successful_runtime_observations():
@@ -6003,19 +6498,19 @@ class HttpInferenceWorker:
 
     @property
     def busy(self):
-        return self._physical_busy.is_set()
+        return self._physical_busy.is_set() or not self._output.empty()
 
     def submit(self, request):
         if self._stopping.is_set():
-            raise RuntimeError("inference worker is stopping")
-        if self.busy or not self._output.empty():
-            raise RuntimeError("inference worker busy")
+            raise ActivationRefused("inference worker is stopping")
+        if self.busy:
+            raise ActivationRefused("inference worker busy")
         self._physical_busy.set()
         try:
             self._input.put_nowait(request)
-        except Exception:
+        except queue.Full as error:
             self._physical_busy.clear()
-            raise
+            raise ActivationRefused("inference request queue is full") from error
         self.metrics.requests_submitted += 1
         self._event_sink(
             "request", generation=request.generation,
@@ -6096,9 +6591,16 @@ class HttpInferenceWorker:
         self.thread.join(timeout_s)
         if self.thread.is_alive():
             raise RuntimeError("inference worker failed to stop within timeout")
+        self._physical_busy.clear()
+        for pending in (self._input, self._output):
+            while True:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    break
 ```
 
-`WorkerMetrics` is a dataclass with `requests_submitted: int = 0` and `first_request_started_at: float | None = None`. Both production and tests pass the parsed contract explicitly. The worker never retries or starts a replacement thread. Reuse the exact Task 3 recording-session tests at this boundary to prove R0 carries reset and successors omit it.
+`WorkerMetrics` is a dataclass with `requests_submitted: int = 0` and `first_request_started_at: float | None = None`. `busy` is true while HTTP is running **or while a completed result remains undrained**, so a local rearm cannot race the main thread's result drain. Both production and tests pass the parsed contract explicitly. The worker never retries or starts a replacement thread. Reuse the exact Task 3 recording-session tests at this boundary to prove R0 carries reset and successors omit it.
 
 Implement in bounded subactions:
 
@@ -6660,6 +7162,8 @@ def run_runtime(
                 else result.psi0_action.tolist()
             ),
             worker_busy=bridge.inference.busy,
+            input_valid=getattr(bridge, "observation_valid", None),
+            input_error=getattr(bridge, "input_error", None),
             discarded_late_results=bridge.metrics.discarded_late_results,
             discarded_old_generation_results=(
                 bridge.metrics.discarded_old_generation_results
@@ -6708,16 +7212,39 @@ class DisabledInferenceWorker:
 
 
 class ObservationOnlyShadowBridge:
-    def __init__(self, inference, clock, *, start_tick):
+    def __init__(self, inference, joints, clock, *, start_tick):
         self.inference = inference
+        self.joints = joints
         self.clock = clock
         self.tick_index = start_tick
         self.state = BridgeState.PAUSED
         self.generation = 0
         self.metrics = BridgeMetrics()
+        self.last_valid_state = None
+        self.last_snapshot = None
+        self.observation_valid = False
+        self.input_error = "no synchronized inputs"
 
     def update_inputs(self, state, camera):
-        del state, camera
+        accepted, reason = accept_measured_state(
+            self.last_valid_state, state, self.joints, self.clock()
+        )
+        self.last_valid_state = accepted
+        if reason is not None:
+            self.observation_valid = False
+            self.input_error = reason
+            return
+        try:
+            snapshot = validate_synchronized_snapshot(
+                accepted, camera, self.clock()
+            )
+        except ValueError as error:
+            self.observation_valid = False
+            self.input_error = str(error)
+            return
+        self.last_snapshot = snapshot
+        self.observation_valid = True
+        self.input_error = None
 
     def handle_toggle(self):
         raise ActivationRefused(
@@ -6967,7 +7494,7 @@ def run_bridge(args):
         if contract is None:
             worker = DisabledInferenceWorker()
             bridge = ObservationOnlyShadowBridge(
-                worker, time.monotonic,
+                worker, preflight.joint_contract, time.monotonic,
                 start_tick=int(time.monotonic() * 50),
             )
         else:
@@ -7815,7 +8342,8 @@ import scripts.tests.smoke_psi0_simple_bridge as smoke_driver
 from scripts.tests.smoke_psi0_simple_bridge import (
     OwnedChildren, SmokeConfig, SmokeSafetyError, arm_next_policy_delay,
     allocate_smoke_run_directory, build_launch_plan, collect_smoke_report,
-    default_wbc_preflight, launch, measured_bridge_worker_idle_at,
+    close_smoke_resources, default_wbc_preflight, launch,
+    measured_bridge_worker_idle_at,
     measured_real_interface_connections, validate_smoke_report,
 )
 
@@ -8321,9 +8849,93 @@ def test_real_child_cleanup_uses_one_shared_absolute_deadline():
         (303, signal.SIGTERM), (202, signal.SIGTERM),
         (101, signal.SIGTERM),
     ]
+
+
+def test_child_cleanup_continues_after_signal_failure_and_can_retry():
+    now = [0.0]
+    terminated = set()
+    fail_303 = [True]
+    events = []
+
+    class Process:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def poll(self):
+            return 0 if self.pid in terminated else None
+
+    def killpg(pgid, sig):
+        events.append((pgid, sig))
+        if pgid == 303 and fail_303[0]:
+            raise OSError("injected signal failure")
+        terminated.add(pgid)
+
+    owner = OwnedChildren(
+        killpg=killpg, clock=lambda: now[0],
+        sleep=lambda duration: now.__setitem__(0, now[0] + duration),
+    )
+    for pid in (101, 202, 303):
+        owner.record(
+            pid=pid, pgid=pid, name=str(pid), argv=(str(pid),),
+            started_at=0.0, process=Process(pid),
+        )
+    with pytest.raises(SmokeSafetyError, match="303"):
+        owner.close(deadline=0.8)
+    assert (202, signal.SIGINT) in events
+    assert (101, signal.SIGINT) in events
+    assert owner.live_pids() == [303]
+    assert owner._closed is False
+
+    fail_303[0] = False
+    owner.close(deadline=2.0)
+    assert owner.live_pids() == []
+    assert owner._closed is True
+
+
+def test_resource_cleanup_closes_pty_and_logs_when_child_cleanup_raises():
+    events = []
+
+    class FailingOwner:
+        def close(self, deadline):
+            events.append(("owner", deadline))
+            raise RuntimeError("child cleanup failed")
+
+    class Log:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            events.append(("log", self.name))
+
+    with pytest.raises(SmokeSafetyError, match="child cleanup failed"):
+        close_smoke_resources(
+            FailingOwner(), (10, 11), (Log("a"), Log("b")), 15.0,
+            close_fd=lambda descriptor: events.append(("fd", descriptor)),
+        )
+    assert events == [
+        ("owner", 15.0), ("fd", 10), ("fd", 11),
+        ("log", "a"), ("log", "b"),
+    ]
+
+
+def test_resource_cleanup_retries_an_owner_that_still_has_live_children():
+    calls = []
+
+    class RetriableOwner:
+        _closed = False
+
+        def close(self, deadline):
+            calls.append(deadline)
+            if len(calls) == 1:
+                raise RuntimeError("transient killpg failure")
+            self._closed = True
+
+    with pytest.raises(SmokeSafetyError, match="transient killpg failure"):
+        close_smoke_resources(RetriableOwner(), (), (), 15.0)
+    assert calls == [15.0, 15.0]
 ```
 
-Use this exact owner and readiness helper. Launch each child with `start_new_session=True`, record it immediately, and walk only that list in reverse. `close(deadline=...)` signals each escalation phase to all still-live process groups before waiting concurrently against the same absolute deadline; it never grants a fresh timeout per child. The injection-only unit branch preserves the exact `waitpid` assertion above:
+Use this exact owner and readiness helper. Launch each child with `start_new_session=True`, record it immediately, and walk only that list in reverse. `close(deadline=...)` catches failures per child and per operation, continues through every remaining process group, and signals each escalation phase to all still-live process groups before waiting concurrently against the same absolute deadline. It never grants a fresh timeout per child. A final SIGKILL pass still runs after an exhausted deadline or earlier cleanup error. The owner becomes closed only after no real child remains (and all injected waits succeeded), so a failed cleanup with a live child can be retried. The injection-only unit branch preserves the exact `waitpid` assertion above:
 
 ```python
 @dataclass
@@ -8347,17 +8959,45 @@ class OwnedChildren:
         self._sleep = sleep
         self.records = []
         self._closed = False
+        self._closing = False
 
     def record(self, *, pid, pgid, name, argv, started_at, process=None):
-        if self._closed or any(record.pid == pid for record in self.records):
+        if (
+            self._closed or self._closing
+            or any(record.pid == pid for record in self.records)
+        ):
             raise RuntimeError("invalid child ownership record")
         self.records.append(ChildRecord(
             pid, pgid, name, tuple(argv), float(started_at), process
         ))
 
-    def _wait_live_until(self, records, deadline):
+    def _poll(self, record, errors):
+        try:
+            return record.process.poll()
+        except Exception as error:
+            errors.append(f"poll {record.name}({record.pid}): {error}")
+            return None
+
+    def _live(self, records, errors):
+        return [
+            record for record in records
+            if self._poll(record, errors) is None
+        ]
+
+    def _signal(self, records, sig, errors):
+        for record in records:
+            try:
+                self._killpg(record.pgid, sig)
+            except ProcessLookupError:
+                continue
+            except Exception as error:
+                errors.append(
+                    f"signal {record.name}({record.pgid}) {sig}: {error}"
+                )
+
+    def _wait_live_until(self, records, deadline, errors):
         while True:
-            live = [record for record in records if record.process.poll() is None]
+            live = self._live(records, errors)
             if not live or self._clock() >= deadline:
                 return live
             self._sleep(min(0.01, deadline - self._clock()))
@@ -8377,38 +9017,99 @@ class OwnedChildren:
     def close(self, deadline=None):
         if self._closed:
             return
-        self._closed = True
+        if self._closing:
+            raise SmokeSafetyError("child cleanup is already in progress")
+        self._closing = True
+        errors = []
         injected = [record for record in reversed(self.records) if record.process is None]
         real = [record for record in reversed(self.records) if record.process is not None]
-        for record in injected:
-            self._killpg(record.pgid, signal.SIGINT)
-            self._waitpid(record.pid, 0)
-        if not real:
-            return
-        live = [record for record in real if record.process.poll() is None]
-        if type(deadline) not in (int, float):
-            raise TypeError("real child cleanup requires an absolute deadline")
-        if deadline <= self._clock():
-            for record in live:
-                self._killpg(record.pgid, signal.SIGKILL)
-                record.process.poll()
-            raise TimeoutError("shared child cleanup deadline already exhausted")
-        for record in live:
-            self._killpg(record.pgid, signal.SIGINT)
-        live = self._wait_live_until(
-            live, min(deadline, self._clock() + 0.5)
+        live = []
+        injected_ok = True
+        try:
+            for record in injected:
+                try:
+                    self._killpg(record.pgid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                except Exception as error:
+                    injected_ok = False
+                    errors.append(f"signal {record.name}({record.pgid}): {error}")
+                try:
+                    self._waitpid(record.pid, 0)
+                except ChildProcessError:
+                    pass
+                except Exception as error:
+                    injected_ok = False
+                    errors.append(f"wait {record.name}({record.pid}): {error}")
+
+            if real:
+                if (
+                    type(deadline) not in (int, float)
+                    or not np.isfinite(deadline)
+                ):
+                    errors.append("real child cleanup requires a finite deadline")
+                    deadline = self._clock()
+                live = self._live(real, errors)
+                if deadline <= self._clock():
+                    errors.append("shared child cleanup deadline exhausted")
+                else:
+                    self._signal(live, signal.SIGINT, errors)
+                    live = self._wait_live_until(
+                        live, min(deadline, self._clock() + 0.5), errors
+                    )
+                    self._signal(live, signal.SIGTERM, errors)
+                    live = self._wait_live_until(
+                        live, min(deadline, self._clock() + 0.2), errors
+                    )
+
+                # This last best-effort phase is unconditional, even if the
+                # shared deadline or an earlier signal operation failed.
+                live = self._live(real, errors)
+                self._signal(live, signal.SIGKILL, errors)
+                live = self._wait_live_until(live, deadline, errors)
+                if live:
+                    errors.append(
+                        "live children: "
+                        + ",".join(
+                            f"{record.name}({record.pid})" for record in live
+                        )
+                    )
+            self._closed = not live and injected_ok
+        finally:
+            self._closing = False
+        if errors:
+            raise SmokeSafetyError("child cleanup failed: " + "; ".join(errors))
+
+
+def close_smoke_resources(
+    owner, descriptors, logs, deadline, *, close_fd=os.close,
+):
+    errors = []
+    try:
+        owner.close(deadline=deadline)
+    except Exception as error:
+        errors.append(f"children: {error}")
+        if getattr(owner, "_closed", True) is False:
+            try:
+                owner.close(deadline=deadline)
+            except Exception as retry_error:
+                errors.append(f"children retry: {retry_error}")
+    for descriptor in descriptors:
+        if descriptor is None:
+            continue
+        try:
+            close_fd(descriptor)
+        except Exception as error:
+            errors.append(f"descriptor {descriptor}: {error}")
+    for index, log in enumerate(logs):
+        try:
+            log.close()
+        except Exception as error:
+            errors.append(f"log {index}: {error}")
+    if errors:
+        raise SmokeSafetyError(
+            "smoke resource cleanup failed: " + "; ".join(errors)
         )
-        for record in live:
-            self._killpg(record.pgid, signal.SIGTERM)
-        live = self._wait_live_until(
-            live, min(deadline, self._clock() + 0.2)
-        )
-        for record in live:
-            self._killpg(record.pgid, signal.SIGKILL)
-        live = self._wait_live_until(live, deadline)
-        if live:
-            names = ",".join(record.name for record in live)
-            raise TimeoutError(f"children missed shared cleanup deadline: {names}")
 
 
 def wait_ready_json(path, expected_host, expected_port, deadline, clock=time.monotonic):
@@ -8666,7 +9367,7 @@ def launch(config, hooks=None):
                 stderr=subprocess.STDOUT, start_new_session=True,
             )
             owner.record(
-                pid=process.pid, pgid=os.getpgid(process.pid), name=spec.name,
+                pid=process.pid, pgid=process.pid, name=spec.name,
                 argv=spec.argv, started_at=hooks.clock(), process=process,
             )
             return process
@@ -8735,12 +9436,9 @@ def launch(config, hooks=None):
             smoke_deadline if smoke_deadline is not None
             else hooks.clock() + 1.0
         )
-        owner.close(deadline=cleanup_deadline)
-        for descriptor in (bridge_master, bridge_slave):
-            if descriptor is not None:
-                os.close(descriptor)
-        for log in logs:
-            log.close()
+        close_smoke_resources(
+            owner, (bridge_master, bridge_slave), logs, cleanup_deadline
+        )
 
     ports_rebound = all(
         port_rebinds(port) for port in (config.camera_port, config.policy_port)
