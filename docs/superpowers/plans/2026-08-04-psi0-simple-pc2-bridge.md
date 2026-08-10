@@ -1708,11 +1708,22 @@ def make_runtime_factories(failure=None):
             raise RuntimeError("service failed")
         return service
 
+    publisher_count = [0]
+
+    def close_endpoint(name):
+        events.append(f"{name}.close")
+        if failure == f"{name}_close":
+            raise RuntimeError(f"{name} close failed")
+
     def publisher(_backend, topic):
-        events.append(f"publisher:{topic}")
-        if failure == "publisher":
-            raise RuntimeError("publisher failed")
-        return SimpleNamespace()
+        publisher_count[0] += 1
+        number = publisher_count[0]
+        events.append(f"publisher_{number}:{topic}")
+        if failure == f"publisher_{number}":
+            raise RuntimeError(f"publisher {number} failed")
+        return SimpleNamespace(
+            close=lambda: close_endpoint(f"publisher_{number}")
+        )
 
     class Dispatcher:
         def register(self, _listener):
@@ -1732,7 +1743,9 @@ def make_runtime_factories(failure=None):
         events.append("subscriber")
         if failure == "subscriber":
             raise RuntimeError("subscriber failed")
-        return SimpleNamespace()
+        return SimpleNamespace(
+            close=lambda: close_endpoint("subscriber")
+        )
 
     def make_simple(stage):
         events.append(stage)
@@ -1765,6 +1778,13 @@ def make_runtime_factories(failure=None):
     return factories, events
 
 
+def owned_zmq_runtime_config():
+    return ControlLoopConfig(
+        interface="sim", enable_waist=True, domain_id=42,
+        messaging_backend="zmq", keyboard_dispatcher_type="raw",
+    )
+
+
 @pytest.mark.parametrize(
     "failure,expected_cleanup",
     [
@@ -1781,48 +1801,66 @@ def make_runtime_factories(failure=None):
             ["policy.close", "environment.close", "manager.shutdown"],
         ),
         (
-            "publisher",
+            "publisher_1",
             ["service.close", "policy.close", "environment.close",
              "manager.shutdown"],
         ),
         (
+            "publisher_2",
+            ["publisher_1.close", "service.close", "policy.close",
+             "environment.close", "manager.shutdown"],
+        ),
+        (
+            "publisher_3",
+            ["publisher_2.close", "publisher_1.close", "service.close",
+             "policy.close", "environment.close", "manager.shutdown"],
+        ),
+        (
             "telemetry",
-            ["service.close", "policy.close", "environment.close",
+            ["publisher_3.close", "publisher_2.close", "publisher_1.close",
+             "service.close", "policy.close", "environment.close",
              "manager.shutdown"],
         ),
         (
             "keyboard_listener",
-            ["service.close", "policy.close", "environment.close",
+            ["publisher_3.close", "publisher_2.close", "publisher_1.close",
+             "service.close", "policy.close", "environment.close",
              "manager.shutdown"],
         ),
         (
             "keyboard_estop",
-            ["service.close", "policy.close", "environment.close",
+            ["publisher_3.close", "publisher_2.close", "publisher_1.close",
+             "service.close", "policy.close", "environment.close",
              "manager.shutdown"],
         ),
         (
             "dispatcher",
-            ["service.close", "policy.close", "environment.close",
+            ["publisher_3.close", "publisher_2.close", "publisher_1.close",
+             "service.close", "policy.close", "environment.close",
              "manager.shutdown"],
         ),
         (
             "dispatcher_register",
-            ["dispatcher.stop", "service.close", "policy.close",
+            ["dispatcher.stop", "publisher_3.close", "publisher_2.close",
+             "publisher_1.close", "service.close", "policy.close",
              "environment.close", "manager.shutdown"],
         ),
         (
             "dispatcher_start",
-            ["dispatcher.stop", "service.close", "policy.close",
+            ["dispatcher.stop", "publisher_3.close", "publisher_2.close",
+             "publisher_1.close", "service.close", "policy.close",
              "environment.close", "manager.shutdown"],
         ),
         (
             "rate",
-            ["dispatcher.stop", "service.close", "policy.close",
+            ["dispatcher.stop", "publisher_3.close", "publisher_2.close",
+             "publisher_1.close", "service.close", "policy.close",
              "environment.close", "manager.shutdown"],
         ),
         (
             "subscriber",
-            ["dispatcher.stop", "service.close", "policy.close",
+            ["dispatcher.stop", "publisher_3.close", "publisher_2.close",
+             "publisher_1.close", "service.close", "policy.close",
              "environment.close", "manager.shutdown"],
         ),
     ],
@@ -1837,9 +1875,7 @@ def test_every_complete_startup_failure_rolls_back_all_owned_resources(
     factories, events = make_runtime_factories(failure)
     with pytest.raises(RuntimeError, match="failed"):
         _build_owned_runtime(
-            ControlLoopConfig(
-                interface="sim", enable_waist=True, domain_id=42
-            ),
+            owned_zmq_runtime_config(),
             factories=factories,
         )
     assert events[-len(expected_cleanup):] == expected_cleanup
@@ -1853,16 +1889,17 @@ def test_successful_runtime_cleanup_is_reverse_order_complete_and_idempotent():
 
     factories, events = make_runtime_factories()
     runtime = _build_owned_runtime(
-        ControlLoopConfig(interface="sim", enable_waist=True, domain_id=42),
+        owned_zmq_runtime_config(),
         factories=factories,
     )
     runtime.close()
     first_close_events = list(events)
     runtime.close()
     assert events == first_close_events
-    assert events[-5:] == [
-        "dispatcher.stop", "service.close", "policy.close",
-        "environment.close", "manager.shutdown",
+    assert events[-9:] == [
+        "subscriber.close", "dispatcher.stop", "publisher_3.close",
+        "publisher_2.close", "publisher_1.close", "service.close",
+        "policy.close", "environment.close", "manager.shutdown",
     ]
 
 
@@ -1873,7 +1910,7 @@ def test_runtime_cleanup_failure_cannot_skip_later_owned_resources():
 
     factories, events = make_runtime_factories()
     runtime = _build_owned_runtime(
-        ControlLoopConfig(interface="sim", enable_waist=True, domain_id=42),
+        owned_zmq_runtime_config(),
         factories=factories,
     )
 
@@ -1884,9 +1921,30 @@ def test_runtime_cleanup_failure_cannot_skip_later_owned_resources():
     runtime.components.robot_config_server.close = fail_service_close
     with pytest.raises(RuntimeError, match="service close failed"):
         runtime.close()
-    assert events[-5:] == [
-        "dispatcher.stop", "service.close.failed", "policy.close",
-        "environment.close", "manager.shutdown",
+    assert events[-9:] == [
+        "subscriber.close", "dispatcher.stop", "publisher_3.close",
+        "publisher_2.close", "publisher_1.close", "service.close.failed",
+        "policy.close", "environment.close", "manager.shutdown",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["subscriber_close", "publisher_2_close"])
+def test_zmq_endpoint_close_failure_cannot_skip_remaining_endpoints(failure):
+    from decoupled_wbc.control.main.teleop.run_g1_control_loop import (
+        _build_owned_runtime,
+    )
+
+    factories, events = make_runtime_factories(failure)
+    runtime = _build_owned_runtime(
+        owned_zmq_runtime_config(),
+        factories=factories,
+    )
+    with pytest.raises(RuntimeError, match="close failed"):
+        runtime.close()
+    assert events[-9:] == [
+        "subscriber.close", "dispatcher.stop", "publisher_3.close",
+        "publisher_2.close", "publisher_1.close", "service.close",
+        "policy.close", "environment.close", "manager.shutdown",
     ]
 ```
 
@@ -2273,6 +2331,13 @@ class CleanupOwner:
         return tuple(errors)
 
 
+def _own_close_if_supported(owner, name, resource):
+    close = getattr(resource, "close", None)
+    if callable(close):
+        owner.own(name, close)
+    return resource
+
+
 @dataclass(frozen=True)
 class WbcRuntime:
     manager: object
@@ -2318,12 +2383,17 @@ def _build_owned_runtime(config, factories=None):
             lambda: _close_attested_components(components),
         )
 
-        data_exp_pub = factories.publisher(backend, STATE_TOPIC_NAME)
-        lower_body_policy_status_pub = factories.publisher(
-            backend, LOWER_BODY_POLICY_STATUS_TOPIC
+        data_exp_pub = _own_close_if_supported(
+            owner, "data_exp_pub",
+            factories.publisher(backend, STATE_TOPIC_NAME),
         )
-        joint_safety_status_pub = factories.publisher(
-            backend, JOINT_SAFETY_STATUS_TOPIC
+        lower_body_policy_status_pub = _own_close_if_supported(
+            owner, "lower_body_policy_status_pub",
+            factories.publisher(backend, LOWER_BODY_POLICY_STATUS_TOPIC),
+        )
+        joint_safety_status_pub = _own_close_if_supported(
+            owner, "joint_safety_status_pub",
+            factories.publisher(backend, JOINT_SAFETY_STATUS_TOPIC),
         )
         telemetry = factories.telemetry(window_size=100)
         keyboard_listener_pub = factories.keyboard_listener()
@@ -2342,8 +2412,9 @@ def _build_owned_runtime(config, factories=None):
 
         rate = manager.create_rate(config.control_frequency)
         zmq_kw = {"host": config.zmq_host} if backend == "zmq" else {}
-        upper_body_policy_subscriber = factories.subscriber(
-            backend, CONTROL_GOAL_TOPIC, **zmq_kw
+        upper_body_policy_subscriber = _own_close_if_supported(
+            owner, "upper_body_policy_subscriber",
+            factories.subscriber(backend, CONTROL_GOAL_TOPIC, **zmq_kw),
         )
         return WbcRuntime(
             manager=manager,
@@ -2395,7 +2466,7 @@ Keep the existing control-loop body after these assignments. Replace its `finall
 runtime.close()
 ```
 
-`_build_owned_runtime()` registers manager shutdown immediately after manager creation, delegates component construction to the internally rollback-safe attested constructor, then registers the component cleanup before it constructs any publisher, dispatcher, or subscriber. It registers `dispatcher.stop` before the first dispatcher callback or thread is started. Any later failure closes all registered resources in reverse ownership order and continues through cleanup failures. `main()` therefore has no partial-startup path outside the owner. Run Ruff against the complete modified file, not these insertion fragments in isolation. The existing file already owns the imports used by `ProductionFactories`; Step 5 adds only the new `dataclass` and model-contract imports.
+`_build_owned_runtime()` registers manager shutdown immediately after manager creation, delegates component construction to the internally rollback-safe attested constructor, then registers the component cleanup before it constructs any publisher, dispatcher, or subscriber. Immediately after each publisher or subscriber factory returns, `_own_close_if_supported()` registers its backend-specific `close()` method; this is mandatory for independent ZMQ sockets/contexts and intentionally becomes a no-op for ROS wrappers whose manager owns destruction. It registers `dispatcher.stop` before the first dispatcher callback or thread is started. Reverse cleanup is subscriber, dispatcher, three publishers, attested service/policy/environment, then manager. Any later failure attempts all registered operations even when an earlier close fails. `main()` therefore has no partial-startup path outside the owner. Run Ruff against the complete modified file, not these insertion fragments in isolation. The existing file already owns the imports used by `ProductionFactories`; Step 5 adds only the new `dataclass` and model-contract imports.
 
 - [ ] **Step 7: Run all nested contract/limit tests**
 
@@ -2875,6 +2946,25 @@ def test_snapshot_freshness_and_skew_are_independent(
         validate_synchronized_snapshot(
             state(received_at=state_time), camera(received_at=camera_time), now
         )
+
+
+@pytest.mark.parametrize("producer_time", [None, np.nan, np.inf, "bad-time"])
+def test_producer_timestamp_is_sanitized_but_never_gates_control(producer_time):
+    frame = TimedCameraFrame(
+        np.zeros((4, 4, 3), np.uint8), 10.0, producer_time
+    )
+    snapshot = validate_synchronized_snapshot(state(), frame, now=10.0)
+    assert snapshot.camera.producer_timestamp is None
+    assert snapshot.camera.producer_timestamp_diagnostic is not None
+
+
+def test_finite_producer_timestamp_is_preserved_as_diagnostic_metadata():
+    frame = TimedCameraFrame(
+        np.zeros((4, 4, 3), np.uint8), 10.0, 123.5
+    )
+    snapshot = validate_synchronized_snapshot(state(), frame, now=10.0)
+    assert snapshot.camera.producer_timestamp == 123.5
+    assert snapshot.camera.producer_timestamp_diagnostic is None
 ```
 
 `accept_measured_state()` returns `(unchanged_last_valid, stable_reason)` on failure and `(candidate, None)` on success. Task 9 adds the executable ACTIVE-state test that proves this stable reason is latched once.
@@ -3012,6 +3102,7 @@ class TimedCameraFrame:
     image: np.ndarray
     received_at: float
     producer_timestamp: float | None
+    producer_timestamp_diagnostic: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3070,6 +3161,14 @@ def accept_measured_state(last_valid, candidate, contract, now):
     return accepted, None
 
 
+def sanitize_producer_timestamp(value):
+    if type(value) in (float, int) and np.isfinite(value):
+        return float(value), None
+    if value is None:
+        return None, "producer timestamp missing"
+    return None, "producer timestamp ignored: nonnumeric or nonfinite"
+
+
 def validate_synchronized_snapshot(state, camera, now):
     if type(state) is not TimedRobotState:
         raise ValueError("state missing or wrong type")
@@ -3087,14 +3186,6 @@ def validate_synchronized_snapshot(state, camera, now):
         or not np.isfinite(camera.received_at)
     ):
         raise ValueError("camera receive time")
-    if (
-        camera.producer_timestamp is not None
-        and (
-            type(camera.producer_timestamp) not in (float, int)
-            or not np.isfinite(camera.producer_timestamp)
-        )
-    ):
-        raise ValueError("camera producer time")
     state_age = float(now) - float(state.received_at)
     camera_age = float(now) - float(camera.received_at)
     if state_age < 0.0 or state_age > 0.10:
@@ -3106,11 +3197,16 @@ def validate_synchronized_snapshot(state, camera, now):
     image = np.asarray(camera.image)
     if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("camera shape/dtype")
+    producer_timestamp, diagnostic = sanitize_producer_timestamp(
+        camera.producer_timestamp
+    )
+    if camera.producer_timestamp_diagnostic is not None:
+        diagnostic = camera.producer_timestamp_diagnostic
     return InputSnapshot(
         TimedRobotState(np.asarray(state.q, np.float32).copy(), state.received_at),
         TimedCameraFrame(
             np.ascontiguousarray(image).copy(), camera.received_at,
-            camera.producer_timestamp,
+            producer_timestamp, diagnostic,
         ),
     )
 ```
@@ -3782,6 +3878,22 @@ def test_invalid_camera_receive_time_becomes_active_fault(received_at):
     assert result.source_kind == "hold"
 
 
+def test_paused_full_bridge_reports_invalid_input_without_faulting():
+    inference = BlockingInference()
+    bridge, clock = ready_bridge(inference)
+    assert bridge.input_status() == (True, None)
+    assert bridge.observation_valid is True
+    assert bridge.input_error is None
+
+    bad = TimedRobotState(np.r_[np.nan, np.zeros(42)], clock())
+    bridge.update_inputs(bad, fresh_inputs(clock)[1])
+    assert bridge.input_status() == (False, "measured state finite")
+    assert bridge.observation_valid is False
+    assert bridge.input_error == "measured state finite"
+    assert bridge.state is BridgeState.PAUSED
+    assert inference.requests == []
+
+
 def test_paused_hold_is_captured_once_and_ignores_later_measurements():
     bridge, clock = ready_bridge(BlockingInference())
     first = bridge.tick()
@@ -4262,6 +4374,40 @@ Add these methods to the class. This fixes R0's observation tick, first-action t
                 self._latest_input_error = "camera shape/dtype"
             else:
                 self._latest_camera = camera
+
+    def _input_status_locked(self):
+        if self._latest_input_error is not None:
+            return False, self._latest_input_error
+        try:
+            self._snapshot_locked()
+        except ValueError as error:
+            return False, str(error)
+        return True, None
+
+    def input_status(self):
+        with self._lock:
+            return self._input_status_locked()
+
+    @property
+    def observation_valid(self):
+        return self.input_status()[0]
+
+    @property
+    def input_error(self):
+        return self.input_status()[1]
+
+    @property
+    def camera_diagnostic(self):
+        with self._lock:
+            if self._latest_camera is None:
+                return None
+            _timestamp, diagnostic = sanitize_producer_timestamp(
+                self._latest_camera.producer_timestamp
+            )
+            return (
+                self._latest_camera.producer_timestamp_diagnostic
+                or diagnostic
+            )
 
     def _snapshot_locked(self):
         if self._latest_input_error is not None:
@@ -4954,12 +5100,16 @@ from scripts.psi0_simple_real_bridge import build_parser, decode_camera_message
 from tests.psi0_bridge_testkit import ManualClock
 
 
-def encoded_sentinel():
+def encoded_sentinel(producer_timestamp=4.5, include_timestamp=True):
     image = np.zeros((32, 64, 3), np.uint8)
     image[:, :24] = [240, 0, 0]
     image[:, 40:] = [0, 0, 240]
+    timestamps = (
+        {"rgb_head_stereo_left": producer_timestamp}
+        if include_timestamp else {}
+    )
     return ImageMessageSchema(
-        timestamps={"rgb_head_stereo_left": 4.5},
+        timestamps=timestamps,
         images={"rgb_head_stereo_left": image},
     ).serialize()
 
@@ -4996,9 +5146,29 @@ def test_camera_key_is_mandatory():
         decode_camera_message(
             encoded_sentinel(), key="missing", color_order="rgb", received_at=1.0
         )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        encoded_sentinel(include_timestamp=False),
+        encoded_sentinel(producer_timestamp=np.nan),
+        encoded_sentinel(producer_timestamp=np.inf),
+        encoded_sentinel(producer_timestamp="not-a-time"),
+        {**encoded_sentinel(), "timestamps": "malformed"},
+    ],
+)
+def test_invalid_or_missing_producer_time_is_diagnostic_only(payload):
+    frame = decode_camera_message(
+        payload, key="rgb_head_stereo_left", color_order="rgb",
+        received_at=10.0,
+    )
+    assert frame.received_at == 10.0
+    assert frame.producer_timestamp is None
+    assert frame.producer_timestamp_diagnostic is not None
 ```
 
-This test establishes numeric channel order after the actual JPEG codec; viewpoint validation remains a saved-sample/manual gate because a codec cannot prove physical viewpoint.
+This test establishes numeric channel order after the actual JPEG codec. Its timestamp matrix also proves that missing, malformed, nonnumeric, NaN, and infinite producer metadata is reduced to `producer_timestamp=None` plus a diagnostic string while the locally timed frame remains usable. Viewpoint validation remains a saved-sample/manual gate because a codec cannot prove physical viewpoint.
 
 - [ ] **Step 4: Verify the CLI module is absent**
 
@@ -5057,7 +5227,7 @@ from simple.deploy.psi0_simple_bridge import (
     ActivationRefused, BridgeMetrics, BridgeMode, BridgeState, JointContract,
     PolicyContract, Psi0SimpleBridge, RtcResult, TickResult,
     TimedCameraFrame, TimedRobotState, accept_measured_state,
-    validate_synchronized_snapshot,
+    sanitize_producer_timestamp, validate_synchronized_snapshot,
 )
 
 
@@ -5666,7 +5836,7 @@ class RosStateSource:
 
 def decode_camera_message(serialized, *, key, color_order, received_at):
     schema = ImageMessageSchema.deserialize(serialized)
-    if key not in schema.images or key not in schema.timestamps:
+    if key not in schema.images:
         raise KeyError(key)
     image = np.asarray(schema.images[key])
     if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
@@ -5675,9 +5845,17 @@ def decode_camera_message(serialized, *, key, color_order, received_at):
         image = image[..., ::-1]
     elif color_order != "rgb":
         raise ValueError("camera color order must be rgb or bgr")
+    if type(schema.timestamps) is dict:
+        raw_producer_timestamp = schema.timestamps.get(key)
+        producer_timestamp, diagnostic = sanitize_producer_timestamp(
+            raw_producer_timestamp
+        )
+    else:
+        producer_timestamp = None
+        diagnostic = "producer timestamp mapping ignored: wrong type"
     return TimedCameraFrame(
         np.ascontiguousarray(image), float(received_at),
-        float(schema.timestamps[key]),
+        producer_timestamp, diagnostic,
     )
 
 
@@ -5944,11 +6122,12 @@ from scripts.psi0_simple_real_bridge import (
 )
 from simple.baselines.client import RtcActionResponse
 from simple.deploy.psi0_simple_bridge import (
-    ActivationRefused, BridgeMode, BridgeState, PolicyContract, RtcRequest,
-    TimedCameraFrame, TimedRobotState,
+    ActivationRefused, BridgeMode, BridgeState, PolicyContract,
+    Psi0SimpleBridge, RtcRequest, TimedCameraFrame, TimedRobotState,
 )
 from tests.psi0_bridge_testkit import (
-    ManualClock, make_joint_contract, policy_payload,
+    ManualClock, fresh_inputs, make_joint_contract, make_policy_contract,
+    policy_payload,
 )
 
 
@@ -6083,6 +6262,34 @@ def test_every_shadow_metric_and_preview_is_uncertified(tmp_path):
     assert all(record["policy_certified"] is False for record in records)
 
 
+def test_full_shadow_tick_metric_reports_invalid_input_instead_of_null(tmp_path):
+    clock = ManualClock(100)
+    inference = SimpleNamespace(busy=False)
+    bridge = Psi0SimpleBridge(
+        make_policy_contract(), make_joint_contract(), inference, clock,
+        start_tick=100,
+    )
+    bridge.update_inputs(*fresh_inputs(clock))
+    bad = TimedRobotState(np.r_[np.nan, np.zeros(42)], clock())
+    bridge.update_inputs(bad, fresh_inputs(clock)[1])
+    input_valid, input_error = bridge.input_status()
+
+    path = tmp_path / "full-shadow.jsonl"
+    metrics = JsonlMetrics(
+        path, mode=BridgeMode.SHADOW, policy_certified=False,
+        clock=lambda: 2.0,
+    )
+    metrics.write(
+        "tick", bridge, published=False, previewed=False,
+        input_valid=input_valid, input_error=input_error,
+        camera_diagnostic=bridge.camera_diagnostic,
+    )
+    metrics.close()
+    record = json.loads(path.read_text())
+    assert record["input_valid"] is False
+    assert record["input_error"] == "measured state finite"
+
+
 def test_rejected_activation_is_reported_and_next_local_p_is_accepted():
     class ToggleBridge:
         state = BridgeState.PAUSED
@@ -6181,6 +6388,14 @@ def test_contractless_shadow_validates_state_camera_freshness_and_skew():
     bridge.update_inputs(fresh_state, invalid_time_camera)
     assert bridge.observation_valid is False
     assert bridge.input_error == "camera receive time"
+
+    diagnostic_camera = TimedCameraFrame(
+        np.zeros((8, 8, 3), np.uint8), clock(), np.nan
+    )
+    bridge.update_inputs(fresh_state, diagnostic_camera)
+    assert bridge.observation_valid is True
+    assert bridge.input_error is None
+    assert bridge.camera_diagnostic is not None
 
 
 def test_connection_evidence_requires_successful_runtime_observations():
@@ -7148,6 +7363,7 @@ def run_runtime(
             bridge.update_inputs(latest_state, latest_camera)
         handle_keyboard_events(bridge, keyboard, metrics)
         result = bridge.tick()
+        input_valid, input_error = bridge.input_status()
         metrics.write(
             "tick", bridge,
             published=(
@@ -7162,8 +7378,9 @@ def run_runtime(
                 else result.psi0_action.tolist()
             ),
             worker_busy=bridge.inference.busy,
-            input_valid=getattr(bridge, "observation_valid", None),
-            input_error=getattr(bridge, "input_error", None),
+            input_valid=input_valid,
+            input_error=input_error,
+            camera_diagnostic=bridge.camera_diagnostic,
             discarded_late_results=bridge.metrics.discarded_late_results,
             discarded_old_generation_results=(
                 bridge.metrics.discarded_old_generation_results
@@ -7224,8 +7441,18 @@ class ObservationOnlyShadowBridge:
         self.last_snapshot = None
         self.observation_valid = False
         self.input_error = "no synchronized inputs"
+        self.camera_diagnostic = None
 
     def update_inputs(self, state, camera):
+        if type(camera) is TimedCameraFrame:
+            _timestamp, diagnostic = sanitize_producer_timestamp(
+                camera.producer_timestamp
+            )
+            self.camera_diagnostic = (
+                camera.producer_timestamp_diagnostic or diagnostic
+            )
+        else:
+            self.camera_diagnostic = None
         accepted, reason = accept_measured_state(
             self.last_valid_state, state, self.joints, self.clock()
         )
@@ -7245,6 +7472,12 @@ class ObservationOnlyShadowBridge:
         self.last_snapshot = snapshot
         self.observation_valid = True
         self.input_error = None
+        self.camera_diagnostic = (
+            snapshot.camera.producer_timestamp_diagnostic
+        )
+
+    def input_status(self):
+        return self.observation_valid, self.input_error
 
     def handle_toggle(self):
         raise ActivationRefused(
