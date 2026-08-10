@@ -90,3 +90,4 @@ MUJOCO_LOG.TXT
 .claude/*
 .runtime-state/
 .robo-nix/
+.worktrees/
