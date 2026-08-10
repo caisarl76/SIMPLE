@@ -131,42 +131,137 @@ class ResponseMessage(Message):
 
 
 
-class HttpActionClient(object):
-    def __init__(self, server_ip: str, server_port: int):
-        self.server_ip, self.server_port = server_ip, server_port
-    
+@dataclass(frozen=True)
+class RtcActionResponse:
+    action: np.ndarray
+    metadata: dict[str, Any]
+    err: float = 0.0
+
+
+class HttpActionClient:
+    def __init__(
+        self,
+        server_ip: str,
+        server_port: int,
+        timeout: float | None = None,
+        session: requests.Session | None = None,
+    ):
+        self.server_ip = server_ip
+        self.server_port = server_port
+        self.timeout = timeout
+        self.session = session or requests.Session()
+
     @property
     def timestamp(self):
         return str(datetime.now()).replace(" ", "_").replace(":", "-")
-    
-    def query_action(self, image_dict: Dict[str, Any], instruction: str, state_dict: Dict[str, Any], condition_dict: Dict[str, Any], history: Optional[Dict[str, Any]] = None, dataset="grasp", gt_action: Optional[np.ndarray] = None) -> np.ndarray:
+
+    def get_contract(self, timeout: float = 2.0) -> dict[str, Any]:
+        response = self.session.get(
+            f"http://{self.server_ip}:{self.server_port}/contract", timeout=timeout
+        )
+        response.raise_for_status()
+        try:
+            result = response.json()
+        except Exception as error:
+            raise RuntimeError(f"invalid policy contract JSON: {error}") from error
+        if type(result) is not dict:
+            raise RuntimeError("policy contract response must be a JSON object")
+        return result
+
+    def _post(self, path: str, request: RequestMessage) -> dict[str, Any]:
+        response = self.session.post(
+            f"http://{self.server_ip}:{self.server_port}{path}",
+            json=request.serialize(),
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+            payload = convert_numpy_in_dict(payload, numpy_deserialize)
+        except Exception as error:
+            raise RuntimeError(str(error)) from error
+        if type(payload) is not dict:
+            raise RuntimeError("policy response must be a JSON object")
+        return payload
+
+    def query_action(
+        self,
+        image_dict,
+        instruction,
+        state_dict,
+        condition_dict,
+        history=None,
+        dataset="grasp",
+        gt_action=None,
+    ):
         if history is None:
-            history = {k: [] for k in image_dict.keys()}
+            history = {key: [] for key in image_dict}
         if gt_action is None:
             gt_action = []
-        
-        request = RequestMessage(image_dict, instruction, history, state_dict, condition_dict, gt_action, dataset, self.timestamp) 
+
+        request = RequestMessage(
+            image_dict,
+            instruction,
+            history,
+            state_dict,
+            condition_dict,
+            gt_action,
+            dataset,
+            self.timestamp,
+        )
         try:
-            response = requests.post(
-                f"http://{self.server_ip}:{self.server_port}/act",
-                json=request.serialize()
-            )
-        except Exception:
-            raise RuntimeError(f"Server is not up ?!")
-        
-        if response.status_code != 200:
-            raise Exception(f"Server is not up ?! {response.status_code}: {response.text}")
-        try:
-            response = ResponseMessage.deserialize(response.json())
-        except Exception as e:
-            raise RuntimeError(response.text)
-        
-        # Validate that the server returned a valid trajectory image
-        if not isinstance(response.traj_image, np.ndarray) or response.traj_image.ndim != 3:
-            print("[WARN] Server did not return a valid trajectory image (traj_image).")
-            return response.action, response.err, None
-                            
-        return response.action, response.err, response.traj_image
+            parsed = ResponseMessage.deserialize(self._post("/act", request))
+        except (requests.Timeout, requests.HTTPError):
+            raise
+        except Exception as error:
+            raise RuntimeError(str(error)) from error
+        trajectory = parsed.traj_image
+        if not isinstance(trajectory, np.ndarray) or trajectory.ndim != 3:
+            trajectory = None
+        return parsed.action, parsed.err, trajectory
+
+    def query_rtc_action(
+        self,
+        image_dict,
+        instruction,
+        state_dict,
+        condition_dict,
+        *,
+        history,
+        dataset="simple",
+    ) -> RtcActionResponse:
+        request = RequestMessage(
+            image_dict,
+            instruction,
+            history,
+            state_dict,
+            condition_dict,
+            [],
+            dataset,
+            self.timestamp,
+        )
+        payload = self._post("/act-rtc-v1", request)
+        if set(payload) != {"action", "metadata"}:
+            raise RuntimeError("RTC response requires action and metadata")
+        metadata = payload["metadata"]
+        metadata_types = {
+            "session_id": str,
+            "request_seq": int,
+            "observation_tick": int,
+            "prediction_horizon": int,
+            "execution_horizon": int,
+            "rtc_delay_steps": int,
+            "first_action_tick": int,
+        }
+        if type(metadata) is not dict or set(metadata) != set(metadata_types):
+            raise RuntimeError("RTC response metadata key set")
+        for key, expected_type in metadata_types.items():
+            if type(metadata[key]) is not expected_type:
+                raise RuntimeError(f"RTC response metadata {key} type")
+        action = payload["action"]
+        if type(action) is not np.ndarray:
+            raise RuntimeError("RTC response action must be a NumPy array")
+        return RtcActionResponse(action=action, metadata=dict(metadata))
     
 
 if __name__ == "__main__":
