@@ -1,5 +1,9 @@
+import re
+import threading
 from dataclasses import dataclass
 from enum import Enum
+from typing import Protocol
+import uuid
 
 import numpy as np
 
@@ -385,3 +389,648 @@ def build_bounded_hold(now, last_valid_state, last_safe_goal, contract):
         goal_to_psi0_action(goal, contract.upper_body_joint_names)
     )
     return HoldResult(goal, action, source, tuple(clamped))
+
+
+@dataclass(frozen=True)
+class PolicyContract:
+    schema: str
+    checkpoint_sha256: str
+    dataset_manifest_sha256: str
+    raw_episode_sha256: str
+    processed_episode_sha256: str
+    source_episode_index: int
+    processed_episode_index: int
+    converter_commit: str
+    server_commit: str
+    converter_layout: str
+    prediction_horizon: int
+    execution_horizon: int
+    rtc_delay_steps: int
+    rtc_training_max_delay: int
+    action_frequency_hz: int
+    observation_dim: int
+    action_dim: int
+    endpoint: str
+    request_semantics: str
+    response_semantics: str
+    image_key: str
+    camera_color_order: str
+    rtc_enabled: bool
+    test_only: bool
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> "PolicyContract":
+        wire_types = {
+            "schema": str,
+            "test_only": bool,
+            "checkpoint_sha256": str,
+            "dataset_manifest_sha256": str,
+            "raw_episode_sha256": str,
+            "processed_episode_sha256": str,
+            "source_episode_index": int,
+            "processed_episode_index": int,
+            "converter_commit": str,
+            "server_commit": str,
+            "converter_layout": str,
+            "observation_dim": int,
+            "action_dim": int,
+            "action_frequency_hz": int,
+            "prediction_horizon": int,
+            "execution_horizon": int,
+            "rtc_delay_steps": int,
+            "rtc_training_max_delay": int,
+            "rtc_enabled": bool,
+            "rtc_endpoint": str,
+            "request_semantics": str,
+            "response_semantics": str,
+            "image_key": str,
+            "camera_color_order": str,
+        }
+        if type(payload) is not dict or set(payload) != set(wire_types):
+            raise TypeError("policy contract keys do not exactly match v2 schema")
+        for key, expected_type in wire_types.items():
+            if type(payload[key]) is not expected_type:
+                raise TypeError(
+                    f"policy contract field {key} must be {expected_type.__name__}"
+                )
+        contract = cls(
+            schema=payload["schema"],
+            checkpoint_sha256=payload["checkpoint_sha256"],
+            dataset_manifest_sha256=payload["dataset_manifest_sha256"],
+            raw_episode_sha256=payload["raw_episode_sha256"],
+            processed_episode_sha256=payload["processed_episode_sha256"],
+            source_episode_index=payload["source_episode_index"],
+            processed_episode_index=payload["processed_episode_index"],
+            converter_commit=payload["converter_commit"],
+            server_commit=payload["server_commit"],
+            converter_layout=payload["converter_layout"],
+            prediction_horizon=payload["prediction_horizon"],
+            execution_horizon=payload["execution_horizon"],
+            rtc_delay_steps=payload["rtc_delay_steps"],
+            rtc_training_max_delay=payload["rtc_training_max_delay"],
+            action_frequency_hz=payload["action_frequency_hz"],
+            observation_dim=payload["observation_dim"],
+            action_dim=payload["action_dim"],
+            endpoint=payload["rtc_endpoint"],
+            request_semantics=payload["request_semantics"],
+            response_semantics=payload["response_semantics"],
+            image_key=payload["image_key"],
+            camera_color_order=payload["camera_color_order"],
+            rtc_enabled=payload["rtc_enabled"],
+            test_only=payload["test_only"],
+        )
+        contract.validate()
+        return contract
+
+    def validate(self) -> None:
+        if self.schema != "simple.psi0.policy-contract.v2":
+            raise ValueError("unsupported policy contract schema")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.checkpoint_sha256):
+            raise ValueError("invalid checkpoint SHA-256")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.dataset_manifest_sha256):
+            raise ValueError("invalid dataset-manifest SHA-256")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.raw_episode_sha256):
+            raise ValueError("invalid raw-episode SHA-256")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.processed_episode_sha256):
+            raise ValueError("invalid processed-episode SHA-256")
+        if self.source_episode_index < 0 or self.processed_episode_index < 0:
+            raise ValueError("episode indices must be nonnegative")
+        if not re.fullmatch(r"[0-9a-f]{40}", self.converter_commit):
+            raise ValueError("invalid converter commit")
+        if not re.fullmatch(r"[0-9a-f]{40}", self.server_commit):
+            raise ValueError("invalid PSI0 server commit")
+        if self.converter_layout != "g1_simple_32_rpyh_v2":
+            raise ValueError("unsupported PSI0 converter layout")
+        if not self.rtc_enabled:
+            raise ValueError("RTC must be enabled")
+        if (
+            self.action_frequency_hz != 50
+            or self.observation_dim != 32
+            or self.action_dim != 36
+        ):
+            raise ValueError("policy dimensions/frequency do not match bridge")
+        d = self.rtc_delay_steps
+        s = self.execution_horizon
+        p = self.prediction_horizon
+        if not (2 <= d <= s and d + s <= p and d < self.rtc_training_max_delay):
+            raise ValueError("invalid RTC horizon/delay contract")
+        if self.endpoint != "/act-rtc-v1":
+            raise ValueError("legacy policy endpoint is ineligible")
+        if self.request_semantics != "exact-post-slew-committed-prefix":
+            raise ValueError("unsupported RTC request semantics")
+        if self.response_semantics != "denormalized-executable-suffix":
+            raise ValueError("unsupported RTC response semantics")
+        if self.image_key != "rgb_head_stereo_left" or self.camera_color_order != "rgb":
+            raise ValueError("policy image contract does not match bridge")
+
+
+@dataclass(frozen=True)
+class RtcRequest:
+    generation: int
+    session_id: str
+    request_seq: int
+    observation_tick: int
+    history_tick: int
+    observation: np.ndarray
+    image: np.ndarray
+    committed_actions: np.ndarray
+    reset: bool
+    deadline_at: float
+
+    @property
+    def first_action_tick(self) -> int:
+        return self.observation_tick + self.committed_actions.shape[0]
+
+    @property
+    def committed_global_ticks(self) -> tuple[int, ...]:
+        return tuple(range(self.observation_tick, self.first_action_tick))
+
+
+@dataclass(frozen=True)
+class RtcResult:
+    generation: int
+    request_seq: int
+    completed_at: float
+    actions: np.ndarray | None
+    metadata: dict[str, object] | None
+    error: str | None = None
+
+
+class InferencePort(Protocol):
+    @property
+    def busy(self) -> bool:
+        raise NotImplementedError
+
+    def submit(self, request: RtcRequest) -> None:
+        raise NotImplementedError
+
+    def poll(self) -> RtcResult | None:
+        raise NotImplementedError
+
+
+class ActivationRefused(RuntimeError):
+    """Expected fail-closed refusal of a local activation request."""
+
+
+RTC_RESPONSE_FIELDS = (
+    "session_id",
+    "request_seq",
+    "observation_tick",
+    "prediction_horizon",
+    "execution_horizon",
+    "rtc_delay_steps",
+    "first_action_tick",
+)
+
+
+def validate_rtc_result(request, result, contract, joints):
+    if result.error is not None:
+        raise ValueError(f"inference error: {result.error}")
+    if type(result.completed_at) is not float or not np.isfinite(result.completed_at):
+        raise ValueError("result completion time must be finite float")
+    if result.completed_at > request.deadline_at:
+        raise ValueError("RTC result missed monotonic deadline")
+    metadata = result.metadata
+    if type(metadata) is not dict or set(metadata) != set(RTC_RESPONSE_FIELDS):
+        raise TypeError("RTC response metadata key set is invalid")
+    expected = {
+        "session_id": request.session_id,
+        "request_seq": request.request_seq,
+        "observation_tick": request.observation_tick,
+        "prediction_horizon": contract.prediction_horizon,
+        "execution_horizon": contract.execution_horizon,
+        "rtc_delay_steps": contract.rtc_delay_steps,
+        "first_action_tick": request.first_action_tick,
+    }
+    for key, value in expected.items():
+        expected_type = str if key == "session_id" else int
+        if type(metadata[key]) is not expected_type:
+            raise TypeError(f"RTC response {key} has wrong type")
+        if metadata[key] != value:
+            raise ValueError(f"RTC response {key} mismatch")
+    actions = np.asarray(result.actions)
+    validate_action_suffix(actions, contract.execution_horizon, joints)
+    return actions.astype(np.float32, copy=True)
+
+
+@dataclass(frozen=True)
+class BridgeStatus:
+    state: BridgeState
+    generation: int
+    scheduled_ticks: tuple[int, ...]
+    staged_first_tick: int | None
+    staged_count: int
+    committed_ticks: tuple[int, ...]
+    deadline: float | None
+    logical_request_active: bool
+
+
+@dataclass
+class BridgeMetrics:
+    discarded_old_generation_results: int = 0
+    discarded_late_results: int = 0
+    fault_transitions: int = 0
+    requests_submitted: int = 0
+    results_accepted: int = 0
+    first_fault_at: float | None = None
+
+
+@dataclass(frozen=True)
+class TickResult:
+    tick: int
+    goal: Goal | None
+    psi0_action: np.ndarray | None
+    source_tick: int | None
+    source_kind: str
+
+
+class Psi0SimpleBridge:
+    def __init__(
+        self,
+        contract,
+        joints,
+        inference,
+        clock,
+        *,
+        start_tick=0,
+        consume_goal=None,
+    ):
+        self.contract = contract
+        self.joints = joints
+        self.inference = inference
+        self.clock = clock
+        self._consume_goal = consume_goal or (lambda goal: True)
+        self._lock = threading.RLock()
+        self._epoch = clock() - start_tick / contract.action_frequency_hz
+        self.state = BridgeState.PAUSED
+        self.generation = 0
+        self.tick_index = start_tick
+        self.session_id = uuid.uuid4().hex
+        self.request_seq = 0
+        self._request = None
+        self._handoff_tick = None
+        self._next_request_tick = None
+        self._scheduled_actions = {}
+        self._scheduled_kinds = {}
+        self._frozen_ticks = set()
+        self._staged_first_tick = None
+        self._staged_actions = None
+        self.command_history_rpyh = np.array([0.0, 0.0, 0.0, 0.74], dtype=np.float32)
+        self.command_history_tick = start_tick - 1
+        self._latest_camera = None
+        self._latest_input_error = "no valid state"
+        self.last_valid_state = None
+        self.last_safe_goal = None
+        self._last_safe_action = None
+        self._captured_hold = None
+        self._hold_consumed = False
+        self.fault_reason = None
+        self.metrics = BridgeMetrics()
+
+    def _scheduled_time(self, tick):
+        return self._epoch + tick / self.contract.action_frequency_hz
+
+    def status(self):
+        with self._lock:
+            committed = ()
+            deadline = None
+            if self._request is not None:
+                committed = self._request.committed_global_ticks
+                deadline = self._request.deadline_at
+            return BridgeStatus(
+                state=self.state,
+                generation=self.generation,
+                scheduled_ticks=tuple(sorted(self._scheduled_actions)),
+                staged_first_tick=self._staged_first_tick,
+                staged_count=(
+                    0 if self._staged_actions is None else len(self._staged_actions)
+                ),
+                committed_ticks=committed,
+                deadline=deadline,
+                logical_request_active=self._request is not None,
+            )
+
+    def _clear_policy_locked(self):
+        self._request = None
+        self._handoff_tick = None
+        self._next_request_tick = None
+        self._scheduled_actions.clear()
+        self._scheduled_kinds.clear()
+        self._frozen_ticks.clear()
+        self._staged_first_tick = None
+        self._staged_actions = None
+
+    def _capture_hold_locked(self):
+        self._captured_hold = build_bounded_hold(
+            self.clock(), self.last_valid_state, self.last_safe_goal, self.joints
+        )
+        self._hold_consumed = False
+        return self._captured_hold
+
+    def _transition_out_locked(self, state, reason=None):
+        if self.state is BridgeState.STOPPED:
+            return
+        if state is BridgeState.FAULT and self.state is BridgeState.FAULT:
+            return
+        self.generation += 1
+        self._clear_policy_locked()
+        self.state = state
+        self.fault_reason = reason if state is BridgeState.FAULT else None
+        self._capture_hold_locked()
+        if state is BridgeState.FAULT:
+            self.metrics.fault_transitions += 1
+            if self.metrics.first_fault_at is None:
+                self.metrics.first_fault_at = self.clock()
+
+    def pause(self):
+        with self._lock:
+            self._transition_out_locked(BridgeState.PAUSED)
+
+    def enter_fault(self, reason):
+        with self._lock:
+            self._transition_out_locked(BridgeState.FAULT, str(reason))
+
+    def stop(self):
+        with self._lock:
+            self._transition_out_locked(BridgeState.STOPPED)
+
+    def update_inputs(self, state, camera):
+        with self._lock:
+            accepted, reason = accept_measured_state(
+                self.last_valid_state, state, self.joints, self.clock()
+            )
+            self.last_valid_state = accepted
+            self._latest_input_error = reason
+            if (
+                type(camera) is not TimedCameraFrame
+                or type(camera.image) is not np.ndarray
+                or camera.image.ndim != 3
+                or camera.image.shape[2] != 3
+                or camera.image.dtype != np.uint8
+            ):
+                self._latest_camera = None
+                self._latest_input_error = "camera shape/dtype"
+            else:
+                self._latest_camera = camera
+
+    def _input_status_locked(self):
+        if self._latest_input_error is not None:
+            return False, self._latest_input_error
+        try:
+            self._snapshot_locked()
+        except ValueError as error:
+            return False, str(error)
+        return True, None
+
+    def input_status(self):
+        with self._lock:
+            return self._input_status_locked()
+
+    @property
+    def observation_valid(self):
+        return self.input_status()[0]
+
+    @property
+    def input_error(self):
+        return self.input_status()[1]
+
+    @property
+    def camera_diagnostic(self):
+        with self._lock:
+            if self._latest_camera is None:
+                return None
+            _timestamp, diagnostic = sanitize_producer_timestamp(
+                self._latest_camera.producer_timestamp
+            )
+            return self._latest_camera.producer_timestamp_diagnostic or diagnostic
+
+    def _snapshot_locked(self):
+        if self._latest_input_error is not None:
+            raise ValueError(self._latest_input_error)
+        return validate_synchronized_snapshot(
+            self.last_valid_state, self._latest_camera, self.clock()
+        )
+
+    def _make_request_locked(self, tick, committed, reset):
+        snapshot = self._snapshot_locked()
+        committed = np.asarray(committed, np.float32).copy()
+        if committed.shape != (self.contract.rtc_delay_steps, 36):
+            raise ValueError("committed prefix must have exact (d,36) shape")
+        request = RtcRequest(
+            generation=self.generation,
+            session_id=self.session_id,
+            request_seq=self.request_seq,
+            observation_tick=tick,
+            history_tick=tick - 1,
+            observation=build_psi0_observation(
+                snapshot.state.q,
+                self.joints.joint_names,
+                self.command_history_rpyh,
+            ).copy(),
+            image=np.ascontiguousarray(snapshot.camera.image).copy(),
+            committed_actions=committed,
+            reset=reset,
+            deadline_at=self._scheduled_time(tick + self.contract.rtc_delay_steps),
+        )
+        self.inference.submit(request)
+        self._request = request
+        self._handoff_tick = request.first_action_tick
+        self.request_seq += 1
+        self.metrics.requests_submitted += 1
+        return request
+
+    def _consume_locked(self, tick, action, source_kind, source_tick):
+        action = np.asarray(action, np.float32).copy()
+        goal = map_psi0_action_to_goal(
+            action, self.joints.upper_body_joint_names, self.clock()
+        )
+        if self._consume_goal(goal) is not True:
+            self._transition_out_locked(BridgeState.FAULT, "command sink rejected")
+            return TickResult(tick, None, None, None, "none")
+        self.last_safe_goal = goal
+        self._last_safe_action = action
+        self.command_history_rpyh = action[[28, 29, 30, 31]].copy()
+        self.command_history_tick = tick
+        if source_kind == "hold":
+            self._hold_consumed = True
+        return TickResult(tick, goal, action, source_tick, source_kind)
+
+    def _hold_tick_locked(self, tick):
+        hold = self._captured_hold
+        if hold is None:
+            hold = self._capture_hold_locked()
+        if hold is None:
+            return TickResult(tick, None, None, None, "none")
+        return self._consume_locked(tick, hold.psi0_action, "hold", None)
+
+    def activate(self):
+        with self._lock:
+            if self.state not in (BridgeState.PAUSED, BridgeState.FAULT):
+                raise RuntimeError("bridge is not paused or faulted")
+            if not self._hold_consumed:
+                raise ActivationRefused("one consumed paused hold is required")
+            try:
+                self._snapshot_locked()
+            except ValueError as error:
+                raise ActivationRefused(str(error)) from error
+            if self.inference.busy:
+                raise ActivationRefused("physical worker busy")
+            if self._captured_hold is None:
+                raise ActivationRefused("no bounded hold action")
+            committed_action = np.asarray(
+                self._captured_hold.psi0_action, np.float32
+            ).copy()
+            self.generation += 1
+            self._clear_policy_locked()
+            self.session_id = uuid.uuid4().hex
+            self.request_seq = 0
+            self.fault_reason = None
+            self.state = BridgeState.ACTIVE
+            self._captured_hold = None
+            r0 = self.tick_index
+            d = self.contract.rtc_delay_steps
+            committed = np.repeat(committed_action[None], d, axis=0)
+            for offset, action in enumerate(committed):
+                tick = r0 + offset
+                self._scheduled_actions[tick] = action.copy()
+                self._scheduled_kinds[tick] = "hold"
+                self._frozen_ticks.add(tick)
+            try:
+                self._make_request_locked(r0, committed, reset=True)
+            except Exception as error:
+                self._transition_out_locked(BridgeState.FAULT, str(error))
+                raise
+            self._next_request_tick = r0 + self.contract.execution_horizon
+
+    def handle_toggle(self):
+        with self._lock:
+            state = self.state
+        if state is BridgeState.ACTIVE:
+            self.pause()
+        elif state in (BridgeState.PAUSED, BridgeState.FAULT):
+            self.activate()
+        else:
+            raise RuntimeError("stopped bridge cannot be toggled")
+
+    def _drain_result_locked(self):
+        result = self.inference.poll()
+        if result is None:
+            return
+        if result.generation != self.generation:
+            self.metrics.discarded_old_generation_results += 1
+            return
+        request = self._request
+        if request is None or result.request_seq != request.request_seq:
+            self._transition_out_locked(BridgeState.FAULT, "unexpected RTC result")
+            return
+        if result.error is not None:
+            self._transition_out_locked(BridgeState.FAULT, result.error)
+            return
+        try:
+            actions = validate_rtc_result(request, result, self.contract, self.joints)
+        except (TypeError, ValueError) as error:
+            if "deadline" in str(error):
+                self.metrics.discarded_late_results += 1
+            self._transition_out_locked(BridgeState.FAULT, str(error))
+            return
+        self._staged_first_tick = request.first_action_tick
+        self._staged_actions = np.asarray(actions, np.float32).copy()
+        self._request = None
+        self.metrics.results_accepted += 1
+
+    def _install_staged_locked(self, tick):
+        if self._staged_first_tick != tick or self._staged_actions is None:
+            self._transition_out_locked(BridgeState.FAULT, "RTC handoff underrun")
+            return False
+        for offset, action in enumerate(self._staged_actions):
+            global_tick = tick + offset
+            self._scheduled_actions[global_tick] = action.copy()
+            self._scheduled_kinds[global_tick] = "policy"
+            self._frozen_ticks.discard(global_tick)
+        self._staged_first_tick = None
+        self._staged_actions = None
+        self._handoff_tick = None
+        return True
+
+    def _freeze_successor_prefix_locked(self, request_tick):
+        previous = self._last_safe_action
+        if previous is None or self.command_history_tick != request_tick - 1:
+            raise ValueError("command history does not end at r-1")
+        committed = []
+        for tick in range(request_tick, request_tick + self.contract.rtc_delay_steps):
+            requested = self._scheduled_actions.get(tick)
+            if requested is None:
+                raise ValueError(f"missing committed action at tick {tick}")
+            limited = apply_slew_limit(previous, requested, self.joints, dt=0.02)
+            self._scheduled_actions[tick] = limited.copy()
+            self._frozen_ticks.add(tick)
+            committed.append(limited.copy())
+            previous = limited
+        return np.stack(committed)
+
+    def _active_tick_locked(self, tick):
+        try:
+            self._snapshot_locked()
+        except ValueError as error:
+            self._transition_out_locked(BridgeState.FAULT, str(error))
+            return self._hold_tick_locked(tick)
+
+        self._drain_result_locked()
+        if self.state is not BridgeState.ACTIVE:
+            return self._hold_tick_locked(tick)
+
+        if self._handoff_tick == tick:
+            if not self._install_staged_locked(tick):
+                return self._hold_tick_locked(tick)
+
+        if self._next_request_tick == tick:
+            if self.inference.busy or self._request is not None:
+                self._transition_out_locked(
+                    BridgeState.FAULT, "physical worker busy at successor"
+                )
+                return self._hold_tick_locked(tick)
+            try:
+                committed = self._freeze_successor_prefix_locked(tick)
+                self._make_request_locked(tick, committed, reset=False)
+            except Exception as error:
+                self._transition_out_locked(BridgeState.FAULT, str(error))
+                return self._hold_tick_locked(tick)
+            self._next_request_tick = tick + self.contract.execution_horizon
+
+        requested = self._scheduled_actions.pop(tick, None)
+        source_kind = self._scheduled_kinds.pop(tick, None)
+        if requested is None:
+            self._transition_out_locked(BridgeState.FAULT, "scheduled action underrun")
+            return self._hold_tick_locked(tick)
+        if tick in self._frozen_ticks:
+            action = requested
+            self._frozen_ticks.remove(tick)
+        else:
+            action = apply_slew_limit(
+                self._last_safe_action, requested, self.joints, dt=0.02
+            )
+        if source_kind not in {"hold", "policy"}:
+            self._transition_out_locked(BridgeState.FAULT, "scheduled kind missing")
+            return self._hold_tick_locked(tick)
+        source_tick = None if source_kind == "hold" else tick
+        return self._consume_locked(tick, action, source_kind, source_tick)
+
+    def tick(self):
+        with self._lock:
+            tick = self.tick_index
+            if self.state is BridgeState.STOPPED:
+                return TickResult(tick, None, None, None, "none")
+            if self.state is BridgeState.ACTIVE:
+                result = self._active_tick_locked(tick)
+            else:
+                self._drain_result_locked()
+                result = self._hold_tick_locked(tick)
+            self.tick_index += 1
+            return result
+
+    def build_bounded_shutdown_hold(self):
+        with self._lock:
+            result = self._captured_hold
+            if result is None:
+                result = self._capture_hold_locked()
+            return None if result is None else result.goal
