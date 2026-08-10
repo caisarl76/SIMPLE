@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import subprocess
+import hashlib
 import json
 import math
+import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +68,45 @@ def write_jsonl(path: Path, rows):
             f.write("\n")
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def resolve_converter_commit(repository_root: Path) -> str:
+    commit = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", "scripts/postprocess_psi0.py"],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
+        raise RuntimeError("could not resolve converter source commit")
+    return commit
+
+
+def build_conversion_provenance(
+    source_path: Path,
+    source_episode_index: int,
+    skip: int,
+    downsample: int,
+    converter_commit: str,
+) -> dict:
+    if re.fullmatch(r"[0-9a-f]{40}", converter_commit) is None:
+        raise ValueError("converter_commit must be a lowercase 40-character Git SHA")
+    return {
+        "source_episode_index": source_episode_index,
+        "source_parquet_sha256": sha256_file(source_path),
+        "skip": skip,
+        "downsample": downsample,
+        "converter_commit": converter_commit,
+    }
+
+
 def modality_dict():
     def _entry(start, end, original_key, absolute=True):
         return {
@@ -118,7 +159,7 @@ def build_vectors(proprio, cmd, history_cmd, action, target_yaw, turning_flag):
     # states: match to_psi0_state_format ordering
     states = np.concatenate(
         [proprio[:, s:e] for _, s, e in STATE_SLICES] + [
-            history_cmd[:to, 3:6][::-1],  # torso_rpy
+            history_cmd[:to, 3:6][:, ::-1],  # torso_rpy
             history_cmd[:to, 6:7]         # base height
         ],
         axis=1,
@@ -186,7 +227,7 @@ def stats_block(arr):
 
 
 # default history command for the initial state
-initial_command = np.array([0, 0, 0, 0, 0, 0, 0.75, 0.75, 0.75], dtype=np.float32) 
+initial_command = np.array([0, 0, 0, 0, 0, 0, 0.74, 0.74, 0.74], dtype=np.float32)
 default_fps=50
 
 
@@ -247,6 +288,8 @@ def main():
     parser.add_argument("--video-key", default="observation.rgb_head_stereo_left")
     parser.add_argument("--chunks-size", type=int, default=1000)
     args = parser.parse_args()
+    repository_root = Path(__file__).resolve().parents[1]
+    converter_commit = resolve_converter_commit(repository_root)
 
     # last_episode_idx = 0
     episode_idx = 0
@@ -392,6 +435,13 @@ def main():
 
             total_frames += n
             ep_task = task_index[0] # ) if len(task_index) else 0
+            conversion_provenance = build_conversion_provenance(
+                source_path=data_path,
+                source_episode_index=ep_index,
+                skip=args.skip,
+                downsample=args.downsample,
+                converter_commit=converter_commit,
+            )
             episodes.append({
                 "episode_index": episode_idx,
                 "tasks": [ep_task],
@@ -400,7 +450,8 @@ def main():
                 "dataset_to_index": total_frames - 1,
                 "robot_type": "g1",
                 "instruction": all_tasks[task_index[0]],
-                "environment_config": episodes_info[ep_index]["environment_config"]
+                "environment_config": episodes_info[ep_index]["environment_config"],
+                "conversion_provenance": conversion_provenance,
             })
 
             ep_stats = {
