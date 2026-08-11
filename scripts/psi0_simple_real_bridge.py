@@ -497,7 +497,7 @@ class RosGoalPublisher:
             raise AssertionError("goal payload key drift")
         packed = msgpack.packb(payload, default=mnp.encode, use_bin_type=True)
         message = ByteMultiArray()
-        message.data = list(packed)
+        message.data = tuple(bytes([value]) for value in packed)
         self.publish_attempts += 1
         self._publisher.publish(message)
         return True
@@ -596,7 +596,13 @@ def build_runtime_adapters(
 
 
 def unpack_dict_message(message):
-    packed = bytes(message.data)
+    elements = tuple(message.data)
+    if elements and all(
+        type(element) is bytes and len(element) == 1 for element in elements
+    ):
+        packed = b"".join(elements)
+    else:
+        packed = bytes(elements)
     payload = msgpack.unpackb(packed, object_hook=mnp.decode, raw=False)
     if type(payload) is not dict:
         raise ValueError("ROS state payload must be a dictionary")

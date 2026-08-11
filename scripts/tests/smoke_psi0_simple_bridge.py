@@ -21,6 +21,11 @@ import requests
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from simple.deploy.psi0_simple_bridge import (  # noqa: E402
+    PSI0_ACTION_JOINT_NAMES,
+    PSI0_WAIST_ACTION_NAMES,
+)
+
 
 class SmokeSafetyError(RuntimeError):
     pass
@@ -96,6 +101,12 @@ class LaunchPlan:
         if len(matches) != 1:
             raise KeyError(name)
         return matches[0]
+
+
+@dataclass(frozen=True)
+class CertificationBoundary:
+    tick: int
+    monotonic_s: float
 
 
 def _inside_output(path, output_dir):
@@ -524,15 +535,123 @@ def read_jsonl(path):
     return records
 
 
-def wait_bridge_preflight(path, deadline, clock=time.monotonic):
+def smoke_action_bounds(wbc_payload):
+    try:
+        model = wbc_payload["model_contract"]["robot_model"]
+        names = tuple(model["joint_names"])
+        lower = np.asarray(model["lower_position_limits"], np.float32)
+        upper = np.asarray(model["upper_position_limits"], np.float32)
+    except (KeyError, TypeError, ValueError) as error:
+        raise SmokeSafetyError(f"WBC action bounds: {error}") from error
+    if (
+        len(names) != 43
+        or len(set(names)) != 43
+        or any(type(name) is not str for name in names)
+        or lower.shape != (43,)
+        or upper.shape != (43,)
+        or not np.isfinite(lower).all()
+        or not np.isfinite(upper).all()
+        or not np.all(lower < upper)
+    ):
+        raise SmokeSafetyError("WBC action bounds schema")
+    by_name = {name: index for index, name in enumerate(names)}
+    ordered_names = (*PSI0_ACTION_JOINT_NAMES, *PSI0_WAIST_ACTION_NAMES)
+    if any(name not in by_name for name in ordered_names):
+        raise SmokeSafetyError("WBC action bounds missing PSI0 joint")
+    indices = [by_name[name] for name in ordered_names]
+    action_lower = np.r_[lower[indices], 0.20, np.zeros(4)].astype(np.float32)
+    action_upper = np.r_[upper[indices], 0.74, np.zeros(4)].astype(np.float32)
+    return action_lower, action_upper
+
+
+def _qualifying_startup_action(record, lower, upper):
+    action = record.get("psi0_action")
+    if (
+        type(action) is not list
+        or len(action) != 36
+        or any(type(value) is not float or not np.isfinite(value) for value in action)
+    ):
+        return None
+    vector = np.asarray(action, np.float32)
+    if (
+        not np.all(vector >= lower)
+        or not np.all(vector <= upper)
+        or not np.array_equal(vector[32:36], np.zeros(4, np.float32))
+    ):
+        return None
+    return vector
+
+
+def find_certification_boundary(records, lower_action_bounds, upper_action_bounds):
+    lower = np.asarray(lower_action_bounds, np.float32)
+    upper = np.asarray(upper_action_bounds, np.float32)
+    if (
+        lower.shape != (36,)
+        or upper.shape != (36,)
+        or not np.isfinite(lower).all()
+        or not np.isfinite(upper).all()
+        or not np.all(lower <= upper)
+    ):
+        raise SmokeSafetyError("smoke action bounds must be finite 36-D envelopes")
+    preflight_indices = [
+        index
+        for index, record in enumerate(records)
+        if record.get("event") == "preflight_complete"
+    ]
+    if len(preflight_indices) > 1:
+        raise SmokeSafetyError("duplicate bridge preflight metrics")
+    if not preflight_indices:
+        return None
+    previous = None
+    for record in records[preflight_indices[0] + 1 :]:
+        if record.get("event") != "tick":
+            continue
+        tick = record.get("tick")
+        monotonic_s = record.get("monotonic_s")
+        action = _qualifying_startup_action(record, lower, upper)
+        qualifies = (
+            type(tick) is int
+            and type(monotonic_s) is float
+            and np.isfinite(monotonic_s)
+            and record.get("state") == "paused"
+            and record.get("published") is True
+            and record.get("source_kind") == "hold"
+            and record.get("input_valid") is True
+            and action is not None
+        )
+        if not qualifies:
+            previous = None
+            continue
+        if (
+            previous is not None
+            and tick == previous[0] + 1
+            and monotonic_s > previous[1]
+            and np.array_equal(action, previous[2])
+        ):
+            return CertificationBoundary(tick, monotonic_s)
+        previous = (tick, monotonic_s, action)
+    return None
+
+
+def wait_bridge_startup(
+    path,
+    lower_action_bounds,
+    upper_action_bounds,
+    deadline,
+    clock=time.monotonic,
+    read_metrics=read_jsonl,
+    sleep=time.sleep,
+):
     path = Path(path)
     while clock() < deadline:
-        if path.exists() and any(
-            record.get("event") == "preflight_complete" for record in read_jsonl(path)
-        ):
-            return
-        time.sleep(min(0.01, max(0.0, deadline - clock())))
-    raise TimeoutError("bridge preflight readiness timeout")
+        if path.exists():
+            boundary = find_certification_boundary(
+                read_metrics(path), lower_action_bounds, upper_action_bounds
+            )
+            if boundary is not None:
+                return boundary
+        sleep(min(0.01, max(0.0, deadline - clock())))
+    raise TimeoutError("bridge startup readiness timeout")
 
 
 def default_wbc_preflight(
@@ -643,11 +762,12 @@ class DefaultSmokeHooks:
 
     owner_factory = staticmethod(OwnedChildren)
     wbc_preflight = staticmethod(default_wbc_preflight)
+    action_bounds = staticmethod(smoke_action_bounds)
     goal_counts = staticmethod(default_goal_counts)
     wait_ready = staticmethod(wait_ready_json)
     openpty = staticmethod(pty.openpty)
     terminal_get = staticmethod(termios.tcgetattr)
-    wait_bridge = staticmethod(wait_bridge_preflight)
+    wait_bridge = staticmethod(wait_bridge_startup)
     write = staticmethod(os.write)
     arm_delay = staticmethod(arm_next_policy_delay)
     policy_status = staticmethod(policy_status)
@@ -704,6 +824,7 @@ def collect_smoke_report(
     records,
     *,
     scenario_started_at,
+    certification_boundary,
     armed_seq,
     delayed_record,
     goal_counts_before,
@@ -716,7 +837,43 @@ def collect_smoke_report(
     child_exit_codes,
     live_threads_after=None,
 ):
-    ticks = [record for record in records if record.get("event") == "tick"]
+    if (
+        type(certification_boundary) is not CertificationBoundary
+        or scenario_started_at != certification_boundary.monotonic_s
+    ):
+        raise SmokeSafetyError("scenario must use the recorded certification boundary")
+    raw_ticks = [record for record in records if record.get("event") == "tick"]
+    if any(
+        type(record.get("monotonic_s")) is not float
+        or not np.isfinite(record["monotonic_s"])
+        for record in raw_ticks
+    ):
+        raise SmokeSafetyError("tick metrics require finite monotonic_s")
+    boundary_matches = [
+        record
+        for record in raw_ticks
+        if record.get("tick") == certification_boundary.tick
+        and record["monotonic_s"] == certification_boundary.monotonic_s
+    ]
+    if len(boundary_matches) != 1:
+        raise SmokeSafetyError("recorded certification boundary tick is missing")
+    pre_window_ticks = [
+        record
+        for record in raw_ticks
+        if record["monotonic_s"] < certification_boundary.monotonic_s
+    ]
+    ticks = [
+        record
+        for record in raw_ticks
+        if record["monotonic_s"] >= certification_boundary.monotonic_s
+    ]
+    if any(
+        record.get("event") == "request"
+        and type(record.get("monotonic_s")) is float
+        and record["monotonic_s"] < certification_boundary.monotonic_s
+        for record in records
+    ):
+        raise SmokeSafetyError("inference request preceded certification boundary")
     publishes = [record for record in ticks if record.get("published") is True]
     fault_ticks = [record for record in ticks if record.get("state") == "fault"]
     if not fault_ticks:
@@ -733,6 +890,20 @@ def collect_smoke_report(
         }
         for record in records
         if record.get("event") == "request"
+        and record["monotonic_s"] >= certification_boundary.monotonic_s
+    ]
+    pre_window_diagnostics = [
+        {
+            "tick": record.get("tick"),
+            "monotonic_s": record.get("monotonic_s"),
+            "published": record.get("published"),
+            "state": record.get("state"),
+            "source_kind": record.get("source_kind"),
+            "input_valid": record.get("input_valid"),
+            "input_error": record.get("input_error"),
+            "psi0_action": record.get("psi0_action"),
+        }
+        for record in pre_window_ticks
     ]
     unpublished_ticks = [
         {
@@ -773,6 +944,11 @@ def collect_smoke_report(
     first_fault_action = np.asarray(fault_ticks[0]["psi0_action"], np.float32)
     final_tick = ticks[-1]
     return {
+        "certification_boundary": {
+            "tick": certification_boundary.tick,
+            "monotonic_s": certification_boundary.monotonic_s,
+        },
+        "pre_window_diagnostics": pre_window_diagnostics,
         "steady_phases": [
             {"publish_times": before_fault},
             {"publish_times": after_fault},
@@ -839,6 +1015,8 @@ def _exact_value(actual, expected):
 
 _REPORT_KEYS = frozenset(
     {
+        "certification_boundary",
+        "pre_window_diagnostics",
         "steady_phases",
         "published_ticks",
         "unpublished_ticks",
@@ -865,6 +1043,18 @@ _REPORT_KEYS = frozenset(
         "ports_rebound",
         "real_interface_connections",
         "extra_goal_publishers",
+    }
+)
+_PRE_WINDOW_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "tick",
+        "monotonic_s",
+        "published",
+        "state",
+        "source_kind",
+        "input_valid",
+        "input_error",
+        "psi0_action",
     }
 )
 _REQUEST_KEYS = frozenset(
@@ -903,6 +1093,92 @@ def validate_smoke_report(report):
             False,
             ("report_schema: expected exact pre-validation top-level key set",),
         )
+
+    boundary = report.get("certification_boundary")
+    boundary_tick = None
+    boundary_time = None
+    if (
+        type(boundary) is not dict
+        or set(boundary) != {"tick", "monotonic_s"}
+        or type(boundary.get("tick")) is not int
+        or type(boundary.get("monotonic_s")) is not float
+        or not np.isfinite(boundary["monotonic_s"])
+    ):
+        failures.append("certification_boundary: record schema")
+    else:
+        boundary_tick = boundary["tick"]
+        boundary_time = boundary["monotonic_s"]
+
+    diagnostics = report.get("pre_window_diagnostics")
+    parsed_diagnostics = []
+    if type(diagnostics) is not list or not diagnostics:
+        failures.append("pre_window_diagnostics: expected startup tick evidence")
+    else:
+        for entry in diagnostics:
+            if type(entry) is not dict or set(entry) != _PRE_WINDOW_DIAGNOSTIC_KEYS:
+                failures.append("pre_window_diagnostics: record schema")
+                continue
+            action = entry["psi0_action"]
+            common_valid = (
+                type(entry["tick"]) is int
+                and type(entry["monotonic_s"]) is float
+                and np.isfinite(entry["monotonic_s"])
+                and type(entry["published"]) is bool
+                and entry["state"] == "paused"
+                and type(entry["input_valid"]) is bool
+                and (entry["input_error"] is None or type(entry["input_error"]) is str)
+            )
+            safe_unpublished = (
+                entry["published"] is False
+                and entry["source_kind"] == "none"
+                and entry["input_valid"] is False
+                and type(entry["input_error"]) is str
+                and action is None
+            )
+            safe_hold = (
+                entry["published"] is True
+                and entry["source_kind"] == "hold"
+                and entry["input_valid"] is True
+                and entry["input_error"] is None
+                and _finite_float_vector(action, _ACTION_DIMENSION)
+                and np.float32(0.20) <= np.float32(action[31]) <= np.float32(0.74)
+                and action[32:36] == [0.0, 0.0, 0.0, 0.0]
+            )
+            if not common_valid or not (safe_unpublished or safe_hold):
+                failures.append("pre_window_diagnostics: unsafe record value")
+                continue
+            parsed_diagnostics.append(entry)
+        if len(parsed_diagnostics) == len(diagnostics):
+            diagnostic_ticks = [entry["tick"] for entry in parsed_diagnostics]
+            diagnostic_times = [entry["monotonic_s"] for entry in parsed_diagnostics]
+            if (
+                diagnostic_ticks != sorted(diagnostic_ticks)
+                or len(set(diagnostic_ticks)) != len(diagnostic_ticks)
+                or not np.all(np.diff(diagnostic_times) > 0.0)
+            ):
+                failures.append("pre_window_diagnostics: ordering")
+            if (
+                boundary_tick is not None
+                and boundary_time is not None
+                and (
+                    parsed_diagnostics[-1]["tick"] != boundary_tick - 1
+                    or not parsed_diagnostics[-1]["published"]
+                    or parsed_diagnostics[-1]["source_kind"] != "hold"
+                    or parsed_diagnostics[-1]["input_valid"] is not True
+                    or not (
+                        0.0
+                        < boundary_time - parsed_diagnostics[-1]["monotonic_s"]
+                        <= 0.060
+                    )
+                    or any(
+                        entry["monotonic_s"] >= boundary_time
+                        for entry in parsed_diagnostics
+                    )
+                )
+            ):
+                failures.append(
+                    "pre_window_diagnostics: missing first qualifying boundary tick"
+                )
 
     phases = report.get("steady_phases")
     phase_times = []
@@ -976,6 +1252,16 @@ def validate_smoke_report(report):
     if timeline:
         timeline_times = np.asarray([entry["time_s"] for entry in timeline], np.float64)
         timeline_tick_values = [entry["tick"] for entry in timeline]
+        if (
+            boundary_tick is None
+            or timeline[0]["tick"] != boundary_tick
+            or timeline[0]["time_s"] != 0.0
+            or timeline[0]["state"] != "paused"
+            or timeline[0]["source_kind"] != "hold"
+        ):
+            failures.append(
+                "certification_boundary: must match first certified paused hold"
+            )
         if not np.all(np.diff(timeline_times) > 0.0):
             failures.append("published_ticks: timestamps must increase")
         if len(timeline_times) > 1 and np.max(np.diff(timeline_times)) > 0.060:
@@ -1062,6 +1348,18 @@ def validate_smoke_report(report):
         if timeline and ticks != [entry["tick"] for entry in timeline]:
             failures.append(
                 "executed_actions: tick keys must exactly cover published timeline"
+            )
+        if (
+            boundary_tick is not None
+            and parsed_diagnostics
+            and boundary_tick in executed_by_tick
+            and not np.array_equal(
+                np.asarray(parsed_diagnostics[-1]["psi0_action"], np.float64),
+                executed_by_tick[boundary_tick],
+            )
+        ):
+            failures.append(
+                "certification_boundary_action: qualifying holds must be identical"
             )
 
     requests_ = report.get("requests")
@@ -1380,7 +1678,8 @@ def launch(config, hooks=None):
             return process
 
         start(plan.child("wbc"))
-        hooks.wbc_preflight(hooks.clock() + 10.0)
+        wbc_payload = hooks.wbc_preflight(hooks.clock() + 10.0)
+        lower_action_bounds, upper_action_bounds = hooks.action_bounds(wbc_payload)
         goal_counts_before = hooks.goal_counts()
         if goal_counts_before != [0, 1]:
             raise SmokeSafetyError(f"WBC preflight graph: {goal_counts_before}")
@@ -1404,9 +1703,18 @@ def launch(config, hooks=None):
 
         bridge_master, bridge_slave = hooks.openpty()
         bridge_original = hooks.terminal_get(bridge_slave)
+        bridge_startup_deadline = hooks.clock() + 10.0
         bridge_process = start(plan.child("bridge"), stdin=bridge_slave)
-        hooks.wait_bridge(config.bridge_metrics_jsonl, hooks.clock() + 3.0, hooks.clock)
-        scenario_started_at = hooks.clock()
+        certification_boundary = hooks.wait_bridge(
+            config.bridge_metrics_jsonl,
+            lower_action_bounds,
+            upper_action_bounds,
+            bridge_startup_deadline,
+            hooks.clock,
+        )
+        if type(certification_boundary) is not CertificationBoundary:
+            raise SmokeSafetyError("bridge startup returned no certification boundary")
+        scenario_started_at = certification_boundary.monotonic_s
         smoke_deadline = scenario_started_at + config.duration_s
 
         sleep_until(scenario_started_at + 3.0, hooks.clock, hooks.sleep)
@@ -1447,7 +1755,7 @@ def launch(config, hooks=None):
         records = hooks.read_metrics(config.bridge_metrics_jsonl)
         report_args = (
             records,
-            scenario_started_at,
+            certification_boundary,
             armed_seq,
             matches[0],
             goal_counts_before,
@@ -1477,7 +1785,8 @@ def launch(config, hooks=None):
     )
     report = collect_smoke_report(
         report_args[0],
-        scenario_started_at=report_args[1],
+        scenario_started_at=report_args[1].monotonic_s,
+        certification_boundary=report_args[1],
         armed_seq=report_args[2],
         delayed_record=report_args[3],
         goal_counts_before=report_args[4],

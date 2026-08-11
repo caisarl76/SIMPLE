@@ -5,6 +5,8 @@ import termios
 import threading
 from types import SimpleNamespace
 
+import msgpack
+import msgpack_numpy as mnp
 import numpy as np
 import pytest
 
@@ -17,14 +19,17 @@ from scripts.psi0_simple_real_bridge import (
     LocalKeyboard,
     ObservationOnlyShadowBridge,
     PreflightError,
+    RosGoalPublisher,
     count_real_interface_connections,
     handle_keyboard_events,
+    unpack_dict_message,
 )
 from simple.baselines.client import RtcActionResponse
 from simple.deploy.psi0_simple_bridge import (
     ActivationRefused,
     BridgeMode,
     BridgeState,
+    Goal,
     PolicyContract,
     Psi0SimpleBridge,
     RtcRequest,
@@ -68,6 +73,60 @@ def valid_http_rtc_response():
             "first_action_tick": 106,
         },
     )
+
+
+def test_ros_state_decoder_accepts_wbc_one_byte_bytes_elements():
+    expected = np.arange(43, dtype=np.float32)
+    packed = msgpack.packb({"q": expected}, default=mnp.encode)
+    message = SimpleNamespace(
+        data=tuple(bytes([value]) for value in packed),
+    )
+
+    payload = unpack_dict_message(message)
+
+    np.testing.assert_array_equal(payload["q"], expected)
+
+
+def test_ros_state_decoder_preserves_standard_integer_elements():
+    expected = np.arange(43, dtype=np.float32)
+    packed = msgpack.packb({"q": expected}, default=mnp.encode)
+    message = SimpleNamespace(data=list(packed))
+
+    payload = unpack_dict_message(message)
+
+    np.testing.assert_array_equal(payload["q"], expected)
+
+
+def test_ros_goal_publisher_uses_wbc_one_byte_bytes_elements():
+    class CapturingNode:
+        def __init__(self):
+            self.message = None
+
+        def create_publisher(self, _message_type, _topic, _depth):
+            return SimpleNamespace(
+                publish=lambda message: setattr(self, "message", message),
+            )
+
+    node = CapturingNode()
+    publisher = RosGoalPublisher(SimpleNamespace(node=node), "test-goal")
+    goal = Goal(
+        target_upper_body_pose=np.zeros(31, np.float32),
+        base_height_command=np.asarray([0.74], np.float32),
+        navigate_cmd=np.zeros(4, np.float32),
+        timestamp=1.0,
+        target_time=1.02,
+    )
+
+    assert publisher.publish(goal) is True
+
+    assert node.message is not None
+    assert all(
+        type(element) is bytes and len(element) == 1 for element in node.message.data
+    )
+    packed = bytes(value for element in node.message.data for value in element)
+    payload = msgpack.unpackb(packed, object_hook=mnp.decode, raw=False)
+    np.testing.assert_array_equal(payload["target_upper_body_pose"], np.zeros(31))
+    np.testing.assert_array_equal(payload["navigate_cmd"], np.zeros(4))
 
 
 def test_local_keyboard_accepts_only_p_and_restores_terminal():

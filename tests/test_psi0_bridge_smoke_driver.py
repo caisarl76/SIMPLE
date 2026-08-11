@@ -25,6 +25,10 @@ from scripts.tests.smoke_psi0_simple_bridge import (
     measured_real_interface_connections,
     validate_smoke_report,
 )
+from simple.deploy.psi0_simple_bridge import (
+    PSI0_ACTION_JOINT_NAMES,
+    PSI0_WAIST_ACTION_NAMES,
+)
 
 
 EXPECTED_WBC_ARGS = (
@@ -119,6 +123,8 @@ EXPECTED_BRIDGE_ARGS = (
 )
 
 EXPECTED_REPORT_KEYS = {
+    "certification_boundary",
+    "pre_window_diagnostics",
     "steady_phases",
     "published_ticks",
     "unpublished_ticks",
@@ -404,6 +410,137 @@ def test_smoke_wbc_preflight_passes_full_ten_second_budget_to_client():
     assert client.timeouts == [10.0]
 
 
+def smoke_action_bounds():
+    lower = np.r_[np.full(31, -1.0), 0.20, np.zeros(4)].astype(np.float32)
+    upper = np.r_[np.full(31, 1.0), 0.74, np.zeros(4)].astype(np.float32)
+    return lower, upper
+
+
+def bounded_hold_action(value=0.0):
+    action = np.full(36, value, np.float32)
+    action[31] = 0.74
+    action[32:36] = 0.0
+    return action.tolist()
+
+
+def startup_tick(tick, monotonic_s, **updates):
+    record = {
+        "event": "tick",
+        "tick": tick,
+        "monotonic_s": float(monotonic_s),
+        "state": "paused",
+        "published": True,
+        "source_kind": "hold",
+        "input_valid": True,
+        "input_error": None,
+        "psi0_action": bounded_hold_action(),
+    }
+    record.update(updates)
+    return record
+
+
+def test_smoke_action_bounds_follow_connected_wbc_joint_names():
+    ordered = (*PSI0_ACTION_JOINT_NAMES, *PSI0_WAIST_ACTION_NAMES)
+    names = tuple(f"lower_{index}" for index in range(12)) + ordered
+    lower = [float(-index - 1) for index in range(43)]
+    upper = [float(index + 1) for index in range(43)]
+    payload = {
+        "model_contract": {
+            "robot_model": {
+                "joint_names": list(names),
+                "lower_position_limits": lower,
+                "upper_position_limits": upper,
+            }
+        }
+    }
+
+    action_lower, action_upper = smoke_driver.smoke_action_bounds(payload)
+
+    np.testing.assert_array_equal(action_lower[:31], lower[12:])
+    np.testing.assert_array_equal(action_upper[:31], upper[12:])
+    np.testing.assert_array_equal(
+        action_lower[31:], np.asarray([0.20, 0.0, 0.0, 0.0, 0.0], np.float32)
+    )
+    np.testing.assert_array_equal(
+        action_upper[31:], np.asarray([0.74, 0.0, 0.0, 0.0, 0.0], np.float32)
+    )
+
+
+def test_bridge_startup_boundary_uses_second_qualifying_tick_recorded_time():
+    lower, upper = smoke_action_bounds()
+    records = [
+        {"event": "preflight_complete"},
+        startup_tick(
+            100,
+            4.98,
+            published=False,
+            source_kind="none",
+            input_valid=False,
+            input_error="no valid state",
+            psi0_action=None,
+        ),
+        startup_tick(101, 5.00),
+        startup_tick(102, 5.02),
+    ]
+
+    boundary = smoke_driver.find_certification_boundary(records, lower, upper)
+
+    assert boundary.tick == 102
+    assert boundary.monotonic_s == 5.02
+
+
+@pytest.mark.parametrize(
+    "first_updates,second_updates",
+    [
+        ({"state": "active"}, {}),
+        ({"published": False}, {}),
+        ({"source_kind": "policy"}, {}),
+        ({"input_valid": False}, {}),
+        ({"psi0_action": bounded_hold_action(1.01)}, {}),
+        ({"psi0_action": [*bounded_hold_action()[:32], 0.1, 0.0, 0.0, 0.0]}, {}),
+        ({}, {"psi0_action": bounded_hold_action(0.1)}),
+        ({}, {"tick": 103}),
+    ],
+)
+def test_bridge_startup_boundary_rejects_nonqualifying_or_nonconsecutive_pair(
+    first_updates, second_updates
+):
+    lower, upper = smoke_action_bounds()
+    first = startup_tick(101, 5.00)
+    first.update(first_updates)
+    second = startup_tick(102, 5.02)
+    second.update(second_updates)
+    records = [
+        {"event": "preflight_complete"},
+        first,
+        second,
+    ]
+
+    assert smoke_driver.find_certification_boundary(records, lower, upper) is None
+
+
+def test_bridge_startup_wait_returns_recorded_boundary_not_poll_time(tmp_path):
+    path = tmp_path / "metrics.jsonl"
+    path.write_text("placeholder", encoding="utf-8")
+    lower, upper = smoke_action_bounds()
+    records = [
+        {"event": "preflight_complete"},
+        startup_tick(101, 5.00),
+        startup_tick(102, 5.02),
+    ]
+
+    boundary = smoke_driver.wait_bridge_startup(
+        path,
+        lower,
+        upper,
+        deadline=10.0,
+        clock=lambda: 7.5,
+        read_metrics=lambda _path: records,
+    )
+
+    assert boundary == smoke_driver.CertificationBoundary(102, 5.02)
+
+
 def test_smoke_wbc_preflight_rejects_a_nonexistent_wrapper_schema():
     client = StaticWbcConfigClient(
         {"control_loop_config": {"env_type": "sim", "interface": "lo"}}
@@ -489,7 +626,7 @@ def test_cli_rejects_an_explicitly_empty_injected_control_token(monkeypatch):
 
 
 def test_collector_uses_lowercase_fault_and_old_generation_counter():
-    zero = np.zeros(36, np.float32).tolist()
+    zero = bounded_hold_action()
     records = [
         {
             "event": "preflight_complete",
@@ -517,6 +654,34 @@ def test_collector_uses_lowercase_fault_and_old_generation_counter():
                 },
             ],
             "real_interface_connections": 0,
+        },
+        {
+            "event": "tick",
+            "tick": -1,
+            "published": True,
+            "state": "paused",
+            "source_kind": "hold",
+            "psi0_action": zero,
+            "monotonic_s": -0.02,
+            "input_valid": True,
+            "input_error": None,
+            "worker_busy": False,
+            "discarded_late_results": 0,
+            "discarded_old_generation_results": 0,
+        },
+        {
+            "event": "tick",
+            "tick": 0,
+            "published": True,
+            "state": "paused",
+            "source_kind": "hold",
+            "psi0_action": zero,
+            "monotonic_s": 0.0,
+            "input_valid": True,
+            "input_error": None,
+            "worker_busy": False,
+            "discarded_late_results": 0,
+            "discarded_old_generation_results": 0,
         },
         {
             "event": "request",
@@ -566,6 +731,7 @@ def test_collector_uses_lowercase_fault_and_old_generation_counter():
     report = collect_smoke_report(
         records,
         scenario_started_at=0.0,
+        certification_boundary=smoke_driver.CertificationBoundary(0, 0.0),
         armed_seq=17,
         delayed_record={"request_seq": 17, "applied_latency_s": 0.30},
         goal_counts_before=[0, 1],
@@ -929,7 +1095,7 @@ def test_port_rebind_checks_continue_after_an_exception_and_return_diagnostics()
 
 
 def _passing_metrics_records():
-    zero = np.zeros(36, np.float32).tolist()
+    zero = bounded_hold_action()
     records = [
         {
             "event": "preflight_complete",
@@ -953,6 +1119,38 @@ def _passing_metrics_records():
             "real_interface_connections": 0,
         }
     ]
+    records.extend(
+        (
+            {
+                "event": "tick",
+                "tick": 98,
+                "published": False,
+                "state": "paused",
+                "source_kind": "none",
+                "psi0_action": None,
+                "monotonic_s": -0.04,
+                "input_valid": False,
+                "input_error": "no valid state",
+                "worker_busy": False,
+                "discarded_late_results": 0,
+                "discarded_old_generation_results": 0,
+            },
+            {
+                "event": "tick",
+                "tick": 99,
+                "published": True,
+                "state": "paused",
+                "source_kind": "hold",
+                "psi0_action": zero,
+                "monotonic_s": -0.02,
+                "input_valid": True,
+                "input_error": None,
+                "worker_busy": False,
+                "discarded_late_results": 0,
+                "discarded_old_generation_results": 0,
+            },
+        )
+    )
     # P=30, s=24, d=6 at 50 Hz: R0 is the first active tick at 3.00 s,
     # each successor is 24 ticks (0.48 s) later, and R17 is at 11.16 s.
     for request_seq in range(18):
@@ -963,7 +1161,9 @@ def _passing_metrics_records():
                 "event": "request",
                 "request_seq": request_seq,
                 "observation_tick": tick,
-                "committed_actions": np.zeros((6, 36), np.float32).tolist(),
+                "committed_actions": np.tile(
+                    np.asarray(zero, np.float32), (6, 1)
+                ).tolist(),
                 "monotonic_s": monotonic_s,
             }
         )
@@ -986,12 +1186,45 @@ def _passing_metrics_records():
                 "source_kind": source_kind,
                 "psi0_action": zero,
                 "monotonic_s": monotonic_s,
+                "input_valid": True,
+                "input_error": None,
                 "worker_busy": not (12.9 <= monotonic_s <= 13.0),
                 "discarded_late_results": 0,
                 "discarded_old_generation_results": 1 if fault else 0,
             }
         )
     return records
+
+
+def test_collector_separates_pre_window_diagnostics_at_recorded_boundary():
+    report = collect_smoke_report(
+        _passing_metrics_records(),
+        scenario_started_at=0.0,
+        certification_boundary=smoke_driver.CertificationBoundary(100, 0.0),
+        armed_seq=17,
+        delayed_record={"request_seq": 17, "applied_latency_s": 0.30},
+        goal_counts_before=[0, 1],
+        goal_counts_running=[1, 1],
+        goal_counts_after=[0, 1],
+        terminal_restored=True,
+        ports_rebound=True,
+        bridge_exit_code=0,
+        live_children_after=[],
+        child_exit_codes={"wbc": -2, "camera": 0, "policy": 0, "bridge": 0},
+        live_threads_after=[],
+    )
+
+    assert report["certification_boundary"] == {
+        "tick": 100,
+        "monotonic_s": 0.0,
+    }
+    assert [entry["tick"] for entry in report["pre_window_diagnostics"]] == [98, 99]
+    assert report["pre_window_diagnostics"][0]["published"] is False
+    assert report["pre_window_diagnostics"][0]["input_error"] == "no valid state"
+    assert report["pre_window_diagnostics"][1]["published"] is True
+    assert report["published_ticks"][0]["tick"] == 100
+    assert report["published_ticks"][0]["time_s"] == 0.0
+    assert report["unpublished_ticks"] == []
 
 
 def test_launch_preserves_both_operation_and_cleanup_failures(tmp_path, monkeypatch):
@@ -1051,13 +1284,14 @@ def test_launch_preserves_both_operation_and_cleanup_failures(tmp_path, monkeypa
         resolve_popen = staticmethod(lambda: lambda argv, **kwargs: Process())
         owner_factory = staticmethod(lambda **kwargs: owner)
         wbc_preflight = staticmethod(lambda deadline: None)
+        action_bounds = staticmethod(lambda payload: smoke_action_bounds())
         goal_counts = staticmethod(lambda: [0, 1])
         wait_ready = staticmethod(lambda *args: None)
         openpty = staticmethod(lambda: (10, 11))
         terminal_get = staticmethod(lambda fd: ["original"])
 
         @staticmethod
-        def wait_bridge(path, deadline, clock):
+        def wait_bridge(path, lower, upper, deadline, clock):
             raise primary
 
         close_fd = staticmethod(lambda fd: events.append(("close_fd", fd)))
@@ -1174,6 +1408,8 @@ def test_launch_is_injected_ordered_bounded_and_uses_shared_deadline(
             events.append(("wbc_ready", deadline))
             return {"env_type": "sim", "interface": "lo"}
 
+        action_bounds = staticmethod(lambda payload: smoke_action_bounds())
+
         goal_results = iter(([0, 1], [1, 1], [0, 1]))
 
         @staticmethod
@@ -1198,8 +1434,13 @@ def test_launch_is_injected_ordered_bounded_and_uses_shared_deadline(
             return ["original"]
 
         @staticmethod
-        def wait_bridge(path, deadline, clock):
+        def wait_bridge(path, lower, upper, deadline, clock):
+            expected_lower, expected_upper = smoke_action_bounds()
+            np.testing.assert_array_equal(lower, expected_lower)
+            np.testing.assert_array_equal(upper, expected_upper)
             events.append(("bridge_ready", deadline))
+            now[0] = 0.5
+            return smoke_driver.CertificationBoundary(100, 0.0)
 
         @staticmethod
         def write(fd, data):
@@ -1282,7 +1523,7 @@ def test_launch_is_injected_ordered_bounded_and_uses_shared_deadline(
         ("terminal", 11),
         ("popen", "bridge"),
         ("record", "bridge", 104, 104),
-        ("bridge_ready", 3.0),
+        ("bridge_ready", 10.0),
     ]
     startup_names = [
         event[0]
@@ -1330,7 +1571,7 @@ def test_launch_is_injected_ordered_bounded_and_uses_shared_deadline(
         ("ready", 22086, 1.0),
     ]
     assert [event for event in events if event[0] == "bridge_ready"] == [
-        ("bridge_ready", 3.0)
+        ("bridge_ready", 10.0)
     ]
     assert [event for event in events if event[0] == "write"] == [
         ("write", 10, b"p", 3.0)
@@ -1365,6 +1606,11 @@ def test_launch_is_injected_ordered_bounded_and_uses_shared_deadline(
     ]
     assert max(event[3] for event in events if event[0] == "cleanup_signal") <= 15.0
     assert report["validation"] == {"ok": True, "failures": []}
+    assert report["certification_boundary"] == {
+        "tick": 100,
+        "monotonic_s": 0.0,
+    }
+    assert [entry["tick"] for entry in report["pre_window_diagnostics"]] == [98, 99]
     assert report["child_exit_codes"] == {
         "wbc": -2,
         "camera": -2,
@@ -1396,11 +1642,35 @@ def passing_smoke_report():
     by_tick = {}
     for tick, timeline_entry in zip(range(100, 750), published_ticks):
         action = np.zeros(36, np.float32)
+        action[31] = 0.74
         if timeline_entry["source_kind"] == "policy":
             action[0] = tick / 10_000.0
         by_tick[tick] = action
         executed_actions.append({"tick": tick, "post_slew_action": action.tolist()})
     return {
+        "certification_boundary": {"tick": 100, "monotonic_s": 1000.0},
+        "pre_window_diagnostics": [
+            {
+                "tick": 98,
+                "monotonic_s": 999.96,
+                "published": False,
+                "state": "paused",
+                "source_kind": "none",
+                "input_valid": False,
+                "input_error": "no valid state",
+                "psi0_action": None,
+            },
+            {
+                "tick": 99,
+                "monotonic_s": 999.98,
+                "published": True,
+                "state": "paused",
+                "source_kind": "hold",
+                "input_valid": True,
+                "input_error": None,
+                "psi0_action": by_tick[100].tolist(),
+            },
+        ],
         "steady_phases": [
             {"publish_times": [value for value in publish_times if value < 11.28]},
             {"publish_times": [value for value in publish_times if value >= 11.28]},
@@ -1459,6 +1729,31 @@ def test_passing_smoke_report_meets_every_bound():
     result = validate_smoke_report(report)
     assert result.ok is True
     assert result.failures == ()
+
+
+def test_smoke_rejects_unattested_or_misaligned_certification_boundary():
+    mutations = []
+
+    wrong_tick = passing_smoke_report()
+    wrong_tick["certification_boundary"]["tick"] = 101
+    mutations.append((wrong_tick, "certification_boundary"))
+
+    nonfinite_time = passing_smoke_report()
+    nonfinite_time["certification_boundary"]["monotonic_s"] = float("nan")
+    mutations.append((nonfinite_time, "certification_boundary"))
+
+    missing_first_qualifier = passing_smoke_report()
+    missing_first_qualifier["pre_window_diagnostics"] = []
+    mutations.append((missing_first_qualifier, "pre_window_diagnostics"))
+
+    changed_hold = passing_smoke_report()
+    changed_hold["pre_window_diagnostics"][-1]["psi0_action"][0] = 0.1
+    mutations.append((changed_hold, "certification_boundary_action"))
+
+    for report, expected in mutations:
+        result = validate_smoke_report(report)
+        assert result.ok is False
+        assert any(expected in failure for failure in result.failures)
 
 
 def test_smoke_rejects_nonexact_top_level_and_nested_report_schemas():
@@ -1668,6 +1963,7 @@ def test_collector_preserves_unpublished_raw_tick_and_validator_rejects_it():
     report = collect_smoke_report(
         records,
         scenario_started_at=0.0,
+        certification_boundary=smoke_driver.CertificationBoundary(100, 0.0),
         armed_seq=17,
         delayed_record={"request_seq": 17, "applied_latency_s": 0.30},
         goal_counts_before=[0, 1],
