@@ -38,6 +38,7 @@ Contributors: [Songlin Wei](https://songlin.github.io/)\*, [Zhenhao Ni](https://
   - [2. Data Post-processing](#2-post-processing)
   - [3. Fine-Tuning](#3-fine-tuning)
 - [Evaluation in SIMPLE](#-evaluation-in-simple)
+- [PSI0 PC2 Bridge (Simulation and Shadow Only)](#psi0-pc2-bridge-simulation-and-shadow-only)
 - [📊 Simulation Benchmarking Results](#-simulation-benchmarking-results)
 - [Citation](#citation)
 - [License](#license)
@@ -548,6 +549,203 @@ mpv data/evals/psi0/G1WholebodyBendPickMP-v0/level-0/episode_0/front_stereo_left
 
 ```
 
+## PSI0 PC2 Bridge (Simulation and Shadow Only)
+
+> [!WARNING]
+> This milestone supports `shadow` and isolated `sim-control` only. It does not
+> provide a `real-control` mode and does not authorize commanding a real robot.
+> Never run the C++ SONIC controller and the Python decoupled-WBC real
+> low-level loop at the same time.
+
+The PC2 bridge reads the named 43-joint G1 configuration and the composed head
+camera, prepares PSI0 requests asynchronously, and publishes at 50 Hz only in
+isolated simulation. It starts in `PAUSED`; pressing the local `p` key toggles
+between paused hold and active inference. An inference deadline or validation
+failure latches `FAULT` and publishes a fixed bounded, zero-navigation hold.
+Press `p` after the worker is idle and the inputs are valid to rearm. `Ctrl-C`
+publishes exactly 25 final hold ticks when a bounded hold exists, otherwise it
+publishes nothing, then closes the bridge publisher. Exiting the bridge does
+not stop WBC or change the activation state of WBC's separate lower-body
+balance policy.
+
+### Named state and action contracts
+
+The 43-D WBC state is interpreted only through the connected model's ordered
+joint names. The bridge selects these 28 arm/hand joints, in PSI0 order:
+
+```text
+left_hand_thumb_0_joint, left_hand_thumb_1_joint,
+left_hand_thumb_2_joint, left_hand_middle_0_joint,
+left_hand_middle_1_joint, left_hand_index_0_joint,
+left_hand_index_1_joint, right_hand_thumb_0_joint,
+right_hand_thumb_1_joint, right_hand_thumb_2_joint,
+right_hand_index_0_joint, right_hand_index_1_joint,
+right_hand_middle_0_joint, right_hand_middle_1_joint,
+left_shoulder_pitch_joint, left_shoulder_roll_joint,
+left_shoulder_yaw_joint, left_elbow_joint, left_wrist_roll_joint,
+left_wrist_pitch_joint, left_wrist_yaw_joint,
+right_shoulder_pitch_joint, right_shoulder_roll_joint,
+right_shoulder_yaw_joint, right_elbow_joint,
+right_wrist_roll_joint, right_wrist_pitch_joint,
+right_wrist_yaw_joint
+```
+
+It appends the last executed command history as
+`[roll, pitch, yaw, height]`, producing PSI0's 32-D observation. A 36-D PSI0
+prediction is decoded by name as:
+
+| PSI0 indices | Meaning | WBC destination |
+| --- | --- | --- |
+| `0:28` | The 28 arm/hand joints above | Named upper-body positions |
+| `28:31` | `waist_roll_joint`, `waist_pitch_joint`, `waist_yaw_joint` | Named upper-body positions |
+| `31` | Base height | `base_height_command` |
+| `32:36` | Four navigation values | `navigate_cmd` |
+
+The 31 joint targets are reordered into the connected WBC model's declared
+upper-body order. Startup fails closed unless the WBC attestation proves the
+exact 43/31 names, limits, model, URDF, ONNX, and nested Git identity.
+
+### Isolated simulation workflow
+
+Use separate terminals. Both ROS and Unitree DDS must use domain 42, and the
+WBC interface must remain loopback. Start MuJoCo WBC first:
+
+```bash
+PYTHONPATH=third_party/decoupled_wbc \
+ROS_DOMAIN_ID=42 UNITREE_DOMAIN_ID=42 \
+uv run --group sonic python -m \
+  decoupled_wbc.control.main.teleop.run_g1_control_loop \
+  --interface sim \
+  --simulator mujoco \
+  --messaging-backend ros2 \
+  --enable-waist \
+  --with-hands \
+  --domain-id 42 \
+  --no-enable-onscreen \
+  --no-enable-offscreen
+```
+
+Start the test-only RTC server and codec-compatible camera:
+
+```bash
+uv run --group sonic python scripts/tests/fake_psi0_rtc_server.py \
+  --host 127.0.0.1 \
+  --port 22086 \
+  --contract scripts/tests/fixtures/psi0_policy_contract_test_v2.json \
+  --normal-latency-s 0.05 \
+  --control-token smoke-control-token \
+  --ready-json outputs/psi0_fake_policy_ready.json
+```
+
+```bash
+PYTHONPATH=third_party/decoupled_wbc uv run --group sonic python \
+  scripts/tests/fake_composed_camera_server.py \
+  --host 127.0.0.1 \
+  --port 15555 \
+  --key rgb_head_stereo_left \
+  --ready-json outputs/psi0_fake_camera_ready.json
+```
+
+Then start the paused bridge and press `p` locally when ready:
+
+```bash
+PYTHONPATH=third_party/decoupled_wbc \
+ROS_DOMAIN_ID=42 UNITREE_DOMAIN_ID=42 \
+uv run --group sonic python scripts/psi0_simple_real_bridge.py \
+  --mode sim-control \
+  --server-host 127.0.0.1 \
+  --server-port 22086 \
+  --instruction "pick up the object" \
+  --policy-contract scripts/tests/fixtures/psi0_policy_contract_test_v2.json \
+  --camera-host 127.0.0.1 \
+  --camera-port 15555 \
+  --camera-source-key rgb_head_stereo_left \
+  --camera-color-order rgb \
+  --ros-domain-id 42 \
+  --unitree-domain-id 42 \
+  --metrics-jsonl outputs/psi0_bridge_sim.jsonl
+```
+
+`sim-control` requires a policy-contract file and accepts the test-only
+contract only with the test fake. That contract cannot certify a live policy
+or any future real-control mode.
+
+### Shadow observation
+
+Shadow mode never creates a goal publisher. It accepts explicit domains so a
+later observation-only validation can inspect an existing system without
+commanding it:
+
+```bash
+PYTHONPATH=third_party/decoupled_wbc uv run --group sonic python \
+  scripts/psi0_simple_real_bridge.py \
+  --mode shadow \
+  --server-host 127.0.0.1 \
+  --server-port 22086 \
+  --instruction "pick up the object" \
+  --camera-host 127.0.0.1 \
+  --camera-port 15555 \
+  --camera-source-key rgb_head_stereo_left \
+  --camera-color-order rgb \
+  --ros-domain-id 42 \
+  --unitree-domain-id 42 \
+  --metrics-jsonl outputs/psi0_bridge_shadow.jsonl
+```
+
+`--policy-contract` is optional in shadow. If the local contract is absent but
+the server supplies a structurally valid contract, the bridge uses it while
+marking every event `policy_certified=false`. If neither contract is usable,
+shadow remains observation-only and still validates the real 43-D state,
+camera freshness, and receive-time skew.
+
+The camera key must match the policy contract. `rgb` is the default color
+order; select `bgr` only when the actual producer contract requires conversion.
+Before any later deployment gate, save a decoded sample from the real codec and
+manually verify the physical viewpoint, resolution, and red/blue channel order.
+The automated fake-camera sentinel validates the codec and channel ordering but
+cannot prove the physical viewpoint.
+
+### External live-policy gate
+
+The inspected checkpoint is uncertified until its processed episode is proven
+to use chronological `[roll, pitch, yaw, 0.74]`. The measured RTX 3060 server
+also produced warmed latency around 0.44-0.47 seconds, while the current
+`P=30`, `s=24`, `d=6` contract requires p99 at or below 0.10 seconds. The
+legacy `/act` endpoint is ineligible because it cannot receive the exact
+post-slew committed prefix or echo RTC tick metadata.
+
+A replacement server must expose `/contract` and `/act-rtc-v1`. Each request
+uses dataset `simple`, an empty condition, the exact image and `states`
+dictionaries, R0-only reset, and a finite `(d,36)` committed prefix. Each
+response must provide an executable `(s,36)` suffix plus exact `session_id`,
+`request_seq`, `observation_tick`, `prediction_horizon`, `execution_horizon`,
+`rtc_delay_steps`, and `first_action_tick`. The policy contract binds these
+dimensions and semantics to the camera key/color order, checkpoint and dataset
+hashes, converter/server commits, and `test_only=false`.
+
+Run live certification only on the external inference server and artifacts
+that have been separately supplied:
+
+```bash
+uv run python scripts/benchmark_psi0_rtc_server.py \
+  --server-url http://SERVER:22085 \
+  --policy-contract artifacts/psi0/policy-contract.json \
+  --checkpoint artifacts/psi0/checkpoint.pt \
+  --dataset-manifest artifacts/psi0/dataset-manifest.json \
+  --representative-samples artifacts/psi0/representative-requests.npz \
+  --warmup-requests 10 \
+  --measured-requests 100 \
+  --output-dir artifacts/psi0/live-certification
+```
+
+Certification discards exactly 10 warmups, then requires 100/100 successful
+measured requests, zero categorized failures, and higher-method p99 no greater
+than `(d-1)/50`. A passing run atomically writes seven co-located files:
+`latency_report.json`, `policy_contract.json`, `checkpoint.sha256`,
+`dataset_manifest.sha256`, `request_samples.sha256`, `server_commit.txt`, and
+`converter_commit.txt`. Until that bundle exists, use only the fake server in
+`sim-control`; an uncertified live server is limited to shadow observation.
+
 
 
 
@@ -609,4 +807,3 @@ _More interesting tasks, including articulated objects._
 This project is licensed under the MIT.
 
 See the [LICENSE](https://www.google.com/search?q=license.md) file for details.
-
