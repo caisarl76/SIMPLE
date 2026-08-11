@@ -1,12 +1,19 @@
 import argparse
 import base64
 from dataclasses import dataclass
+import ipaddress
+import json
 import os
 from pathlib import Path
+import queue
 import re
+import select
 import subprocess
+import sys
+import termios
 import threading
 import time
+import tty
 from typing import Callable
 
 import msgpack
@@ -30,12 +37,20 @@ from decoupled_wbc.control.robot_model.instantiation.g1 import (
 from decoupled_wbc.control.sensor.sensor_server import ImageMessageSchema
 from simple.baselines.client import HttpActionClient
 from simple.deploy.psi0_simple_bridge import (
+    ActivationRefused,
+    BridgeMetrics,
     BridgeMode,
+    BridgeState,
     JointContract,
     PolicyContract,
+    Psi0SimpleBridge,
+    RtcResult,
+    TickResult,
     TimedCameraFrame,
     TimedRobotState,
+    accept_measured_state,
     sanitize_producer_timestamp,
+    validate_synchronized_snapshot,
 )
 
 
@@ -861,3 +876,853 @@ def build_local_wbc_identity(repository_root):
     if contract["git"] != {"commit": gitlink, "working_tree_clean": True}:
         raise PreflightError("local WBC model contract Git identity")
     return LocalWbcIdentity(gitlink, contract)
+
+
+@dataclass
+class WorkerMetrics:
+    requests_submitted: int = 0
+    first_request_started_at: float | None = None
+
+
+class HttpInferenceWorker:
+    def __init__(
+        self,
+        *,
+        client,
+        clock,
+        contract,
+        instruction="instruction",
+        event_sink=None,
+    ):
+        self.client = client
+        self.clock = clock
+        self.contract = contract
+        self.instruction = instruction
+        self._event_sink = event_sink or (lambda _event, **_fields: None)
+        self._input = queue.Queue(maxsize=1)
+        self._output = queue.Queue(maxsize=1)
+        self._physical_busy = threading.Event()
+        self._stopping = threading.Event()
+        self.metrics = WorkerMetrics()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="psi0-http-worker",
+            daemon=True,
+        )
+        self.thread.start()
+
+    @property
+    def busy(self):
+        return self._physical_busy.is_set() or not self._output.empty()
+
+    def submit(self, request):
+        if self._stopping.is_set():
+            raise ActivationRefused("inference worker is stopping")
+        if self.busy:
+            raise ActivationRefused("inference worker busy")
+        self._physical_busy.set()
+        try:
+            self._input.put_nowait(request)
+        except queue.Full as error:
+            self._physical_busy.clear()
+            raise ActivationRefused("inference request queue is full") from error
+        self.metrics.requests_submitted += 1
+        self._event_sink(
+            "request",
+            generation=request.generation,
+            request_seq=request.request_seq,
+            observation_tick=request.observation_tick,
+            committed_actions=request.committed_actions.tolist(),
+        )
+
+    def _serialize_history(self, request):
+        history = {
+            "session_id": request.session_id,
+            "request_seq": request.request_seq,
+            "observation_tick": request.observation_tick,
+            "rtc_delay_steps": self.contract.rtc_delay_steps,
+            "committed_actions": request.committed_actions.copy(),
+        }
+        if request.reset:
+            history["reset"] = True
+        return history
+
+    def _run(self):
+        while True:
+            try:
+                request = self._input.get(timeout=0.05)
+            except queue.Empty:
+                if self._stopping.is_set():
+                    return
+                continue
+            if self._stopping.is_set():
+                self._physical_busy.clear()
+                return
+            started_at = self.clock()
+            if self.metrics.first_request_started_at is None:
+                self.metrics.first_request_started_at = started_at
+            try:
+                response = self.client.query_rtc_action(
+                    {self.contract.image_key: request.image},
+                    self.instruction,
+                    {"states": request.observation},
+                    {},
+                    history=self._serialize_history(request),
+                    dataset="simple",
+                )
+                result = RtcResult(
+                    generation=request.generation,
+                    request_seq=request.request_seq,
+                    completed_at=self.clock(),
+                    actions=np.asarray(response.action, np.float32).copy(),
+                    metadata=dict(response.metadata),
+                )
+            except Exception as error:
+                result = RtcResult(
+                    generation=request.generation,
+                    request_seq=request.request_seq,
+                    completed_at=self.clock(),
+                    actions=None,
+                    metadata=None,
+                    error=f"{type(error).__name__}: {error}",
+                )
+            try:
+                self._output.put_nowait(result)
+            finally:
+                self._physical_busy.clear()
+            self._event_sink(
+                "result",
+                generation=result.generation,
+                request_seq=result.request_seq,
+                completed_at=result.completed_at,
+                error=result.error,
+            )
+            if self._stopping.is_set():
+                return
+
+    def poll(self):
+        try:
+            return self._output.get_nowait()
+        except queue.Empty:
+            return None
+
+    def close(self, timeout_s):
+        self._stopping.set()
+        self.thread.join(timeout_s)
+        if self.thread.is_alive():
+            raise RuntimeError("inference worker failed to stop within timeout")
+        self._physical_busy.clear()
+        for pending in (self._input, self._output):
+            while True:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    break
+
+
+class LocalKeyboard:
+    ACCEPTED_KEYS = (b"p",)
+
+    def __init__(self, fd):
+        self.fd = fd
+        self._original = None
+
+    def __enter__(self):
+        if not os.isatty(self.fd):
+            raise RuntimeError("local keyboard requires a TTY")
+        self._original = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def poll(self, timeout_s=0.0):
+        accepted = []
+        readable, _, _ = select.select([self.fd], [], [], timeout_s)
+        while readable:
+            value = os.read(self.fd, 1)
+            if value in self.ACCEPTED_KEYS:
+                accepted.append(value.decode("ascii"))
+            readable, _, _ = select.select([self.fd], [], [], 0.0)
+        return tuple(accepted)
+
+    def close(self, timeout_s=0.0):
+        if self._original is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self._original)
+            self._original = None
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+
+class JsonlMetrics:
+    def __init__(self, path, *, mode, policy_certified, clock=time.monotonic):
+        self._file = Path(path).open("x", encoding="utf-8")
+        self._mode = mode.value
+        self._policy_certified = bool(policy_certified)
+        self._clock = clock
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def write(self, event, bridge, *, published, **fields):
+        if self._closed:
+            raise RuntimeError("metrics writer is closed")
+        if "policy_certified" in fields:
+            raise ValueError("policy certification is owned by JsonlMetrics")
+        payload = {
+            "event": event,
+            "mode": self._mode,
+            "state": bridge.state.value,
+            "generation": bridge.generation,
+            "monotonic_s": self._clock(),
+            "published": bool(published),
+            "policy_certified": self._policy_certified,
+            **fields,
+        }
+        with self._lock:
+            self._file.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            self._file.flush()
+
+    def write_event(self, event, **fields):
+        if self._closed:
+            raise RuntimeError("metrics writer is closed")
+        if "policy_certified" in fields:
+            raise ValueError("policy certification is owned by JsonlMetrics")
+        payload = {
+            "event": event,
+            "mode": self._mode,
+            "monotonic_s": self._clock(),
+            "policy_certified": self._policy_certified,
+            **fields,
+        }
+        with self._lock:
+            self._file.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            self._file.flush()
+
+    def close(self, timeout_s=0.0):
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._file.close()
+
+
+@dataclass(frozen=True)
+class ShutdownReport:
+    final_hold_publishes: int
+    publisher_closed_after_publish_count: int
+    started_at: float
+    deadline_at: float
+    finished_at: float
+    cleanup_errors: tuple[str, ...]
+
+
+class ShutdownCoordinator:
+    def __init__(
+        self,
+        *,
+        bridge,
+        command_sink,
+        camera,
+        worker,
+        state_source,
+        ownership_guard,
+        ros_runtime,
+        keyboard,
+        metrics,
+        clock=time.monotonic,
+        sleep=time.sleep,
+    ):
+        self.bridge = bridge
+        self.command_sink = command_sink
+        self.camera = camera
+        self.worker = worker
+        self.state_source = state_source
+        self.ownership_guard = ownership_guard
+        self.ros_runtime = ros_runtime
+        self.keyboard = keyboard
+        self.metrics = metrics
+        self.clock = clock
+        self.sleep = sleep
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            raise RuntimeError("shutdown coordinator may run only once")
+        self._closed = True
+        started_at = self.clock()
+        errors = []
+        try:
+            self.bridge.stop()
+        except Exception as error:
+            errors.append(f"bridge_stop: {error}")
+        hold = None
+        try:
+            hold = self.bridge.build_bounded_shutdown_hold()
+        except Exception as error:
+            errors.append(f"bounded_hold: {error}")
+        try:
+            worker_busy = bool(self.worker.busy)
+        except Exception as error:
+            errors.append(f"worker_busy: {error}")
+            worker_busy = True
+        long_path = hold is not None or worker_busy
+        deadline_at = started_at + (6.5 if long_path else 0.5)
+
+        def remaining(cap=None):
+            value = max(0.0, deadline_at - self.clock())
+            return value if cap is None else min(value, cap)
+
+        def close_resource(name, resource, cap=None):
+            if resource is None:
+                return
+            budget = remaining(cap)
+            if budget <= 0.0:
+                errors.append(f"{name}: overall shutdown deadline exhausted")
+            try:
+                resource.close(timeout_s=budget)
+            except Exception as error:
+                errors.append(f"{name}: {error}")
+            if self.clock() > deadline_at:
+                errors.append(f"{name}: exceeded overall shutdown deadline")
+
+        published = 0
+        try:
+            if hold is not None and self.command_sink is not None:
+                first = self.clock()
+                for index in range(25):
+                    scheduled_at = first + index * 0.02
+                    if scheduled_at > deadline_at:
+                        raise TimeoutError("final hold exceeds overall deadline")
+                    self.sleep(max(0.0, scheduled_at - self.clock()))
+                    if self.clock() > deadline_at:
+                        raise TimeoutError("final hold missed overall deadline")
+                    if self.command_sink.publish(hold) is not True:
+                        raise RuntimeError("final hold publish rejected")
+                    published += 1
+        except Exception as error:
+            errors.append(f"final_hold: {error}")
+        finally:
+            close_resource("publisher", self.command_sink)
+
+        close_resource("camera", self.camera, 0.5)
+        close_resource("worker", self.worker, 5.5)
+        close_resource("state", self.state_source)
+        close_resource("keyboard", self.keyboard)
+        close_resource("ownership_guard", self.ownership_guard)
+        close_resource("ros", self.ros_runtime)
+        close_resource("metrics", self.metrics)
+        finished_at = self.clock()
+        if finished_at > deadline_at and not any(
+            "overall shutdown deadline" in error for error in errors
+        ):
+            errors.append("cleanup: exceeded overall shutdown deadline")
+        return ShutdownReport(
+            final_hold_publishes=published,
+            publisher_closed_after_publish_count=published,
+            started_at=started_at,
+            deadline_at=deadline_at,
+            finished_at=finished_at,
+            cleanup_errors=tuple(errors),
+        )
+
+
+class FiftyHzLoop:
+    def __init__(self, clock=time.monotonic, sleep=time.sleep):
+        self.clock = clock
+        self.sleep = sleep
+        self._next = None
+
+    def run_n(self, count, callback):
+        first = self.clock() if self._next is None else self._next
+        for index in range(count):
+            scheduled = first + index * 0.02
+            self.sleep(max(0.0, scheduled - self.clock()))
+            callback(scheduled)
+        self._next = first + count * 0.02
+
+
+def handle_keyboard_events(bridge, keyboard, metrics):
+    for key in keyboard.poll(0.0):
+        if key != "p":
+            continue
+        try:
+            bridge.handle_toggle()
+        except ActivationRefused as error:
+            metrics.write_event(
+                "activation_refused",
+                state=bridge.state.value,
+                reason=str(error),
+            )
+
+
+def run_runtime(bridge, adapters, keyboard, coordinator, metrics, ownership_guard):
+    latest_state = None
+    latest_camera = None
+
+    def one_tick(_scheduled):
+        nonlocal latest_state, latest_camera
+        ownership_guard.check()
+        state = adapters.state_source.poll()
+        camera = adapters.camera_reader.poll()
+        latest_state = state if state is not None else latest_state
+        latest_camera = camera if camera is not None else latest_camera
+        if latest_state is not None and latest_camera is not None:
+            bridge.update_inputs(latest_state, latest_camera)
+        handle_keyboard_events(bridge, keyboard, metrics)
+        result = bridge.tick()
+        input_valid, input_error = bridge.input_status()
+        metrics.write(
+            "tick",
+            bridge,
+            published=(adapters.goal_publisher is not None and result.goal is not None),
+            tick=result.tick,
+            source_kind=result.source_kind,
+            previewed=(adapters.goal_publisher is None and result.goal is not None),
+            psi0_action=(
+                None if result.psi0_action is None else result.psi0_action.tolist()
+            ),
+            worker_busy=bridge.inference.busy,
+            input_valid=input_valid,
+            input_error=input_error,
+            camera_diagnostic=bridge.camera_diagnostic,
+            discarded_late_results=bridge.metrics.discarded_late_results,
+            discarded_old_generation_results=(
+                bridge.metrics.discarded_old_generation_results
+            ),
+        )
+
+    loop = FiftyHzLoop()
+    try:
+        while bridge.state is not BridgeState.STOPPED:
+            loop.run_n(1, one_tick)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        shutdown_report = coordinator.close()
+    return shutdown_report
+
+
+class ShadowPreviewSink:
+    def __init__(self, metrics):
+        self.metrics = metrics
+        self.closed = False
+
+    def publish(self, goal):
+        if self.closed:
+            raise RuntimeError("preview sink is closed")
+        self.metrics.write_event(
+            "preview",
+            target_upper_body_pose=goal.target_upper_body_pose.tolist(),
+            base_height_command=goal.base_height_command.tolist(),
+            navigate_cmd=goal.navigate_cmd.tolist(),
+        )
+        return True
+
+    def close(self, timeout_s=0.0):
+        self.closed = True
+
+
+class DisabledInferenceWorker:
+    busy = False
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self, timeout_s=0.0):
+        self.closed = True
+
+
+class ObservationOnlyShadowBridge:
+    def __init__(self, inference, joints, clock, *, start_tick):
+        self.inference = inference
+        self.joints = joints
+        self.clock = clock
+        self.tick_index = start_tick
+        self.state = BridgeState.PAUSED
+        self.generation = 0
+        self.metrics = BridgeMetrics()
+        self.last_valid_state = None
+        self.last_snapshot = None
+        self.observation_valid = False
+        self.input_error = "no synchronized inputs"
+        self.camera_diagnostic = None
+
+    def update_inputs(self, state, camera):
+        if type(camera) is TimedCameraFrame:
+            _timestamp, diagnostic = sanitize_producer_timestamp(
+                camera.producer_timestamp
+            )
+            self.camera_diagnostic = camera.producer_timestamp_diagnostic or diagnostic
+        else:
+            self.camera_diagnostic = None
+        accepted, reason = accept_measured_state(
+            self.last_valid_state, state, self.joints, self.clock()
+        )
+        self.last_valid_state = accepted
+        if reason is not None:
+            self.observation_valid = False
+            self.input_error = reason
+            return
+        try:
+            snapshot = validate_synchronized_snapshot(accepted, camera, self.clock())
+        except ValueError as error:
+            self.observation_valid = False
+            self.input_error = str(error)
+            return
+        self.last_snapshot = snapshot
+        self.observation_valid = True
+        self.input_error = None
+        self.camera_diagnostic = snapshot.camera.producer_timestamp_diagnostic
+
+    def input_status(self):
+        return self.observation_valid, self.input_error
+
+    def handle_toggle(self):
+        raise ActivationRefused(
+            "no usable policy contract; shadow remains observation-only"
+        )
+
+    def tick(self):
+        result = TickResult(self.tick_index, None, None, None, "none")
+        self.tick_index += 1
+        return result
+
+    def stop(self):
+        if self.state is not BridgeState.STOPPED:
+            self.generation += 1
+            self.state = BridgeState.STOPPED
+
+    def build_bounded_shutdown_hold(self):
+        return None
+
+
+def _is_loopback_host(host):
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class ConnectionEvidenceRecorder:
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._records = {}
+
+    def _observe(self, component, transport, endpoint, real_interface):
+        if component in self._records:
+            raise PreflightError(f"duplicate observed connection: {component}")
+        if type(endpoint) is not str or not endpoint:
+            raise PreflightError(f"invalid observed endpoint: {component}")
+        self._records[component] = {
+            "component": component,
+            "transport": transport,
+            "endpoint": endpoint,
+            "real_interface": bool(real_interface),
+            "observed_at": float(self._clock()),
+        }
+
+    def observe_wbc_response(self, payload):
+        if type(payload) is not dict:
+            raise PreflightError("WBC response observation requires payload")
+        interface = payload.get("interface")
+        env_type = payload.get("env_type")
+        if type(interface) is not str or type(env_type) is not str:
+            raise PreflightError("WBC response lacks interface identity")
+        self._observe(
+            "wbc",
+            "dds-service-response",
+            interface,
+            not (env_type == "sim" and interface == "lo"),
+        )
+
+    def observe_camera_frame(self, host, frame):
+        if (
+            type(frame) is not TimedCameraFrame
+            or type(frame.image) is not np.ndarray
+            or frame.image.dtype != np.uint8
+            or frame.image.ndim != 3
+            or frame.image.shape[2] != 3
+        ):
+            raise PreflightError("camera observation requires a decoded frame")
+        self._observe(
+            "camera",
+            "decoded-frame",
+            host,
+            not _is_loopback_host(host),
+        )
+
+    def observe_policy_contract(self, host, payload):
+        if type(payload) is not dict or not payload:
+            raise PreflightError("policy observation requires contract response")
+        self._observe(
+            "policy",
+            "http-contract-response",
+            host,
+            not _is_loopback_host(host),
+        )
+
+    def snapshot(self, required_components):
+        required = set(required_components)
+        missing = required - set(self._records)
+        if missing:
+            raise PreflightError(
+                "missing observed connections: " + ",".join(sorted(missing))
+            )
+        order = ("wbc", "camera", "policy")
+        evidence = [
+            dict(self._records[name]) for name in order if name in self._records
+        ]
+        count_real_interface_connections(evidence)
+        return evidence
+
+
+def count_real_interface_connections(evidence):
+    expected_keys = {
+        "component",
+        "transport",
+        "endpoint",
+        "real_interface",
+        "observed_at",
+    }
+    allowed_components = {"wbc", "camera", "policy"}
+    if type(evidence) is not list or not 1 <= len(evidence) <= 3:
+        raise PreflightError("connection evidence record count")
+    components = [record.get("component") for record in evidence]
+    if len(set(components)) != len(components) or not set(components) <= (
+        allowed_components
+    ):
+        raise PreflightError("connection evidence component set")
+    for record in evidence:
+        if type(record) is not dict or set(record) != expected_keys:
+            raise PreflightError("connection evidence record schema")
+        if (
+            type(record["transport"]) is not str
+            or type(record["endpoint"]) is not str
+            or type(record["real_interface"]) is not bool
+            or type(record["observed_at"]) is not float
+            or not np.isfinite(record["observed_at"])
+        ):
+            raise PreflightError("connection evidence record types")
+    return sum(record["real_interface"] for record in evidence)
+
+
+def _close_partial(resources):
+    errors = []
+    seen = set()
+    for name, resource in reversed(resources):
+        if resource is None or id(resource) in seen:
+            continue
+        seen.add(id(resource))
+        try:
+            resource.close(timeout_s=0.5)
+        except Exception as error:
+            errors.append(f"{name}: {error}")
+    return tuple(errors)
+
+
+def validate_domain_selection(mode, ros_domain_id, unitree_domain_id):
+    mode = BridgeMode(mode)
+    for label, value in (("ROS", ros_domain_id), ("Unitree", unitree_domain_id)):
+        if type(value) is not int or not 0 <= value <= 232:
+            raise PreflightError(f"{label} domain must be an integer in [0,232]")
+    if mode is BridgeMode.SIM_CONTROL and (
+        ros_domain_id,
+        unitree_domain_id,
+    ) != (42, 42):
+        raise PreflightError("sim-control requires isolated domain 42")
+    return ros_domain_id, unitree_domain_id
+
+
+def load_local_policy_payload(path, mode):
+    mode = BridgeMode(mode)
+    if path is None:
+        if mode is BridgeMode.SIM_CONTROL:
+            raise PreflightError("--policy-contract is required in sim-control")
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        if mode is BridgeMode.SIM_CONTROL:
+            raise PreflightError(
+                f"cannot read local policy contract: {error}"
+            ) from error
+        return None
+    return payload
+
+
+def run_bridge(args):
+    mode = BridgeMode(args.mode)
+    validate_domain_selection(mode, args.ros_domain_id, args.unitree_domain_id)
+    os.environ["ROS_DOMAIN_ID"] = str(args.ros_domain_id)
+    os.environ["UNITREE_DOMAIN_ID"] = str(args.unitree_domain_id)
+    repository_root = Path(__file__).resolve().parents[1]
+    resources = []
+    coordinator = None
+    connection_recorder = ConnectionEvidenceRecorder()
+    try:
+        runtime = RosRuntime(args.ros_domain_id)
+        resources.append(("ros", runtime))
+        wbc_payload = create_ros_wbc_config_client(
+            "WBCPolicy/robot_config", args.ros_domain_id
+        ).get_config(3.0)
+        connection_recorder.observe_wbc_response(wbc_payload)
+        local_policy_payload = load_local_policy_payload(args.policy_contract, mode)
+        policy_client = build_policy_client(args.server_host, args.server_port)
+        try:
+            server_policy_payload = policy_client.get_contract(timeout=2.0)
+            connection_recorder.observe_policy_contract(
+                args.server_host, server_policy_payload
+            )
+        except Exception:
+            if mode is not BridgeMode.SHADOW:
+                raise
+            server_policy_payload = None
+        local_wbc = build_local_wbc_identity(repository_root)
+        preflight = run_preflight(
+            mode=mode,
+            local_policy=local_policy_payload,
+            server_policy=server_policy_payload,
+            wbc_payload=wbc_payload,
+            graph=runtime,
+            expected_model_contract=local_wbc.model_contract,
+            expected_gitlink_sha=local_wbc.root_gitlink_sha,
+            required_domain_id=args.ros_domain_id,
+        )
+        factories = RuntimeDependencyFactories(
+            state_source=lambda: RosStateSource(runtime, "G1Env/env_state_act"),
+            camera_reader=lambda: ComposedCameraReader(
+                args.camera_host,
+                args.camera_port,
+                args.camera_source_key,
+                args.camera_color_order,
+            ),
+            graph=lambda: runtime,
+        )
+        adapters = build_runtime_adapters(
+            mode=mode,
+            preflight_result=preflight,
+            publisher_factory=lambda: RosGoalPublisher(runtime, CONTROL_GOAL_TOPIC),
+            test_dependencies=factories,
+        )
+        adapters = RuntimeAdapters(
+            adapters.state_source,
+            adapters.camera_reader,
+            adapters.goal_publisher,
+            runtime,
+        )
+        resources.extend(
+            (
+                ("publisher", adapters.goal_publisher),
+                ("state", adapters.state_source),
+                ("camera", adapters.camera_reader),
+            )
+        )
+        observed_camera = adapters.camera_reader.wait_for_frame(timeout_s=1.0)
+        connection_recorder.observe_camera_frame(args.camera_host, observed_camera)
+        ownership_guard = GoalOwnershipGuard(
+            mode, runtime, preflight.goal_counts_at_preflight
+        )
+        resources.append(("ownership_guard", ownership_guard))
+        metrics = JsonlMetrics(
+            args.metrics_jsonl,
+            mode=mode,
+            policy_certified=preflight.policy_certified,
+        )
+        resources.append(("metrics", metrics))
+        command_sink = (
+            adapters.goal_publisher
+            if adapters.goal_publisher is not None
+            else ShadowPreviewSink(metrics)
+        )
+        resources.append(("command_sink", command_sink))
+        contract = preflight.runtime_policy_contract
+        if contract is None:
+            worker = DisabledInferenceWorker()
+            bridge = ObservationOnlyShadowBridge(
+                worker,
+                preflight.joint_contract,
+                time.monotonic,
+                start_tick=int(time.monotonic() * 50),
+            )
+        else:
+            worker = HttpInferenceWorker(
+                client=policy_client,
+                clock=time.monotonic,
+                contract=contract,
+                instruction=args.instruction,
+                event_sink=metrics.write_event,
+            )
+            bridge = Psi0SimpleBridge(
+                contract,
+                preflight.joint_contract,
+                worker,
+                time.monotonic,
+                start_tick=int(time.monotonic() * contract.action_frequency_hz),
+                consume_goal=command_sink.publish,
+            )
+        resources.append(("worker", worker))
+        keyboard = LocalKeyboard(sys.stdin.fileno())
+        keyboard.__enter__()
+        resources.append(("keyboard", keyboard))
+        required_connections = {"wbc", "camera"}
+        if mode is BridgeMode.SIM_CONTROL:
+            required_connections.add("policy")
+        connection_evidence = connection_recorder.snapshot(
+            required_components=required_connections
+        )
+        metrics.write_event(
+            "preflight_complete",
+            policy_mismatched_fields=list(preflight.policy_mismatched_fields),
+            wbc_mismatched_fields=list(preflight.wbc_mismatched_fields),
+            publisher_required=preflight.publisher_required,
+            goal_counts_at_preflight=list(preflight.goal_counts_at_preflight),
+            connection_evidence=connection_evidence,
+            real_interface_connections=count_real_interface_connections(
+                connection_evidence
+            ),
+        )
+        coordinator = ShutdownCoordinator(
+            bridge=bridge,
+            command_sink=command_sink,
+            camera=adapters.camera_reader,
+            worker=worker,
+            state_source=adapters.state_source,
+            ownership_guard=ownership_guard,
+            ros_runtime=runtime,
+            keyboard=keyboard,
+            metrics=metrics,
+        )
+        report = run_runtime(
+            bridge,
+            adapters,
+            keyboard,
+            coordinator,
+            metrics,
+            ownership_guard,
+        )
+        if report.cleanup_errors:
+            raise RuntimeError(
+                "bridge shutdown errors: " + "; ".join(report.cleanup_errors)
+            )
+        return 0
+    except Exception as error:
+        cleanup_errors = ()
+        if coordinator is not None and not coordinator._closed:
+            report = coordinator.close()
+            cleanup_errors = report.cleanup_errors
+        elif coordinator is None:
+            cleanup_errors = _close_partial(resources)
+        if cleanup_errors:
+            raise RuntimeError(
+                f"{error}; cleanup: " + "; ".join(cleanup_errors)
+            ) from error
+        raise
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return run_bridge(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
