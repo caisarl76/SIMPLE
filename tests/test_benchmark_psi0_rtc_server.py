@@ -6,6 +6,7 @@ import requests
 
 from scripts.benchmark_psi0_rtc_server import (
     FAILURE_KEYS,
+    _rename_directory_noreplace,
     BenchmarkReport,
     BenchmarkRequestError,
     BenchmarkSample,
@@ -15,6 +16,7 @@ from scripts.benchmark_psi0_rtc_server import (
     build_parser,
     classify_response,
     load_representative_samples,
+    load_representative_samples_with_sha256,
     main,
     sha256_file,
     write_certification_bundle,
@@ -210,6 +212,16 @@ def test_representative_loader_accepts_only_exact_contiguous_finite_schema(tmp_p
     assert np.array_equal(loaded[17].image, expected[17].image)
     assert np.array_equal(loaded[17].state, expected[17].state)
     assert loaded[17].instruction == expected[17].instruction
+
+
+def test_representative_loader_hashes_the_exact_parsed_bytes(tmp_path):
+    path = tmp_path / "samples.npz"
+    write_representative_npz(path, representative_samples(100))
+
+    loaded, benchmarked_sha256 = load_representative_samples_with_sha256(path)
+
+    assert len(loaded) == 100
+    assert benchmarked_sha256 == sha256_file(path)
 
 
 @pytest.mark.parametrize(
@@ -451,6 +463,7 @@ def test_certified_bundle_contains_exact_contract_hash_and_commit_evidence(tmp_p
         checkpoint_path=checkpoint,
         dataset_manifest_path=dataset_manifest,
         samples_path=samples,
+        benchmarked_samples_sha256=sha256_file(samples),
     )
     assert {path.name for path in output.iterdir()} == {
         "latency_report.json",
@@ -485,6 +498,153 @@ def test_certified_bundle_contains_exact_contract_hash_and_commit_evidence(tmp_p
     assert latency["certified"] is True
 
 
+@pytest.mark.parametrize(
+    ("p99_latency_s", "latency_limit_s", "message"),
+    [
+        (0.101, 0.10, "p99 latency"),
+        (float("nan"), 0.10, "p99 latency"),
+        (-0.001, 0.10, "p99 latency"),
+        (0.05, 0.11, "latency limit"),
+    ],
+)
+def test_bundle_rederives_latency_gate_from_contract(
+    tmp_path,
+    p99_latency_s,
+    latency_limit_s,
+    message,
+):
+    checkpoint = tmp_path / "checkpoint.pt"
+    dataset_manifest = tmp_path / "dataset.json"
+    samples = tmp_path / "samples.npz"
+    checkpoint.write_bytes(b"checkpoint")
+    dataset_manifest.write_bytes(b"dataset")
+    write_representative_npz(samples, representative_samples(100))
+    payload = live_policy_payload(
+        checkpoint_sha256=sha256_file(checkpoint),
+        dataset_manifest_sha256=sha256_file(dataset_manifest),
+    )
+    contract_path = tmp_path / "policy-contract.json"
+    contract_path.write_text(json.dumps(payload))
+    output = tmp_path / "bundle"
+
+    with pytest.raises(ValueError, match=message):
+        write_certification_bundle(
+            output_dir=output,
+            report=BenchmarkReport(
+                10,
+                100,
+                100,
+                {key: 0 for key in FAILURE_KEYS},
+                p99_latency_s,
+                latency_limit_s,
+                True,
+            ),
+            policy_contract_path=contract_path,
+            fetched_server_contract=payload,
+            checkpoint_path=checkpoint,
+            dataset_manifest_path=dataset_manifest,
+            samples_path=samples,
+            benchmarked_samples_sha256=sha256_file(samples),
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"warmup_requests": 10.0},
+        {"measured_requests": 100.0},
+        {"successes": 100.0},
+        {"failures": {key: False for key in FAILURE_KEYS}},
+        {"p99_latency_s": 0},
+        {"latency_limit_s": 0},
+        {"certified": 1},
+    ],
+)
+def test_bundle_requires_exact_report_field_types(tmp_path, updates):
+    checkpoint = tmp_path / "checkpoint.pt"
+    dataset_manifest = tmp_path / "dataset.json"
+    samples = tmp_path / "samples.npz"
+    checkpoint.write_bytes(b"checkpoint")
+    dataset_manifest.write_bytes(b"dataset")
+    write_representative_npz(samples, representative_samples(100))
+    payload = live_policy_payload(
+        checkpoint_sha256=sha256_file(checkpoint),
+        dataset_manifest_sha256=sha256_file(dataset_manifest),
+    )
+    contract_path = tmp_path / "policy-contract.json"
+    contract_path.write_text(json.dumps(payload))
+    report_fields = {
+        "warmup_requests": 10,
+        "measured_requests": 100,
+        "successes": 100,
+        "failures": {key: 0 for key in FAILURE_KEYS},
+        "p99_latency_s": 0.05,
+        "latency_limit_s": 0.10,
+        "certified": True,
+    }
+    report_fields.update(updates)
+    output = tmp_path / "bundle"
+
+    with pytest.raises(ValueError, match="report field types"):
+        write_certification_bundle(
+            output_dir=output,
+            report=BenchmarkReport(**report_fields),
+            policy_contract_path=contract_path,
+            fetched_server_contract=payload,
+            checkpoint_path=checkpoint,
+            dataset_manifest_path=dataset_manifest,
+            samples_path=samples,
+            benchmarked_samples_sha256=sha256_file(samples),
+        )
+    assert not output.exists()
+
+
+def test_bundle_refuses_samples_changed_after_loading(tmp_path):
+    checkpoint = tmp_path / "checkpoint.pt"
+    dataset_manifest = tmp_path / "dataset.json"
+    samples = tmp_path / "samples.npz"
+    checkpoint.write_bytes(b"checkpoint")
+    dataset_manifest.write_bytes(b"dataset")
+    write_representative_npz(samples, representative_samples(100))
+    _, benchmarked_samples_sha256 = load_representative_samples_with_sha256(samples)
+    payload = live_policy_payload(
+        checkpoint_sha256=sha256_file(checkpoint),
+        dataset_manifest_sha256=sha256_file(dataset_manifest),
+    )
+    contract_path = tmp_path / "policy-contract.json"
+    contract_path.write_text(json.dumps(payload))
+    changed_samples = list(representative_samples(100))
+    changed_samples[0] = BenchmarkSample(
+        changed_samples[0].image,
+        changed_samples[0].state,
+        "changed after benchmark",
+    )
+    write_representative_npz(samples, changed_samples)
+    output = tmp_path / "bundle"
+
+    with pytest.raises(ValueError, match="representative sample hash"):
+        write_certification_bundle(
+            output_dir=output,
+            report=BenchmarkReport(
+                10,
+                100,
+                100,
+                {key: 0 for key in FAILURE_KEYS},
+                0.05,
+                0.10,
+                True,
+            ),
+            policy_contract_path=contract_path,
+            fetched_server_contract=payload,
+            checkpoint_path=checkpoint,
+            dataset_manifest_path=dataset_manifest,
+            samples_path=samples,
+            benchmarked_samples_sha256=benchmarked_samples_sha256,
+        )
+    assert not output.exists()
+
+
 def test_bundle_refuses_hash_mismatch_and_existing_destination(tmp_path):
     checkpoint = tmp_path / "checkpoint.pt"
     dataset_manifest = tmp_path / "dataset.json"
@@ -517,6 +677,7 @@ def test_bundle_refuses_hash_mismatch_and_existing_destination(tmp_path):
             checkpoint_path=checkpoint,
             dataset_manifest_path=dataset_manifest,
             samples_path=samples,
+            benchmarked_samples_sha256=sha256_file(samples),
         )
     assert not output.exists()
     output.mkdir()
@@ -529,7 +690,24 @@ def test_bundle_refuses_hash_mismatch_and_existing_destination(tmp_path):
             checkpoint_path=checkpoint,
             dataset_manifest_path=dataset_manifest,
             samples_path=samples,
+            benchmarked_samples_sha256=sha256_file(samples),
         )
+
+
+def test_atomic_directory_publish_never_replaces_an_existing_empty_directory(
+    tmp_path,
+):
+    source = tmp_path / "temporary-bundle"
+    destination = tmp_path / "bundle"
+    source.mkdir()
+    (source / "evidence.txt").write_text("preserve me")
+    destination.mkdir()
+
+    with pytest.raises(FileExistsError):
+        _rename_directory_noreplace(source, destination)
+
+    assert (source / "evidence.txt").read_text() == "preserve me"
+    assert list(destination.iterdir()) == []
 
 
 def test_cli_requires_artifact_identity_paths_and_exact_counts():

@@ -1,7 +1,11 @@
 import argparse
+import ctypes
 from dataclasses import asdict, dataclass
+import errno
 import hashlib
+import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -74,8 +78,8 @@ class BenchmarkReport:
     certified: bool
 
 
-def load_representative_samples(path):
-    with np.load(path, allow_pickle=False) as payload:
+def _parse_representative_samples(raw_bytes):
+    with np.load(io.BytesIO(raw_bytes), allow_pickle=False) as payload:
         if set(payload.files) != {"images", "states", "instructions"}:
             raise ValueError("sample NPZ keys must be images/states/instructions")
         images = payload["images"]
@@ -97,6 +101,17 @@ def load_representative_samples(path):
         BenchmarkSample(images[i].copy(), states[i].copy(), str(instructions[i]))
         for i in range(len(images))
     )
+
+
+def load_representative_samples_with_sha256(path):
+    raw_bytes = Path(path).read_bytes()
+    samples = _parse_representative_samples(raw_bytes)
+    return samples, hashlib.sha256(raw_bytes).hexdigest()
+
+
+def load_representative_samples(path):
+    samples, _ = load_representative_samples_with_sha256(path)
+    return samples
 
 
 def expected_metadata(history, contract):
@@ -355,6 +370,42 @@ def _fsync_directory(path):
         os.close(descriptor)
 
 
+def _rename_directory_noreplace(source, destination):
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic no-replace directory publication is unavailable",
+            destination,
+        )
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(os.fspath(source)),
+        -100,
+        os.fsencode(os.fspath(destination)),
+        1,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(
+            error_number,
+            os.strerror(error_number),
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def write_certification_bundle(
     *,
     output_dir,
@@ -364,11 +415,25 @@ def write_certification_bundle(
     checkpoint_path,
     dataset_manifest_path,
     samples_path,
+    benchmarked_samples_sha256,
 ):
     output = Path(output_dir)
     if output.exists():
         raise FileExistsError(output)
-    if type(report) is not BenchmarkReport or not report.certified:
+    if type(report) is not BenchmarkReport:
+        raise ValueError("only a certified report may create an evidence bundle")
+    if (
+        type(report.warmup_requests) is not int
+        or type(report.measured_requests) is not int
+        or type(report.successes) is not int
+        or type(report.failures) is not dict
+        or any(type(value) is not int for value in report.failures.values())
+        or type(report.p99_latency_s) is not float
+        or type(report.latency_limit_s) is not float
+        or type(report.certified) is not bool
+    ):
+        raise ValueError("certification report field types are invalid")
+    if not report.certified:
         raise ValueError("only a certified report may create an evidence bundle")
     if (
         report.warmup_requests != 10
@@ -385,6 +450,22 @@ def write_certification_bundle(
         raise ValueError("fetched server contract differs from local contract")
     if local_contract.test_only:
         raise ValueError("test-only policy contract cannot be live-certified")
+    derived_latency_limit_s = (
+        local_contract.rtc_delay_steps - 1
+    ) / local_contract.action_frequency_hz
+    if (
+        type(report.latency_limit_s) is not float
+        or not math.isfinite(report.latency_limit_s)
+        or report.latency_limit_s != derived_latency_limit_s
+    ):
+        raise ValueError("latency limit differs from policy contract")
+    if (
+        type(report.p99_latency_s) is not float
+        or not math.isfinite(report.p99_latency_s)
+        or report.p99_latency_s < 0.0
+        or report.p99_latency_s > derived_latency_limit_s
+    ):
+        raise ValueError("p99 latency does not meet the policy contract gate")
     checkpoint_hash = sha256_file(checkpoint_path)
     dataset_hash = sha256_file(dataset_manifest_path)
     sample_hash = sha256_file(samples_path)
@@ -392,6 +473,12 @@ def write_certification_bundle(
         raise ValueError("checkpoint hash differs from policy contract")
     if dataset_hash != local_contract.dataset_manifest_sha256:
         raise ValueError("dataset manifest hash differs from policy contract")
+    if (
+        type(benchmarked_samples_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", benchmarked_samples_sha256) is None
+        or sample_hash != benchmarked_samples_sha256
+    ):
+        raise ValueError("representative sample hash changed after loading")
     for field in ("server_commit", "converter_commit"):
         if re.fullmatch(r"[0-9a-f]{40}", getattr(local_contract, field)) is None:
             raise ValueError(f"{field} must be a full lowercase Git SHA")
@@ -407,7 +494,7 @@ def write_certification_bundle(
         ),
         "checkpoint.sha256": checkpoint_hash + "\n",
         "dataset_manifest.sha256": dataset_hash + "\n",
-        "request_samples.sha256": sample_hash + "\n",
+        "request_samples.sha256": benchmarked_samples_sha256 + "\n",
         "server_commit.txt": local_contract.server_commit + "\n",
         "converter_commit.txt": local_contract.converter_commit + "\n",
     }
@@ -417,7 +504,7 @@ def write_certification_bundle(
         for name, data in files.items():
             _write_fsynced(temporary / name, data)
         _fsync_directory(temporary)
-        os.rename(temporary, output)
+        _rename_directory_noreplace(temporary, output)
         _fsync_directory(output.parent)
     except Exception:
         if temporary.exists():
@@ -461,7 +548,9 @@ def main(argv=None):
     contract = PolicyContract.from_dict(contract_payload)
     if contract.test_only:
         raise SystemExit("test-only contracts cannot be live-certified")
-    samples = load_representative_samples(args.representative_samples)
+    samples, benchmarked_samples_sha256 = load_representative_samples_with_sha256(
+        args.representative_samples
+    )
     transport = HttpBenchmarkTransport(
         args.server_url,
         image_key=contract.image_key,
@@ -486,6 +575,7 @@ def main(argv=None):
         checkpoint_path=args.checkpoint,
         dataset_manifest_path=args.dataset_manifest,
         samples_path=args.representative_samples,
+        benchmarked_samples_sha256=benchmarked_samples_sha256,
     )
     return 0
 
