@@ -358,6 +358,9 @@ from simple.sensors.config import CameraCfg
 from simple.tasks.registry import TaskRegistry
 ```
 
+Also change its existing dataclass import to
+`from dataclasses import dataclass, replace`.
+
 Then append the following test support and tests below the Task 1 tests; do not
 place new imports between test functions:
 
@@ -537,21 +540,78 @@ def test_preconstructed_task_rejects_sensor_injection_without_mutation(monkeypat
     assert task.sensor_cfgs is original_sensor_mapping
     assert set(task.sensor_cfgs) == {"head"}
     assert events == []
+
+
+@pytest.mark.parametrize("sim_mode", ["mujoco", "isaac", "mujoco_isaac"])
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        (lambda cfg: object(), TypeError),
+        (lambda cfg: replace(cfg, width=0), ValueError),
+        (lambda cfg: replace(cfg, height=-1), ValueError),
+        (lambda cfg: replace(cfg, focal_length=0.0), ValueError),
+        (lambda cfg: replace(cfg, focal_length=np.nan), ValueError),
+        (lambda cfg: replace(cfg, fov=0.0), ValueError),
+        (lambda cfg: replace(cfg, fov=np.inf), ValueError),
+        (lambda cfg: replace(cfg, near=0.0), ValueError),
+        (lambda cfg: replace(cfg, far=np.nan), ValueError),
+        (lambda cfg: replace(cfg, far=cfg.near), ValueError),
+        (lambda cfg: replace(cfg, mount="eye_in_void"), ValueError),
+    ],
+    ids=(
+        "wrong-type",
+        "zero-width",
+        "negative-height",
+        "zero-focal-length",
+        "nonfinite-focal-length",
+        "zero-fov",
+        "nonfinite-fov",
+        "zero-near",
+        "nonfinite-far",
+        "reversed-clipping",
+        "invalid-mount",
+    ),
+)
+def test_invalid_evaluation_camera_fails_before_all_resources(
+    monkeypatch, sim_mode, mutation, expected_error
+):
+    install_live_task()
+    events = []
+    install_fake_simulators(monkeypatch, events)
+    monkeypatch.setattr(
+        BaseDualSim,
+        "_init_isaac",
+        lambda self, headless, webrtc: events.append("init:isaac"),
+    )
+    candidate = mutation(camera_cfg("third-person"))
+    try:
+        with pytest.raises(expected_error):
+            BaseDualSim(
+                "third-person-live-task",
+                sim_mode=sim_mode,
+                extra_sensor_cfgs={"third_person": candidate},
+            )
+        assert events == []
+    finally:
+        remove_live_task()
 ```
 
-- [ ] **Step 2: Run the three new tests and verify RED**
+- [ ] **Step 2: Run the initial validation/isolation tests and verify RED**
 
 Run:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   .venv/bin/python -m pytest -q -p no:cacheprovider \
-  tests/test_third_person_eval_camera.py -k 'live_environments or collision or clipping'
+  tests/test_third_person_eval_camera.py \
+  -k 'live_environments or collision or clipping or invalid_evaluation_camera'
 ```
 
 Expected: failures for missing `extra_sensor_cfgs` support/factory seams and cached task use.
 
-- [ ] **Step 3: Add sensor preparation and factory seams**
+**Deferred production specification — do not edit source until the complete
+rollback suite below has failed.** Add these sensor-preparation and factory
+seams only in Step 4:
 
 Add these functions above `BaseDualSim` in `base_dual_env.py`:
 
@@ -623,7 +683,7 @@ def _prepare_task_sensors(
     task.sensor_cfgs = merged
 ```
 
-- [ ] **Step 4: Replace `BaseDualSim.__init__` and make close idempotent**
+The deferred constructor/close implementation for Step 4 is:
 
 Use this constructor/close ownership logic; keep `_init_isaac`, `spin`, and the
 Gym superclass behavior unchanged:
@@ -741,7 +801,7 @@ def _close_simulation_app() -> None:
         _ISAAC_LOADED = False
 ```
 
-- [ ] **Step 5: Add and pass rollback tests**
+- [ ] **Step 3: Add rollback tests and verify the complete suite is RED**
 
 Append these tests:
 
@@ -877,7 +937,21 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   tests/test_third_person_eval_camera.py
 ```
 
-Expected: all Task 1 and Task 2 tests pass.
+Expected for this RED checkpoint: all camera validation,
+collision, isolation, and rollback tests have been collected, none of
+`_init_isaac`, `IsaacSimSimulator`, or `MujocoSimulator` ran for invalid input,
+and the suite fails only because the deferred production seams are absent.
+
+- [ ] **Step 4: Apply the deferred sensor, constructor, and cleanup implementation**
+
+Now, and only now, add the exact sensor-preparation, factory, constructor,
+`close`, and `_close_simulation_app` definitions specified above.
+
+- [ ] **Step 5: Rerun the complete Task 1/Task 2 file and verify GREEN**
+
+Run the same complete-file command from Step 3. Expected: all Task 1 and Task 2
+tests pass, including every invalid-camera case in every simulation mode and
+all constructor rollback cases.
 
 - [ ] **Step 6: Commit task ownership and ordering**
 
@@ -903,7 +977,7 @@ Change the existing dataclass import at the top of
 `tests/test_third_person_eval_camera.py` to:
 
 ```python
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 ```
 
 Then add these new-module imports to that same top-level import block:
@@ -1125,7 +1199,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 Expected: RED because `_build_worker_kwargs`, `_start_worker_process`, and
 `_make_worker_environment` do not yet exist.
 
-- [ ] **Step 6: Plumb the option through testable parent and worker builders**
+**Deferred production specification — do not edit either CLI yet.** The exact
+parent and worker plumbing to apply in Step 7 is:
 
 Add this Typer parameter to both `main` functions and both worker functions:
 
@@ -1266,7 +1341,7 @@ make_kwargs.update(
 
 Do not add an empty `extra_sensor_cfgs` mapping when disabled.
 
-- [ ] **Step 7: Add broader parent-to-worker and worker-to-environment regression tests**
+- [ ] **Step 6: Add the complete parent/worker regressions and verify RED**
 
 Add the remaining imports to the file's top-level import block. `pytest`,
 `eval_cli`, and `decoupled_cli` are already present from Step 5. Append the
@@ -1425,7 +1500,18 @@ dictionary. Both CLI parents must call `_start_worker_process`, so this test
 covers the complete parent path from the built dictionary through
 `_make_worker_process`, `ctx.Process`, and `Process.start()`.
 
-- [ ] **Step 8: Run the complete camera/config tests and verify GREEN**
+- [ ] **Step 7: Run the complete camera/config file and verify RED, then implement**
+
+First run the complete-file command below. Expected: RED for the still-missing
+parent builders, process seam, and worker-local environment helper. This is the
+mandatory complete behavioral RED checkpoint; do not accept only the focused
+Step 5 subset.
+
+After that RED result, apply the exact deferred production specification above
+to both CLIs and `EnvRunner`, with every parent routing through
+`_start_worker_process`.
+
+- [ ] **Step 8: Rerun the complete camera/config tests and verify GREEN**
 
 Run:
 
@@ -1467,6 +1553,7 @@ the ordinary `.venv`. In particular, this file must not import
 after `BaseDualSim._init_isaac` has created `SimulationApp`.
 
 ```python
+from pathlib import Path
 from types import SimpleNamespace
 
 import mujoco
@@ -1520,6 +1607,37 @@ def test_mujoco_clipping_is_converted_from_metres_to_extent_units() -> None:
     apply_mujoco_clipping(model, near=0.2, far=5.0)
     assert model.vis.map.znear * model.stat.extent == 0.2
     assert model.vis.map.zfar * model.stat.extent == 5.0
+
+
+def test_opt_out_compiled_mujoco_model_keeps_default_clipping() -> None:
+    simulator = MujocoSimulator.__new__(MujocoSimulator)
+    simulator.task = SimpleNamespace(layout=SimpleNamespace(cameras={}))
+    baseline = mujoco.MjSpec().compile()
+    before = (float(baseline.vis.map.znear), float(baseline.vis.map.zfar))
+    model = simulator._compile_mujoco_model(mujoco.MjSpec())
+    assert (float(model.vis.map.znear), float(model.vis.map.zfar)) == before
+
+
+def test_opt_in_compiled_mujoco_model_applies_third_person_clipping() -> None:
+    simulator = MujocoSimulator.__new__(MujocoSimulator)
+    simulator.task = SimpleNamespace(
+        layout=SimpleNamespace(
+            cameras={"third_person": third_person_entity()}
+        )
+    )
+    model = simulator._compile_mujoco_model(mujoco.MjSpec())
+    assert model.vis.map.znear * model.stat.extent == 0.2
+    assert model.vis.map.zfar * model.stat.extent == 5.0
+
+
+def test_isaac_production_wiring_routes_through_parent_adapter() -> None:
+    source = Path("src/simple/engines/isaacsim.py").read_text()
+    start = source.index("    def add_cameras(self):")
+    end = source.index("    def add_lights(self):", start)
+    body = source[start:end]
+    assert "isaac_camera_parent_path(" in body
+    assert "workspace_prim_path=self.workspace_prim_path" in body
+    assert "prim_path=f\"{cam_parent_path}/{cam_key}\"" in body
 
 
 def test_asymmetric_marker_analyzer_checks_order_center_and_clipping() -> None:
@@ -1757,6 +1875,18 @@ def apply_mujoco_clipping(model, *, near: float, far: float) -> None:
     model.vis.map.zfar = far / extent
 
 
+def apply_third_person_mujoco_clipping_if_present(model, cameras) -> bool:
+    camera = cameras.get(THIRD_PERSON_SENSOR_KEY)
+    if camera is None:
+        return False
+    apply_mujoco_clipping(
+        model,
+        near=camera.cam_cfg.near,
+        far=camera.cam_cfg.far,
+    )
+    return True
+
+
 def _dominant_mask(frame: np.ndarray, channel: int) -> np.ndarray:
     primary = frame[..., channel].astype(np.int16)
     others = [frame[..., index].astype(np.int16) for index in range(3) if index != channel]
@@ -1842,10 +1972,11 @@ After adding the neutral helpers, run:
 PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   .venv/bin/python -m pytest -q -p no:cacheprovider \
   tests/test_third_person_eval_backends.py \
-  -k 'reinjected or prepares_layout or eye_in_world or production_builder or mixed_mode'
+  -k 'reinjected or prepares_layout or eye_in_world or production_builder or mixed_mode or opt_out or opt_in or isaac_production'
 ```
 
-Expected: RED for the missing reset hook and `eye_in_world` branch. The
+Expected: RED for the missing reset hook, both backend production seams, and
+the `eye_in_world` branches. The
 fovy-only production builder must specifically fail
 `test_production_builder_compiles_exact_camera_calibration` because its
 compiled resolution is `[1, 1]` rather than `[640, 360]`.
@@ -1906,7 +2037,8 @@ both evaluation CLIs, and used only by the backend verification script in Task
 
 - [ ] **Step 6: Implement MuJoCo camera, clipping, and visual-only markers**
 
-Import `apply_mujoco_clipping` from the neutral module. First make world-fixed
+Import `apply_third_person_mujoco_clipping_if_present` from the neutral module.
+First make world-fixed
 cameras use MuJoCo's explicit pixel calibration even when their `CameraCfg`
 does not contain an `intrinsics` mapping. Preserve the legacy fovy-only path
 for all other cameras without explicit intrinsics:
@@ -1962,8 +2094,27 @@ elif camera.mount == "eye_in_world":
     )
 ```
 
-Immediately after `mjSpec.compile()`, call `apply_mujoco_clipping` with the
-`third_person` camera's exact near/far values before constructing a renderer.
+Replace the direct compile with this production setup seam and call it before
+constructing `MjData` or any renderer:
+
+```python
+def _compile_mujoco_model(self, mj_spec):
+    model = mj_spec.compile()
+    apply_third_person_mujoco_clipping_if_present(
+        model,
+        self.task.layout.cameras,
+    )
+    return model
+
+
+self.mjModel = self._compile_mujoco_model(mjSpec)
+```
+
+The helper must return without reading `third_person` fields when that key is
+absent. Consequently an ordinary opt-out reset compiles with MuJoCo's existing
+default clipping unchanged; the two compiled-model tests above execute the
+same production setup seam used by ordinary `update_layout`, not a handcrafted
+XML or a direct helper-only path.
 In `_build_primitive`, keep the current table behavior and use this exact
 marker-only branch when `verification_rgb` is present:
 
@@ -4537,12 +4688,29 @@ def test_mujoco_contract_reads_backend_applied_pose_intrinsics_and_resolution():
 def test_isaac_contract_reads_backend_applied_pose_intrinsics_and_resolution():
     camera = third_person_entity()
     width, height = camera.resolution
+
+    class FakePath:
+        def __str__(self):
+            return "/World/workspace"
+
+    class FakeParent:
+        def GetPath(self):
+            return FakePath()
+
+    class FakePrim:
+        def GetParent(self):
+            return FakeParent()
+
     isaac_camera = SimpleNamespace(
         get_local_pose=lambda: (
             np.asarray(camera.pose.position),
             np.asarray(camera.pose.quaternion),
         ),
         get_resolution=lambda: (width, height),
+        get_world_pose=lambda: (
+            np.asarray(camera.pose.position),
+            np.asarray(camera.pose.quaternion),
+        ),
         get_focal_length=lambda: camera.focal_length,
         get_horizontal_aperture=lambda: (
             camera.focal_length * width / camera.fx
@@ -4550,8 +4718,10 @@ def test_isaac_contract_reads_backend_applied_pose_intrinsics_and_resolution():
         get_vertical_aperture=lambda: (
             camera.focal_length * height / camera.fy
         ),
-        prim=object(),
+        prim=FakePrim(),
+        prim_path="/World/workspace/third_person",
     )
+
     class FakeAttribute:
         def Get(self):
             return 0.0
@@ -4569,13 +4739,23 @@ def test_isaac_contract_reads_backend_applied_pose_intrinsics_and_resolution():
             task=SimpleNamespace(
                 layout=SimpleNamespace(cameras={"third_person": camera})
             ),
-            isaac=SimpleNamespace(cameras={"third_person": isaac_camera}),
+            isaac=SimpleNamespace(
+                workspace_prim_path="/World/workspace",
+                cameras={"third_person": isaac_camera},
+            ),
         )
     )
     report = read_and_validate_backend_camera_contract(
         env,
         "isaac",
         isaac_usd_camera_factory=lambda prim: usd_camera,
+        isaac_world_pose_probe=lambda env: {
+            "before_position": list(camera.pose.position),
+            "before_quaternion": list(camera.pose.quaternion),
+            "after_position": list(camera.pose.position),
+            "after_quaternion": list(camera.pose.quaternion),
+            "stable": True,
+        },
     )
     assert report["backend_camera_contract_ok"] is True
     assert report["actual"]["resolution"] == [640, 360]
@@ -4585,6 +4765,13 @@ def test_isaac_contract_reads_backend_applied_pose_intrinsics_and_resolution():
         "cx": 320.0,
         "cy": 180.0,
     }
+    assert report["actual"]["prim_path"] == "/World/workspace/third_person"
+    assert report["actual"]["parent_prim_path"] == "/World/workspace"
+    assert report["parent_prim_ok"] is True
+    assert report["world_position_ok"] is True
+    assert report["world_quaternion_ok"] is True
+    assert report["world_pose_stability"]["stable"] is True
+    assert report["world_pose_stable_ok"] is True
 ```
 
 - [ ] **Step 2: Run script tests and verify RED**
@@ -4670,7 +4857,22 @@ def _expected_camera_contract(env, sim_mode: str) -> dict:
         quaternion = t3d.quaternions.qmult(
             quaternion, q_isaac_mujoco
         )
-    elif sim_mode != "isaac":
+    elif sim_mode == "isaac":
+        return {
+            "position": [float(value) for value in camera.pose.position],
+            "quaternion": [float(value) for value in quaternion],
+            "world_position": [float(value) for value in camera.pose.position],
+            "world_quaternion": [float(value) for value in quaternion],
+            "parent_prim_path": env.unwrapped.isaac.workspace_prim_path,
+            "resolution": [int(value) for value in camera.resolution],
+            "intrinsics": {
+                "fx": float(camera.fx),
+                "fy": float(camera.fy),
+                "cx": float(camera.cx),
+                "cy": float(camera.cy),
+            },
+        }
+    else:
         raise ValueError(f"unsupported verification backend: {sim_mode}")
     return {
         "position": [float(value) for value in camera.pose.position],
@@ -4724,6 +4926,7 @@ def read_backend_camera_contract(
             isaac_usd_camera_factory = UsdGeom.Camera
         usd_camera = isaac_usd_camera_factory(camera.prim)
         position, quaternion = camera.get_local_pose()
+        world_position, world_quaternion = camera.get_world_pose()
         width, height = camera.get_resolution()
         focal_length = float(camera.get_focal_length())
         horizontal_aperture = float(camera.get_horizontal_aperture())
@@ -4735,8 +4938,16 @@ def read_backend_camera_contract(
             usd_camera.GetVerticalApertureOffsetAttr().Get()
         )
         return {
+            "prim_path": str(camera.prim_path),
+            "parent_prim_path": str(camera.prim.GetParent().GetPath()),
             "position": [float(value) for value in _as_numpy(position)],
             "quaternion": [float(value) for value in _as_numpy(quaternion)],
+            "world_position": [
+                float(value) for value in _as_numpy(world_position)
+            ],
+            "world_quaternion": [
+                float(value) for value in _as_numpy(world_quaternion)
+            ],
             "resolution": [int(width), int(height)],
             "intrinsics": {
                 "fx": focal_length * width / horizontal_aperture,
@@ -4748,8 +4959,53 @@ def read_backend_camera_contract(
     raise ValueError(f"unsupported verification backend: {sim_mode}")
 
 
+def probe_isaac_world_pose_stability(env) -> dict:
+    engine = env.unwrapped.isaac
+    camera = engine.cameras[THIRD_PERSON_SENSOR_KEY]
+    before_position, before_quaternion = camera.get_world_pose()
+    robot_position, robot_quaternion = engine.robot.get_world_pose()
+    displaced = _as_numpy(robot_position).copy()
+    displaced[0] += 0.10
+    try:
+        engine.robot.set_world_pose(
+            position=displaced,
+            orientation=robot_quaternion,
+        )
+        engine.world.step(render=True)
+        after_position, after_quaternion = camera.get_world_pose()
+    finally:
+        engine.robot.set_world_pose(
+            position=robot_position,
+            orientation=robot_quaternion,
+        )
+        engine.world.step(render=True)
+    before_position = _as_numpy(before_position)
+    before_quaternion = _as_numpy(before_quaternion)
+    after_position = _as_numpy(after_position)
+    after_quaternion = _as_numpy(after_quaternion)
+    quaternion_similarity = abs(
+        float(np.dot(before_quaternion, after_quaternion))
+    ) / float(
+        np.linalg.norm(before_quaternion) * np.linalg.norm(after_quaternion)
+    )
+    return {
+        "before_position": before_position.tolist(),
+        "before_quaternion": before_quaternion.tolist(),
+        "after_position": after_position.tolist(),
+        "after_quaternion": after_quaternion.tolist(),
+        "stable": bool(
+            np.allclose(before_position, after_position, rtol=0.0, atol=1e-6)
+            and np.isclose(quaternion_similarity, 1.0, rtol=0.0, atol=1e-6)
+        ),
+    }
+
+
 def read_and_validate_backend_camera_contract(
-    env, sim_mode: str, *, isaac_usd_camera_factory=None
+    env,
+    sim_mode: str,
+    *,
+    isaac_usd_camera_factory=None,
+    isaac_world_pose_probe=None,
 ) -> dict:
     actual = read_backend_camera_contract(
         env,
@@ -4793,12 +5049,54 @@ def read_and_validate_backend_camera_contract(
             )
         ),
     }
+    world_pose_stability = None
+    if sim_mode == "isaac":
+        actual_world_quaternion = np.asarray(
+            actual["world_quaternion"], dtype=np.float64
+        )
+        expected_world_quaternion = np.asarray(
+            expected["world_quaternion"], dtype=np.float64
+        )
+        world_quaternion_similarity = abs(
+            float(np.dot(actual_world_quaternion, expected_world_quaternion))
+        ) / float(
+            np.linalg.norm(actual_world_quaternion)
+            * np.linalg.norm(expected_world_quaternion)
+        )
+        probe = isaac_world_pose_probe or probe_isaac_world_pose_stability
+        world_pose_stability = probe(env)
+        checks.update(
+            {
+                "parent_prim_ok": (
+                    actual["parent_prim_path"] == expected["parent_prim_path"]
+                ),
+                "world_position_ok": bool(
+                    np.allclose(
+                        actual["world_position"],
+                        expected["world_position"],
+                        rtol=0.0,
+                        atol=1e-6,
+                    )
+                ),
+                "world_quaternion_ok": bool(
+                    np.isclose(
+                        world_quaternion_similarity,
+                        1.0,
+                        rtol=0.0,
+                        atol=1e-6,
+                    )
+                ),
+                "world_pose_stable_ok": world_pose_stability["stable"] is True,
+            }
+        )
     report = {
         "actual": actual,
         "expected": expected,
         **checks,
         "backend_camera_contract_ok": all(checks.values()),
     }
+    if world_pose_stability is not None:
+        report["world_pose_stability"] = world_pose_stability
     if report["backend_camera_contract_ok"] is not True:
         raise ValueError(f"backend camera contract mismatch: {report}")
     return report
@@ -5002,7 +5300,7 @@ Expected: every command exits zero.
 The first whitespace command covers the complete implementation range from the
 approved design commit; the second covers any still-uncommitted correction.
 The narrowed legacy-file rule set is intentional: the pre-existing files have
-46 unrelated Ruff findings and nine pre-existing format deltas on commit
+60 unrelated Ruff findings and 12 pre-existing format deltas on commit
 `83c175c`. Do not expand this feature into a repository-wide style cleanup.
 Every newly created file still receives the full Ruff and format gates.
 
@@ -5088,6 +5386,12 @@ red/green/blue centroid ordering, the green marker within 32 pixels of optical
 center, no visible near-magenta or far-cyan sentinel, and measured clipping
 `[0.2, 5.0]`. Both reports also require exact applied resolution and
 intrinsics plus pose/quaternion agreement (with quaternion sign equivalence).
+The Isaac report additionally requires the actual camera prim path, its parent
+prim path equal to `/World/workspace`, its backend world pose equal to the
+canonical camera pose, and an unchanged camera world pose after the verifier
+temporarily translates the robot root by 0.10 m and restores it. The robot
+motion probe runs only in this one-reset verification process and restoration
+is protected by `finally`.
 The Isaac engine and `pxr` imports occur only after `SimulationApp` startup
 inside `gym.make`; the ordinary `.venv` unit gate never imports `carb`.
 
@@ -5283,12 +5587,29 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 timeout 15s ssh h100 \
-  "docker exec '$psi0_container' nvidia-smi --query-gpu=index,uuid,name,memory.used --format=csv,noheader" \
+  "docker inspect '$psi0_container' --format '{{json .HostConfig.DeviceRequests}}'" \
+  > "$verification_dir/container-device-requests.json"
+selected_host_gpu_index="$(jq -er \
+  '[.[] | select(.Driver == "nvidia") | .DeviceIDs[]][0] \
+   | select(test("^[0-9]+$"))' \
+  "$verification_dir/container-device-requests.json")"
+timeout 15s ssh h100 \
+  "nvidia-smi --query-gpu=index,uuid,name,memory.used --format=csv,noheader" \
   > "$verification_dir/h100-gpu-inventory.txt"
 timeout 15s ssh h100 \
-  "docker exec '$psi0_container' nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader" \
+  "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader" \
   > "$verification_dir/h100-compute-apps.txt"
-selected_gpu_uuid="$(awk -F, '$1 ~ /^[[:space:]]*0[[:space:]]*$/ {gsub(/[[:space:]]/, "", $2); print $2}' "$verification_dir/h100-gpu-inventory.txt")"
+selected_gpu_uuid="$(awk -F, -v selected_index="$selected_host_gpu_index" '
+  {
+    gpu_index=$1
+    gsub(/[[:space:]]/, "", gpu_index)
+    if (gpu_index == selected_index) {
+      gpu_uuid=$2
+      gsub(/[[:space:]]/, "", gpu_uuid)
+      print gpu_uuid
+    }
+  }
+' "$verification_dir/h100-gpu-inventory.txt")"
 test -n "$selected_gpu_uuid"
 test "$(printf '%s\n' "$selected_gpu_uuid" | wc -l)" -eq 1
 if awk -F, -v selected="$selected_gpu_uuid" '
@@ -5299,12 +5620,15 @@ if awk -F, -v selected="$selected_gpu_uuid" '
   }
   END {exit found ? 0 : 1}
 ' "$verification_dir/h100-compute-apps.txt"; then
-  printf '%s\n' "blocked: compute process already owns container GPU 0 ($selected_gpu_uuid)" \
+  printf '%s\n' "blocked: compute process already owns host GPU $selected_host_gpu_index ($selected_gpu_uuid), mapped to container cuda:0" \
     > "$verification_dir/gpu-ownership.txt"
   exit 42
 fi
-printf '%s\n' "available: container GPU 0 ($selected_gpu_uuid) has no compute process" \
+printf '%s\n' "available: host GPU $selected_host_gpu_index ($selected_gpu_uuid), mapped to container cuda:0, has no compute process" \
   > "$verification_dir/gpu-ownership.txt"
+timeout 30s ssh h100 \
+  "docker exec '$psi0_container' /workspace/Psi0/.venv/bin/python -c 'import torch; assert torch.cuda.is_available(); assert torch.cuda.device_count() >= 1; tensor = torch.ones(1, device=\"cuda:0\"); print(torch.cuda.get_device_name(0), float(tensor.item()))'" \
+  > "$verification_dir/container-cuda-probe.txt"
 ssh h100 "if test -d '$remote_source/.git'; then test \"\$(git -C '$remote_source' rev-parse HEAD)\" = '$psi0_commit' && test -z \"\$(git -C '$remote_source' status --porcelain)\"; else test ! -e '$remote_source' && git clone https://github.com/physical-superintelligence-lab/Psi0.git '$remote_source' && git -C '$remote_source' checkout --detach '$psi0_commit'; fi"
 ssh h100 "git -C '$remote_source' rev-parse HEAD && git -C '$remote_source' status --porcelain" > "$verification_dir/psi0-source.txt"
 ssh h100 "sha256sum '$remote_run/checkpoints/ckpt_40000/model.safetensors'" > "$verification_dir/checkpoint.sha256"
@@ -5336,11 +5660,17 @@ Expected: source HEAD equals the recorded commit with an empty status, the
 6,253,648,840-byte `model.safetensors` receives a SHA-256 manifest, health is
 200, and only the owned loopback tunnel exposes it locally. `/info` is recorded
 whether it returns 200 or 404; artifact lookup below handles either naming
-case. The executable ownership gate exits 42 before `remote_server_may_exist`
-is set whenever any compute PID already owns the UUID mapped to container GPU
-index 0; it never selects or terminates another user's process. A passing run
-records `available` and the selected UUID in `gpu-ownership.txt` before the
-server command. `remote_server_state` has exactly three
+case. Container `nvidia-smi` is deliberately not used: the named container
+currently reports `Failed to initialize NVML: Unknown Error`. Instead, the
+gate records Docker's device-request mapping, maps container `cuda:0` to the
+first declared host GPU ID (currently host device 2), and queries ownership
+with host-side `nvidia-smi`. It exits 42 before `remote_server_may_exist` is set
+whenever any compute PID already owns that exact host UUID; it never selects or
+terminates another user's process. The bounded PyTorch probe then proves that
+the container can enumerate and allocate on `cuda:0`; failure stops before
+server startup and means container GPU access must be repaired. A passing run
+records the mapping, host inventory/process evidence, CUDA probe output, and
+selected UUID before the server command. `remote_server_state` has exactly three
 results: `alive`, `stopped`, and `unknown`. SSH timeout, Docker failure,
 malformed output, or missing PID evidence yields `unknown`, exit code 125 from
 cleanup, and a manifest that cannot pass; only a confirmed failed `kill -0`
@@ -5468,6 +5798,7 @@ jq -n \
   --arg psi0_commit "$recorded_psi0_commit" \
   --arg checkpoint_path "$remote_run/checkpoints/ckpt_40000/model.safetensors" \
   --arg checkpoint_sha256 "$checkpoint_sha256" \
+  --arg selected_host_gpu_index "$selected_host_gpu_index" \
   --arg selected_gpu_uuid "$selected_gpu_uuid" \
   --arg artifact_path "$third_person_path" \
   --arg artifact_sha256 "$third_person_sha256" \
@@ -5485,6 +5816,8 @@ jq -n \
   --rawfile info_response "$verification_dir/info-response.txt" \
   --rawfile server_command "$verification_dir/server-command.txt" \
   --rawfile gpu_ownership "$verification_dir/gpu-ownership.txt" \
+  --rawfile container_device_requests "$verification_dir/container-device-requests.json" \
+  --rawfile container_cuda_probe "$verification_dir/container-cuda-probe.txt" \
   --rawfile eval_command "$verification_dir/eval-command.txt" \
   --slurpfile ffprobe "$verification_dir/third-person-ffprobe.json" \
   --slurpfile mujoco "$verification_dir/mujoco/report.json" \
@@ -5498,8 +5831,11 @@ jq -n \
     backend_reports: {mujoco: $mujoco[0], isaac: $isaac[0]},
     policy_server: {
       command: ($server_command | rtrimstr("\n")),
+      selected_host_gpu_index: $selected_host_gpu_index,
       selected_gpu_uuid: $selected_gpu_uuid,
       gpu_ownership: ($gpu_ownership | rtrimstr("\n")),
+      container_device_requests: ($container_device_requests | fromjson),
+      container_cuda_probe: ($container_cuda_probe | rtrimstr("\n")),
       health: ($health | rtrimstr("\n")),
       info_http_status: $info_status,
       info_response: ($info_response | rtrimstr("\n")),
@@ -5527,9 +5863,11 @@ jq -n \
   }' > "$verification_dir/manifest.json"
 
 jq -e '[.. | select(. == null)] | length == 0' "$verification_dir/manifest.json"
-jq -e '.policy_server.selected_gpu_uuid != "" and (.policy_server.gpu_ownership | startswith("available:"))' "$verification_dir/manifest.json"
+jq -e '.policy_server.selected_host_gpu_index | test("^[0-9]+$")' "$verification_dir/manifest.json"
+jq -e '.policy_server.selected_gpu_uuid != "" and (.policy_server.gpu_ownership | startswith("available:")) and (.policy_server.container_device_requests | length > 0) and (.policy_server.container_cuda_probe | length > 0)' "$verification_dir/manifest.json"
 jq -e '.evaluator.exit_code == 0 and .cleanup.tunnel_cleanup_exit_code == 0 and .cleanup.server_cleanup_exit_code == 0 and .cleanup.server_state == "stopped" and .cleanup.local_listener == false' "$verification_dir/manifest.json"
 jq -e 'all(.backend_reports[]; .marker_validation.marker_order_ok == true and .marker_validation.center_projection_ok == true and .marker_validation.clipping_ok == true and .effective_clipping_ok == true and .effective_clipping == [0.2, 5.0] and .backend_camera_contract.backend_camera_contract_ok == true and .backend_camera_contract.position_ok == true and .backend_camera_contract.quaternion_ok == true and .backend_camera_contract.resolution_ok == true and .backend_camera_contract.intrinsics_ok == true)' "$verification_dir/manifest.json"
+jq -e '.backend_reports.isaac.backend_camera_contract.parent_prim_ok == true and .backend_reports.isaac.backend_camera_contract.world_position_ok == true and .backend_reports.isaac.backend_camera_contract.world_quaternion_ok == true and .backend_reports.isaac.backend_camera_contract.world_pose_stable_ok == true and .backend_reports.isaac.backend_camera_contract.actual.parent_prim_path == "/World/workspace" and .backend_reports.isaac.backend_camera_contract.world_pose_stability.stable == true' "$verification_dir/manifest.json"
 jq -e '.artifact.ffprobe.streams | length == 1 and .[0].width == 640 and .[0].height == 360 and (.[0].nb_frames | tonumber) > 0 and (.[0].duration | tonumber) > 0' "$verification_dir/manifest.json"
 git status --short
 git log --oneline --decorate -12
