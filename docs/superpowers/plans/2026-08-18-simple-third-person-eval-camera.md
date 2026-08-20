@@ -126,7 +126,7 @@ test "$ruff_baseline_exit" -eq 1
 test "$format_baseline_exit" -eq 1
 ```
 
-Expected: the baseline records 46 existing Ruff findings and nine existing
+Expected: the baseline records 60 existing Ruff findings and 12 existing
 format deltas. Do not edit unrelated lines to clear them in this feature.
 
 ## Task 1: Make registry construction fresh through nested dependencies
@@ -493,15 +493,23 @@ def test_sensor_collision_fails_before_any_simulator_resource(monkeypatch):
         remove_live_task()
 
 
-def test_incompatible_mujoco_clipping_fails_before_resources(monkeypatch):
+@pytest.mark.parametrize("sim_mode", ["mujoco", "isaac", "mujoco_isaac"])
+def test_incompatible_camera_clipping_fails_before_resources(
+    monkeypatch, sim_mode
+):
     install_live_task()
     events = []
     install_fake_simulators(monkeypatch, events)
+    monkeypatch.setattr(
+        BaseDualSim,
+        "_init_isaac",
+        lambda self, headless, webrtc: events.append("init:isaac"),
+    )
     try:
         try:
             BaseDualSim(
                 "third-person-live-task",
-                sim_mode="mujoco",
+                sim_mode=sim_mode,
                 extra_sensor_cfgs={
                     "third_person": camera_cfg("third-person", near=0.3, far=5.0)
                 },
@@ -601,7 +609,7 @@ def _prepare_task_sensors(
             raise TypeError(f"evaluation sensor {name} must be CameraCfg")
         _validate_camera(name, cfg)
     merged = {**base, **extra}
-    if "mujoco" in sim_mode and "third_person" in extra:
+    if "third_person" in extra:
         expected = (extra["third_person"].near, extra["third_person"].far)
         for name, cfg in merged.items():
             if isinstance(cfg, CameraCfg) and not (
@@ -1030,7 +1038,94 @@ validate_video_options(
 )
 ```
 
-- [ ] **Step 5: Plumb the option through testable parent and worker builders**
+- [ ] **Step 5: Write worker-plumbing tests and verify RED**
+
+Add `import pytest` plus the two CLI module imports to the existing top-level
+test import block, then append these focused contracts before changing either
+CLI worker path:
+
+```python
+from simple.cli import eval as eval_cli
+from simple.cli import eval_decoupled_wbc as decoupled_cli
+
+
+def test_preimplementation_parent_worker_kwargs_contract() -> None:
+    from simple.evals.api import EvalConfig
+
+    config = EvalConfig(
+        env_id="simple/Probe-v0",
+        policy="psi0",
+        third_person_video=True,
+    )
+    ordinary = eval_cli._build_worker_kwargs(config)
+    decoupled = decoupled_cli._build_worker_kwargs(
+        config, sonic_config={"ENV_NAME": "simple"}
+    )
+    assert ordinary["third_person_video"] is True
+    assert decoupled["third_person_video"] is True
+
+
+@pytest.mark.parametrize("module", [eval_cli, decoupled_cli])
+def test_preimplementation_parent_process_start_contract(module) -> None:
+    calls = []
+
+    class FakeProcess:
+        def __init__(self, kwargs):
+            self.kwargs = kwargs
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    class FakeContext:
+        def Process(self, **kwargs):
+            calls.append(kwargs)
+            return FakeProcess(kwargs)
+
+    worker_kwargs = {"third_person_video": True}
+    process = module._start_worker_process(
+        FakeContext(),
+        worker_result_path="worker.pkl",
+        worker_id=0,
+        num_workers=1,
+        worker_kwargs=worker_kwargs,
+        log_path="worker.log",
+        progress_connection=object(),
+    )
+    assert process.started is True
+    assert calls[0]["args"][3] is worker_kwargs
+
+
+@pytest.mark.parametrize("module", [eval_cli, decoupled_cli])
+def test_preimplementation_worker_environment_contract(monkeypatch, module) -> None:
+    calls = []
+    monkeypatch.setattr(
+        module.gym,
+        "make",
+        lambda env_id, **kwargs: calls.append(kwargs) or object(),
+    )
+    module._make_worker_environment(
+        "simple/Probe-v0",
+        make_kwargs={"sim_mode": "mujoco"},
+        third_person_video=True,
+    )
+    camera = calls[0]["extra_sensor_cfgs"]["third_person"]
+    assert camera.uid == "simple_eval_third_person_v1"
+```
+
+Run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q -p no:cacheprovider \
+  tests/test_third_person_eval_camera.py \
+  -k 'preimplementation_parent or preimplementation_worker'
+```
+
+Expected: RED because `_build_worker_kwargs`, `_start_worker_process`, and
+`_make_worker_environment` do not yet exist.
+
+- [ ] **Step 6: Plumb the option through testable parent and worker builders**
 
 Add this Typer parameter to both `main` functions and both worker functions:
 
@@ -1171,20 +1266,17 @@ make_kwargs.update(
 
 Do not add an empty `extra_sensor_cfgs` mapping when disabled.
 
-- [ ] **Step 6: Add parent-to-worker and worker-to-environment regression tests**
+- [ ] **Step 7: Add broader parent-to-worker and worker-to-environment regression tests**
 
-Add these imports to the file's top-level import block. Append the exact CLI
-tests without mid-file imports:
+Add the remaining imports to the file's top-level import block. `pytest`,
+`eval_cli`, and `decoupled_cli` are already present from Step 5. Append the
+exact CLI tests without mid-file imports:
 
 ```python
 import inspect
 
-import pytest
 import typer
 from typer.testing import CliRunner
-
-from simple.cli import eval as eval_cli
-from simple.cli import eval_decoupled_wbc as decoupled_cli
 ```
 
 ```python
@@ -1325,14 +1417,15 @@ def test_both_workers_pass_fresh_environment_camera_kwargs(
     assert first.uid == second.uid == "simple_eval_third_person_v1"
 ```
 
-Add `import inspect`, `import pytest`, and the two CLI module imports used by
-the parametrized tests to the existing top-level import block. Do not import
-them between tests.
+Keep all imports from Steps 5 and 7 in the existing top-level import block. Do
+not import them between tests.
 The production parent must assign `worker_kwargs = _build_worker_kwargs(...)`
 before branching on `num_workers`; no branch may rebuild or mutate that
 dictionary. Both CLI parents must call `_start_worker_process`, so this test
 covers the complete parent path from the built dictionary through
 `_make_worker_process`, `ctx.Process`, and `Process.start()`.
+
+- [ ] **Step 8: Run the complete camera/config tests and verify GREEN**
 
 Run:
 
@@ -1344,7 +1437,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 
 Expected: all tests pass.
 
-- [ ] **Step 7: Commit camera/config plumbing**
+- [ ] **Step 9: Commit camera/config plumbing**
 
 ```bash
 git add src/simple/evals/third_person_camera.py src/simple/evals/api.py \
@@ -1376,10 +1469,14 @@ after `BaseDualSim._init_isaac` has created `SimulationApp`.
 ```python
 from types import SimpleNamespace
 
+import mujoco
 import numpy as np
+import transforms3d as t3d
 
 from simple.core.actor import CameraEntity
+from simple.engines.mujoco import MujocoSimulator
 from simple.envs.base_dual_env import BaseDualSim
+from simple.envs.sonic_loco_manip import SonicLocoManipEnv
 from simple.evals.third_person_camera import (
     analyze_verification_frame,
     apply_mujoco_clipping,
@@ -1501,6 +1598,95 @@ def test_every_environment_prepares_layout_before_backend_consumption() -> None:
         preparation = source.index("_reset_task_and_prepare_layout")
         assert preparation < source.index("mujoco.update_layout")
         assert preparation < source.index("isaac.update_layout")
+
+
+def test_mujoco_eye_in_world_attaches_to_worldbody() -> None:
+    simulator = MujocoSimulator.__new__(MujocoSimulator)
+    worldbody = object()
+    calls = []
+    simulator.mj_worldbody = worldbody
+
+    def record_camera(parent, camera, **kwargs):
+        calls.append((parent, camera, kwargs))
+
+    simulator._add_mujoco_camera = record_camera
+    camera = third_person_entity()
+    simulator._build_camera("third_person", camera)
+    parent, got_camera, kwargs = calls[0]
+    assert parent is worldbody
+    assert got_camera is camera
+    np.testing.assert_allclose(kwargs["pos"], camera.pose.position, atol=1e-7)
+
+
+def compile_third_person_camera_through_production_builder():
+    simulator = MujocoSimulator.__new__(MujocoSimulator)
+    spec = mujoco.MjSpec()
+    camera = third_person_entity()
+    simulator._add_mujoco_camera(
+        spec.worldbody,
+        camera,
+        name="third_person",
+        pos=camera.pose.position,
+        quat=t3d.quaternions.qmult(
+            camera.pose.quaternion,
+            t3d.quaternions.mat2quat(
+                np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]])
+            ),
+        ),
+    )
+    return spec.compile(), camera
+
+
+def test_production_builder_compiles_exact_camera_calibration() -> None:
+    model, camera = compile_third_person_camera_through_production_builder()
+    camera_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_CAMERA, "third_person"
+    )
+    assert camera_id >= 0
+    assert model.cam_resolution[camera_id].tolist() == [640, 360]
+    np.testing.assert_allclose(
+        model.cam_intrinsic[camera_id], [320.0, 320.0, 0.0, 0.0]
+    )
+    np.testing.assert_allclose(
+        model.cam_pos[camera_id], camera.pose.position, atol=1e-7
+    )
+    expected_quaternion = t3d.quaternions.qmult(
+        camera.pose.quaternion,
+        t3d.quaternions.mat2quat(
+            np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]])
+        ),
+    )
+    assert np.isclose(
+        abs(float(np.dot(model.cam_quat[camera_id], expected_quaternion))),
+        1.0,
+        atol=1e-7,
+    )
+
+
+def test_non_world_camera_without_intrinsics_keeps_legacy_fovy_path() -> None:
+    config = make_third_person_camera()
+    config.mount = "eye_on_base"
+    camera = CameraEntity("legacy", config)
+    simulator = MujocoSimulator.__new__(MujocoSimulator)
+    kwargs = simulator._mujoco_camera_intrinsic_kwargs(camera)
+    assert set(kwargs) == {"fovy"}
+    assert kwargs["fovy"] > 0.0
+
+
+def test_mixed_mode_selects_isaac_and_mujoco_only_selects_mujoco() -> None:
+    mujoco_frame = np.full((2, 3, 3), 11, dtype=np.uint8)
+    isaac_frame = np.full((2, 3, 3), 22, dtype=np.uint8)
+    env = SonicLocoManipEnv.__new__(SonicLocoManipEnv)
+    env.task = SimpleNamespace(metadata={})
+    env.mujoco = SimpleNamespace(render=lambda: {"third_person": mujoco_frame})
+    env.isaac = SimpleNamespace(render=lambda: {"third_person": isaac_frame})
+    np.testing.assert_array_equal(
+        env._render_frame()["third_person"], isaac_frame
+    )
+    env.isaac = None
+    np.testing.assert_array_equal(
+        env._render_frame()["third_person"], mujoco_frame
+    )
 ```
 
 - [ ] **Step 2: Run pure tests and verify RED without importing Isaac**
@@ -1514,7 +1700,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 ```
 
 Expected: the test process imports neither `carb` nor the Isaac engine, and
-the first command fails because the pure adapter/marker helpers do not exist.
+the first command fails because the pure adapter/marker helpers and reset hook
+do not exist.
 
 - [ ] **Step 3: Implement the backend-neutral adapter and marker contract**
 
@@ -1647,7 +1834,23 @@ def analyze_verification_frame(frame: np.ndarray) -> dict:
 Keep these helpers free of Isaac imports. Ruff may reflow the two long boolean
 expressions; `ruff format` is authoritative.
 
-- [ ] **Step 4: Inject verifier markers after every task reset and before backend consumption**
+- [ ] **Step 4: Rerun backend construction tests and verify focused RED**
+
+After adding the neutral helpers, run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q -p no:cacheprovider \
+  tests/test_third_person_eval_backends.py \
+  -k 'reinjected or prepares_layout or eye_in_world or production_builder or mixed_mode'
+```
+
+Expected: RED for the missing reset hook and `eye_in_world` branch. The
+fovy-only production builder must specifically fail
+`test_production_builder_compiles_exact_camera_calibration` because its
+compiled resolution is `[1, 1]` rather than `[640, 360]`.
+
+- [ ] **Step 5: Inject verifier markers after every task reset and before backend consumption**
 
 Add `_third_person_verification_markers: bool = False` as an explicit
 keyword-only `BaseDualSim.__init__` argument. Validate the flag against the
@@ -1701,10 +1904,51 @@ markers before either backend consumes it. The hook is private, absent from
 both evaluation CLIs, and used only by the backend verification script in Task
 10.
 
-- [ ] **Step 5: Implement MuJoCo camera, clipping, and visual-only markers**
+- [ ] **Step 6: Implement MuJoCo camera, clipping, and visual-only markers**
 
-Import `apply_mujoco_clipping` from the neutral module. Add the
-`eye_in_world` `_build_camera` branch before `eye_in_hand`:
+Import `apply_mujoco_clipping` from the neutral module. First make world-fixed
+cameras use MuJoCo's explicit pixel calibration even when their `CameraCfg`
+does not contain an `intrinsics` mapping. Preserve the legacy fovy-only path
+for all other cameras without explicit intrinsics:
+
+```python
+@staticmethod
+def _uses_explicit_mujoco_intrinsics(camera: CameraEntity) -> bool:
+    return camera.cam_cfg.intrinsics is not None or camera.mount == "eye_in_world"
+
+
+def _mujoco_camera_intrinsic_kwargs(
+    self, camera: CameraEntity
+) -> dict[str, Any]:
+    if not self._uses_explicit_mujoco_intrinsics(camera):
+        _, height = camera.resolution
+        fovy = 2 * np.arctan(height / (2 * camera.fy)) * 180 / np.pi
+        return {"fovy": fovy}
+
+    width, height = camera.resolution
+    return {
+        "fovy": 0.0,
+        "resolution": [int(width), int(height)],
+        "sensor_size": [float(width), float(height)],
+        "focal_pixel": [float(camera.fx), float(camera.fy)],
+        "principal_pixel": [
+            float(camera.cx - 0.5 * width),
+            float(camera.cy - 0.5 * height),
+        ],
+    }
+```
+
+Change the first guard in `_apply_mujoco_camera_intrinsics` to:
+
+```python
+if not self._uses_explicit_mujoco_intrinsics(camera):
+    return
+```
+
+Keep the remainder of `_apply_mujoco_camera_intrinsics` unchanged so the
+fallback path also writes resolution, sensor size, focal pixels, and principal
+pixels. Then add the `eye_in_world` `_build_camera` branch before
+`eye_in_hand`:
 
 ```text
 elif camera.mount == "eye_in_world":
@@ -1743,7 +1987,7 @@ table.add_geom(
 )
 ```
 
-- [ ] **Step 6: Implement Isaac adapter use, clipping, and visual-only markers**
+- [ ] **Step 7: Implement Isaac adapter use, clipping, and visual-only markers**
 
 Use `isaac_camera_parent_path` in `add_cameras`; construct all four candidate
 paths first, then select by mount. Replace the hard-coded clipping call with:
@@ -1791,47 +2035,15 @@ for actor_name, actor in self.task.layout.actors.items():
 No test in the ordinary `.venv` imports this module. Task 10 performs the
 initialized Isaac integration and reads the camera's effective clipping range.
 
-- [ ] **Step 7: Add MuJoCo construction and mixed-output unit coverage**
+- [ ] **Step 8: Run the complete backend suite and verify GREEN**
 
-Append these imports and tests to the existing backend test file:
+Run the Task 4 Step 2 commands again. Expected: all tests, including the
+production-builder compilation contract, pass. The compiled MuJoCo camera must
+report resolution `[640, 360]`, intrinsics `[320, 320, 0, 0]`, and the expected
+world pose/quaternion. The import sentinel proves the ordinary unit gate is
+independent of Isaac runtime packages.
 
-```python
-from simple.engines.mujoco import MujocoSimulator
-from simple.envs.sonic_loco_manip import SonicLocoManipEnv
-
-
-def test_mujoco_eye_in_world_attaches_to_worldbody() -> None:
-    simulator = MujocoSimulator.__new__(MujocoSimulator)
-    worldbody = object()
-    calls = []
-    simulator.mj_worldbody = worldbody
-    simulator._add_mujoco_camera = (
-        lambda parent, camera, **kwargs: calls.append((parent, camera, kwargs))
-    )
-    camera = third_person_entity()
-    simulator._build_camera("third_person", camera)
-    parent, got_camera, kwargs = calls[0]
-    assert parent is worldbody
-    assert got_camera is camera
-    np.testing.assert_allclose(kwargs["pos"], camera.pose.position, atol=1e-7)
-
-
-def test_mixed_mode_selects_isaac_and_mujoco_only_selects_mujoco() -> None:
-    mujoco_frame = np.full((2, 3, 3), 11, dtype=np.uint8)
-    isaac_frame = np.full((2, 3, 3), 22, dtype=np.uint8)
-    env = SonicLocoManipEnv.__new__(SonicLocoManipEnv)
-    env.task = SimpleNamespace(metadata={})
-    env.mujoco = SimpleNamespace(render=lambda: {"third_person": mujoco_frame})
-    env.isaac = SimpleNamespace(render=lambda: {"third_person": isaac_frame})
-    np.testing.assert_array_equal(env._render_frame()["third_person"], isaac_frame)
-    env.isaac = None
-    np.testing.assert_array_equal(env._render_frame()["third_person"], mujoco_frame)
-```
-
-Run the Task 4 Step 2 commands again. Expected: all tests pass, and the import
-sentinel proves the pure gate is independent of Isaac runtime packages.
-
-- [ ] **Step 8: Commit backend semantics**
+- [ ] **Step 9: Commit backend semantics**
 
 ```bash
 git add src/simple/evals/third_person_camera.py src/simple/envs/base_dual_env.py \
@@ -2798,12 +3010,23 @@ def test_construct_worker_stack_rolls_back_every_completed_stage(
 
 
 class FakeProcess:
-    def __init__(self, name, pid, events, *, terminate_error=None):
+    def __init__(
+        self,
+        name,
+        pid,
+        events,
+        *,
+        terminate_error=None,
+        survive_terminate=False,
+        survive_kill=False,
+    ):
         self.name = name
         self.pid = pid
         self._alive = True
         self.events = events
         self.terminate_error = terminate_error
+        self.survive_terminate = survive_terminate
+        self.survive_kill = survive_kill
 
     def is_alive(self):
         return self._alive
@@ -2812,14 +3035,16 @@ class FakeProcess:
         self.events.append((self.name, "terminate"))
         if self.terminate_error is not None:
             raise self.terminate_error
-        self._alive = False
+        if not self.survive_terminate:
+            self._alive = False
 
     def join(self, timeout):
         self.events.append((self.name, "join", timeout))
 
     def kill(self):
         self.events.append((self.name, "kill"))
-        self._alive = False
+        if not self.survive_kill:
+            self._alive = False
 
 
 def test_stop_workers_has_one_deadline_and_never_skips_cleanup(monkeypatch):
@@ -2836,20 +3061,57 @@ def test_stop_workers_has_one_deadline_and_never_skips_cleanup(monkeypatch):
         if pid == first.pid:
             first._alive = False
 
-    clock_values = iter([10.0, 76.0, 76.0, 82.0, 82.0, 82.0, 82.0])
+    now = [10.0]
+
+    def clock():
+        return now[0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
     monkeypatch.setattr(lifecycle.os, "kill", kill)
     failures = stop_worker_processes(
         processes,
         grace_seconds=65.0,
-        clock=lambda: next(clock_values),
-        sleep=lambda _: (_ for _ in ()).throw(
-            AssertionError("shared deadline should already be expired")
-        ),
+        clock=clock,
+        sleep=sleep,
     )
     assert [name for name, _ in failures] == ["third"]
     assert all(any(event[:2] == (proc.name, "join") for event in events) for proc in processes)
     assert ("third", "kill") in events
     assert all(not proc.is_alive() for proc in processes)
+
+
+def test_stop_workers_reports_a_child_that_survives_kill(monkeypatch):
+    events = []
+    survivor = FakeProcess(
+        "survivor",
+        104,
+        events,
+        survive_terminate=True,
+        survive_kill=True,
+    )
+    now = [20.0]
+
+    def clock():
+        return now[0]
+
+    def sleep(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr(lifecycle.os, "kill", lambda pid, signal_number: None)
+    failures = stop_worker_processes(
+        [survivor],
+        grace_seconds=0.0,
+        clock=clock,
+        sleep=sleep,
+    )
+    assert ("survivor", "kill") in events
+    assert any(
+        name == "survivor" and "survived SIGKILL" in str(error)
+        for name, error in failures
+    )
+    assert survivor.is_alive() is True
 
 
 class FakeConnection:
@@ -3068,11 +3330,24 @@ def stop_worker_processes(
                 process.kill()
             except Exception as error:
                 failures.append((process.name, error))
+    kill_deadline = clock() + 5.0
+    while any(is_alive(process) for process in processes) and clock() < kill_deadline:
+        sleep(min(0.05, max(0.0, kill_deadline - clock())))
     for process in processes:
         try:
-            process.join(timeout=max(0.0, termination_deadline - clock()))
+            process.join(timeout=max(0.0, kill_deadline - clock()))
         except Exception as error:
             failures.append((process.name, error))
+    for process in processes:
+        if is_alive(process):
+            failures.append(
+                (
+                    process.name,
+                    RuntimeError(
+                        f"worker {process.name} survived SIGKILL deadline"
+                    ),
+                )
+            )
     return failures
 
 
@@ -4094,10 +4369,10 @@ git commit -m "fix: finalize evaluation artifacts on every exit"
 
 - [ ] **Step 1: Write failing CLI parsing and report tests**
 
-Add `import json`, `import mujoco`, `import pytest`,
-`import transforms3d as t3d`, and the verifier import below to the top-level import block of
-`tests/test_third_person_eval_backends.py`, then append the literal tests
-without adding imports between test functions:
+Add `import json`, `import pytest`, and the verifier import below to the
+top-level import block of `tests/test_third_person_eval_backends.py`. The
+MuJoCo and transforms3d imports already exist from Task 4. Then append the
+literal tests without adding imports between test functions:
 
 ```python
 from scripts.verify_third_person_camera import (
@@ -4239,21 +4514,7 @@ def test_effective_clipping_reads_initialized_backend_without_importing_isaac():
 
 
 def test_mujoco_contract_reads_backend_applied_pose_intrinsics_and_resolution():
-    camera = third_person_entity()
-    q_isaac_mujoco = t3d.quaternions.mat2quat(
-        np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]])
-    )
-    quaternion = t3d.quaternions.qmult(
-        camera.pose.quaternion, q_isaac_mujoco
-    )
-    position = " ".join(str(value) for value in camera.pose.position)
-    orientation = " ".join(str(value) for value in quaternion)
-    model = mujoco.MjModel.from_xml_string(
-        f"""<mujoco><worldbody><camera name="third_person"
-        pos="{position}" quat="{orientation}" resolution="640 360"
-        focalpixel="320 320" principalpixel="0 0"
-        sensorsize="640 360"/></worldbody></mujoco>"""
-    )
+    model, camera = compile_third_person_camera_through_production_builder()
     env = SimpleNamespace(
         unwrapped=SimpleNamespace(
             task=SimpleNamespace(
@@ -4702,6 +4963,9 @@ legacy_modified_files=(
   src/simple/core/registry.py
   src/simple/core/task.py
   src/simple/envs/base_dual_env.py
+  src/simple/envs/tabletop_grasp.py
+  src/simple/envs/loco_manipulation.py
+  src/simple/envs/sonic_loco_manip.py
   src/simple/engines/isaacsim.py
   src/simple/engines/mujoco.py
   src/simple/envs/video_writer.py
@@ -5018,7 +5282,29 @@ trap cleanup_owned_infrastructure EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-ssh h100 "docker exec '$psi0_container' nvidia-smi --query-gpu=index,uuid,name,memory.used --format=csv,noheader && docker exec '$psi0_container' nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader" > "$verification_dir/h100-gpu-preflight.txt"
+timeout 15s ssh h100 \
+  "docker exec '$psi0_container' nvidia-smi --query-gpu=index,uuid,name,memory.used --format=csv,noheader" \
+  > "$verification_dir/h100-gpu-inventory.txt"
+timeout 15s ssh h100 \
+  "docker exec '$psi0_container' nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader" \
+  > "$verification_dir/h100-compute-apps.txt"
+selected_gpu_uuid="$(awk -F, '$1 ~ /^[[:space:]]*0[[:space:]]*$/ {gsub(/[[:space:]]/, "", $2); print $2}' "$verification_dir/h100-gpu-inventory.txt")"
+test -n "$selected_gpu_uuid"
+test "$(printf '%s\n' "$selected_gpu_uuid" | wc -l)" -eq 1
+if awk -F, -v selected="$selected_gpu_uuid" '
+  {
+    gpu_uuid=$1
+    gsub(/[[:space:]]/, "", gpu_uuid)
+    if (gpu_uuid == selected) found=1
+  }
+  END {exit found ? 0 : 1}
+' "$verification_dir/h100-compute-apps.txt"; then
+  printf '%s\n' "blocked: compute process already owns container GPU 0 ($selected_gpu_uuid)" \
+    > "$verification_dir/gpu-ownership.txt"
+  exit 42
+fi
+printf '%s\n' "available: container GPU 0 ($selected_gpu_uuid) has no compute process" \
+  > "$verification_dir/gpu-ownership.txt"
 ssh h100 "if test -d '$remote_source/.git'; then test \"\$(git -C '$remote_source' rev-parse HEAD)\" = '$psi0_commit' && test -z \"\$(git -C '$remote_source' status --porcelain)\"; else test ! -e '$remote_source' && git clone https://github.com/physical-superintelligence-lab/Psi0.git '$remote_source' && git -C '$remote_source' checkout --detach '$psi0_commit'; fi"
 ssh h100 "git -C '$remote_source' rev-parse HEAD && git -C '$remote_source' status --porcelain" > "$verification_dir/psi0-source.txt"
 ssh h100 "sha256sum '$remote_run/checkpoints/ckpt_40000/model.safetensors'" > "$verification_dir/checkpoint.sha256"
@@ -5050,9 +5336,11 @@ Expected: source HEAD equals the recorded commit with an empty status, the
 6,253,648,840-byte `model.safetensors` receives a SHA-256 manifest, health is
 200, and only the owned loopback tunnel exposes it locally. `/info` is recorded
 whether it returns 200 or 404; artifact lookup below handles either naming
-case. Inspect `h100-gpu-preflight.txt` before the server command and stop if
-container GPU index 0 already has an unrelated compute PID; do not select or
-terminate another user's process. `remote_server_state` has exactly three
+case. The executable ownership gate exits 42 before `remote_server_may_exist`
+is set whenever any compute PID already owns the UUID mapped to container GPU
+index 0; it never selects or terminates another user's process. A passing run
+records `available` and the selected UUID in `gpu-ownership.txt` before the
+server command. `remote_server_state` has exactly three
 results: `alive`, `stopped`, and `unknown`. SSH timeout, Docker failure,
 malformed output, or missing PID evidence yields `unknown`, exit code 125 from
 cleanup, and a manifest that cannot pass; only a confirmed failed `kill -0`
@@ -5180,6 +5468,7 @@ jq -n \
   --arg psi0_commit "$recorded_psi0_commit" \
   --arg checkpoint_path "$remote_run/checkpoints/ckpt_40000/model.safetensors" \
   --arg checkpoint_sha256 "$checkpoint_sha256" \
+  --arg selected_gpu_uuid "$selected_gpu_uuid" \
   --arg artifact_path "$third_person_path" \
   --arg artifact_sha256 "$third_person_sha256" \
   --arg task_verdict "$task_verdict" \
@@ -5195,6 +5484,7 @@ jq -n \
   --rawfile health "$verification_dir/health.json" \
   --rawfile info_response "$verification_dir/info-response.txt" \
   --rawfile server_command "$verification_dir/server-command.txt" \
+  --rawfile gpu_ownership "$verification_dir/gpu-ownership.txt" \
   --rawfile eval_command "$verification_dir/eval-command.txt" \
   --slurpfile ffprobe "$verification_dir/third-person-ffprobe.json" \
   --slurpfile mujoco "$verification_dir/mujoco/report.json" \
@@ -5208,6 +5498,8 @@ jq -n \
     backend_reports: {mujoco: $mujoco[0], isaac: $isaac[0]},
     policy_server: {
       command: ($server_command | rtrimstr("\n")),
+      selected_gpu_uuid: $selected_gpu_uuid,
+      gpu_ownership: ($gpu_ownership | rtrimstr("\n")),
       health: ($health | rtrimstr("\n")),
       info_http_status: $info_status,
       info_response: ($info_response | rtrimstr("\n")),
@@ -5235,6 +5527,7 @@ jq -n \
   }' > "$verification_dir/manifest.json"
 
 jq -e '[.. | select(. == null)] | length == 0' "$verification_dir/manifest.json"
+jq -e '.policy_server.selected_gpu_uuid != "" and (.policy_server.gpu_ownership | startswith("available:"))' "$verification_dir/manifest.json"
 jq -e '.evaluator.exit_code == 0 and .cleanup.tunnel_cleanup_exit_code == 0 and .cleanup.server_cleanup_exit_code == 0 and .cleanup.server_state == "stopped" and .cleanup.local_listener == false' "$verification_dir/manifest.json"
 jq -e 'all(.backend_reports[]; .marker_validation.marker_order_ok == true and .marker_validation.center_projection_ok == true and .marker_validation.clipping_ok == true and .effective_clipping_ok == true and .effective_clipping == [0.2, 5.0] and .backend_camera_contract.backend_camera_contract_ok == true and .backend_camera_contract.position_ok == true and .backend_camera_contract.quaternion_ok == true and .backend_camera_contract.resolution_ok == true and .backend_camera_contract.intrinsics_ok == true)' "$verification_dir/manifest.json"
 jq -e '.artifact.ffprobe.streams | length == 1 and .[0].width == 640 and .[0].height == 360 and (.[0].nb_frames | tonumber) > 0 and (.[0].duration | tonumber) > 0' "$verification_dir/manifest.json"
