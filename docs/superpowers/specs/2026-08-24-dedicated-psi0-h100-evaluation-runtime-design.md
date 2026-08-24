@@ -139,6 +139,22 @@ read-only. Runtime sets
 mounted. The container mounts this snapshot, never the mutable
 `/home/kube/psi0-train/repo` working tree.
 
+The reviewed seccomp JSON is materialized during that same freeze. The manager
+copies the exact committed `configs/psi0_h100_eval_seccomp_v1.json` bytes into
+server staging at `runtime-tools/psi0_h100_eval_seccomp_v1.json`; the
+privileged H100 installer publishes it as part of the protected source
+payload. The committed profile requires:
+
+```text
+container_seccomp_profile_host_path =
+  <source_snapshot_host_path>/runtime-tools/psi0_h100_eval_seccomp_v1.json
+```
+
+`container_seccomp_profile_sha256` is its file digest, while
+`source_installer_receipt_sha256` and `source_completion_sha256` bind its path,
+mode, bytes, complete containing tree, and protected publication. There is no
+mutable workspace copy, upload, or run-selected seccomp file in `create`.
+
 The checkpoint is frozen separately under:
 
 ```text
@@ -185,15 +201,27 @@ atomically rename and fsync both parents, then exclusively create/fsync the
 separately hashed manager-only completion metadata as the final mutation. Its
 durable receipt contains the final tree digest, manifest hash,
 completion-metadata hash, root identity, and mode-policy version; only this
-receipt may populate the candidate profile. Its
-fixed policy cannot install arbitrary source/destination paths or
+receipt may populate the candidate profile. The root-owned,
+lifecycle-readable but non-writable receipts are exclusively created at:
+
+```text
+/mnt/data01/jhkim/psi0-simple-eval-control/input-installations/
+  server/<source-tree-root-sha256>.json
+/mnt/data01/jhkim/psi0-simple-eval-control/input-installations/
+  checkpoint/<checkpoint-tree-root-sha256>.json
+```
+
+Their hashes are `source_installer_receipt_sha256` and
+`checkpoint_installer_receipt_sha256`; neither file is mounted in the
+container. The installer's fixed policy cannot install arbitrary
+source/destination paths or
 mutate an existing target. The lifecycle account has no general sudo or input-
 root write permission.
 
 The profile records the exact image digest and ID, server-tree digest, entry
 count/bytes, package-freeze hash, protected checkpoint snapshot and named
 weight identities, final mode-policy versions, external completion-metadata
-hashes, and both spot hashes. `freeze-provenance` writes a
+hashes, H100 installer-receipt hashes, and both spot hashes. `freeze-provenance` writes a
 candidate profile for explicit Git review; it does not update an existing
 profile or create a container.
 
@@ -209,6 +237,7 @@ source_tree_root_sha256: 64-character lowercase hexadecimal string
 source_entry_count: positive integer
 source_regular_file_bytes: positive integer
 source_completion_sha256: 64-character lowercase hexadecimal string
+source_installer_receipt_sha256: 64-character lowercase hexadecimal string
 source_mode_policy_version: positive integer
 package_freeze_sha256: 64-character lowercase hexadecimal string
 python_version: nonempty string
@@ -222,6 +251,7 @@ checkpoint_size: positive integer
 checkpoint_sha256: 64-character lowercase hexadecimal string
 checkpoint_tree_root_sha256: 64-character lowercase hexadecimal string
 checkpoint_completion_sha256: 64-character lowercase hexadecimal string
+checkpoint_installer_receipt_sha256: 64-character lowercase hexadecimal string
 checkpoint_mode_policy_version: positive integer
 checkpoint_tracer_path: absolute in-container path string
 checkpoint_tracer_sha256: 64-character lowercase hexadecimal string
@@ -230,6 +260,7 @@ checkpoint_tracer_argv_sha256: 64-character lowercase hexadecimal string
 checkpoint_tracer_probe_sha256: 64-character lowercase hexadecimal string
 checkpoint_tracer_probe_sentinel_sha256: 64-character lowercase hexadecimal string
 checkpoint_tracer_probe_argv_sha256: 64-character lowercase hexadecimal string
+container_seccomp_profile_host_path: absolute string beneath source_snapshot_host_path
 container_seccomp_profile_sha256: 64-character lowercase hexadecimal string
 container_security_contract_sha256: 64-character lowercase hexadecimal string
 server_source_sha256: 64-character lowercase hexadecimal string
@@ -245,6 +276,8 @@ pc2_source_tree_sha256: 64-character lowercase hexadecimal string
 pc2_venv_tree_sha256: 64-character lowercase hexadecimal string
 pc2_base_python_host_path: absolute string ending in pc2_base_python_tree_sha256
 pc2_base_python_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_loader_relative_path: normalized nonempty relative path with no dot segments
+pc2_base_python_loader_sha256: 64-character lowercase hexadecimal string
 pc2_base_python_completion_sha256: 64-character lowercase hexadecimal string
 pc2_base_python_root_identity_sha256: 64-character lowercase hexadecimal string
 pc2_base_python_installer_receipt_sha256: 64-character lowercase hexadecimal string
@@ -265,6 +298,13 @@ pc2_installer_config_sha256: 64-character lowercase hexadecimal string
 pc2_installer_service_unit_sha256: 64-character lowercase hexadecimal string
 pc2_installer_socket_unit_sha256: 64-character lowercase hexadecimal string
 pc2_installer_receipt_sha256: 64-character lowercase hexadecimal string
+pc2_runner_launcher_sha256: 64-character lowercase hexadecimal string
+pc2_runner_config_sha256: 64-character lowercase hexadecimal string
+pc2_runner_service_unit_sha256: 64-character lowercase hexadecimal string
+pc2_runner_socket_unit_sha256: 64-character lowercase hexadecimal string
+pc2_runner_sandbox_contract_sha256: 64-character lowercase hexadecimal string
+pc2_evaluator_uid: positive integer
+pc2_evaluator_gid: positive integer
 pc2_mode_policy_version: positive integer
 pc2_python_version: nonempty string
 pc2_torch_version: nonempty string
@@ -329,8 +369,9 @@ The required Docker configuration is:
 - `--cap-drop=ALL --cap-add=SYS_PTRACE`, no `--privileged`, no host PID
   namespace, and `--security-opt=no-new-privileges:true`;
 - the committed `configs/psi0_h100_eval_seccomp_v1.json` supplied through
-  `--security-opt=seccomp=<absolute-profile-path>`, with its exact bytes hashed
-  as `container_seccomp_profile_sha256`;
+  `--security-opt=seccomp=<container_seccomp_profile_host_path>` from the
+  protected H100 server snapshot, with its exact bytes hashed as
+  `container_seccomp_profile_sha256`;
 - fixed ownership labels for SIMPLE, the selected host GPU UUID, image ID, and
   runtime-contract version, seccomp digest, and canonical security-contract
   digest; and
@@ -342,8 +383,12 @@ checkpoint tracer added. It is never `unconfined`. The canonical security
 contract records the exact capability add/drop sets, seccomp digest,
 `no-new-privileges`, PID/IPC/network modes, read-only-root flag, and every
 tmpfs/mount setting; its digest is `container_security_contract_sha256`.
-Create and reuse compare the daemon-side inspect result field-for-field with
-that contract. Docker's default seccomp policy is an allowlist and may block
+The remote Docker CLI no-follow opens and hashes the exact protected host file
+immediately before `docker create`; Docker reads that H100-client path and
+sends its contents to the daemon. The helper reads/hashes it again after create
+and requires the source installer receipt/completion and full source tree to
+remain exact. Create and reuse compare the daemon-side inspect result and
+digest label field-for-field with that contract. Docker's default seccomp policy is an allowlist and may block
 `ptrace`, so merely adding `SYS_PTRACE` without the reviewed seccomp profile is
 not accepted; the security assumptions follow Docker's
 [seccomp documentation](https://docs.docker.com/engine/security/seccomp/).
@@ -439,8 +484,9 @@ container cgroup. Container-namespace and host PIDs are correlated through
 recorded namespace PID data; process name alone is never sufficient. The
 allowed set is the attested server PID and its fully recorded descendants.
 
-A process outside that set is foreign. The manager interrupts only its own
-evaluator, tunnel, and server resources and never signals the foreign GPU PID.
+A process outside that set is foreign. The manager requests interruption of
+only its runner-supervised evaluator and directly cleans only its owned tunnel
+and server resources; it never signals the foreign GPU PID.
 It may stop the dedicated container only after proving the foreign process is
 outside that container and every process inside the container is owned by the
 current lease. A foreign or unknown process inside the dedicated container
@@ -458,18 +504,19 @@ records the complete local compute-process table. No active compute process may
 use that UUID before the allocation probe or immediately before either
 episode.
 
-The allocation probe runs in a tracked, bounded subprocess with
-`CUDA_VISIBLE_DEVICES=1`. Through the CUDA runtime used by the sealed PC2
-environment's PyTorch, it must observe exactly one CUDA device, report its UUID
-equal to the selected physical UUID, allocate a small tensor on `cuda:0`, and
-synchronize successfully. The probe has a 30-second internal deadline plus a
-tracked PID and bounded INT/TERM/KILL cleanup; killing only a wrapper process
-is insufficient.
+The allocation probe runs as the runner supervisor's fixed `cuda_probe`
+operation in the same dedicated-UID/private-root sandbox and direct-loader
+path used for evaluation, with `CUDA_VISIBLE_DEVICES=1`. Through the CUDA
+runtime used by the sealed PC2 environment's PyTorch, it must observe exactly
+one CUDA device, report its UUID equal to the selected physical UUID, allocate
+a small tensor on `cuda:0`, and synchronize successfully. The probe has a
+30-second internal deadline plus an attested child PID and bounded
+supervisor-owned INT/KILL/reap; killing only a client process is insufficient.
 
 After the probe exits, the manager requires its GPU process to disappear. It
 rechecks GPU-1 process ownership before episode 2, after episode-2 cleanup,
 before episode 3, and after final cleanup. During an episode, only PIDs in the
-recorded evaluator process group/tree may appear on the selected UUID.
+runner's attested evaluator process group/tree may appear on the selected UUID.
 
 From immediately before evaluator launch through its final descendant-reaping
 check, an independent manager task polls the structured PC2 GPU process table
@@ -484,8 +531,9 @@ tree immediately makes the episode an infrastructure failure and initiates
 cleanup of only the owned evaluator/remote resources.
 
 A foreign process appearing at any gate is `FOREIGN_BLOCKED`: the manager may
-interrupt its own evaluator and clean up its own remote resources, but it never
-signals the foreign GPU process. GPU inventory, UUID, probe result, and
+request interruption of its own supervised evaluator and clean up its own
+remote resources, but it never signals the foreign GPU process. GPU inventory,
+UUID, probe result, and
 before/during/after process tables are mandatory evidence rather than values
 inferred from `CUDA_VISIBLE_DEVICES`.
 
@@ -533,7 +581,9 @@ hash, run ID, random 256-bit owner-token hash, host name, boot ID, owner PID and
 `/proc` start ticks, state, phase, staging and final resolved paths,
 `cleanup_required`, pending action, heartbeat monotonic/wall times, and last
 error. The lock is held through construction; the owner record is the
-write-ahead crash record and is fsynced before every filesystem mutation.
+write-ahead crash record and is fsynced before every filesystem mutation. The
+stable `pc2-construction.lock` inode is never replaced; only the owner-record
+path is atomically replaced on updates.
 Neither record is stored in the input closure or exposed to an evaluator.
 The fixed resolved paths, mount IDs, device/inode, owner/group, and modes of
 all four roots are committed as `pc2_roots_identity_sha256`; a replaced,
@@ -570,13 +620,27 @@ field. The socket unit uses `Accept=yes`, one request per connection, bounded
 message/idle timeouts, and no filesystem path supplied by the peer.
 
 Each connection sends exactly one length-bounded canonical JSON request plus
-the already locked owner-record FD via `SCM_RIGHTS`. The service obtains the
+the already locked stable construction-lock FD via `SCM_RIGHTS`. The service obtains the
 peer UID/PID with `SO_PEERCRED`, requires the operator-configured lifecycle UID
-and a live matching PID/start-ticks owner record, `fstat`s the received descriptor, proves that
-it is the configured owner-record inode, and independently opens that exact
-record and requires `flock(LOCK_EX|LOCK_NB)` to fail with `EWOULDBLOCK` while
-the received same-open-description FD remains live. It then binds the
-request's owner/recovery token to the durable record. The strict request
+and a live matching PID/start-ticks owner record, `fstat`s the received
+descriptor, and proves that it is the configured stable construction-lock
+inode. It independently opens that lock path and requires
+`flock(LOCK_EX|LOCK_NB)` to fail with `EWOULDBLOCK` while the received
+same-open-description FD remains live. Only then does it independently
+`openat2(..., RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` the current owner-record
+path, verify its regular-file inode/content/schema/token/phase and manager
+PID/start ticks, and bind its digest into the root journal. The manager is
+forbidden to advance its construction phase or change any token, identity,
+path, pending action, or cleanup field while the service transaction is live;
+it may atomically replace only the heartbeat timestamps while holding the same
+stable lock. The service's continued authority derives from that stable
+same-open-description lock FD and token-bound journal, not from retaining a
+replaceable owner-record inode.
+Closure operations accept only `pc2-construction.lock`; base-Python operations
+accept only `base-python-construction.lock`. Their device/inode identities are
+fixed in the installer configuration, and neither request may select a lock or
+owner-record path.
+The strict request
 operation is `install_closure`, `recover_closure`, `install_base_python`, or
 `recover_base_python`; it contains only schema version,
 operation, expected source/destination kind and operation-specific IDs,
@@ -613,7 +677,10 @@ Its separately hashed completion metadata is
 metadata files are outside the base payload/root digest and are required by
 the inherited-base-root preflight.
 The service's append-only, fsynced operation journals are likewise outside all
-payload hashes and inaccessible to the lifecycle account:
+payload hashes. They are root-owned and lifecycle-readable only through their
+exact token-derived paths after a terminal response; the lifecycle account
+cannot create, append, truncate, rename, or delete them, and the evaluator
+namespace cannot see them:
 
 ```text
 /mnt/data/psi0-simple-eval-inputs/.installer-journal/
@@ -657,8 +724,8 @@ compute the authoritative mode-inclusive manifests for `source`, `venv`,
 `episode-data`, and normalized `task-data`. It validates, normalizes to `0444`,
 and hashes the already complete `hssd-normalization-results.json`, then
 computes `pc2_runtime_identity_sha256`, whose canonical inputs include the
-protected base-Python tree/root/receipt and normalization-results digest. It
-writes the exact
+protected base-Python tree/root/receipt, loader hash, normalization-results
+digest, runner sandbox digest, and evaluator UID/GID. It writes the exact
 `runtime-identity.json` as owned mode `0444` and hashes that sidecar before
 writing `COMPLETE.json` as the completion metadata. The normalization-results
 file, identity sidecar, and completion marker are explicitly excluded from
@@ -672,15 +739,22 @@ The installer fsyncs all payloads and markers, removes `INCOMPLETE.json`, makes
 `COMPLETE.json` immutable to the lifecycle account, and makes the staging root
 `0555` last. It then atomically renames the now-final tree to the previously
 absent protected destination and fsyncs both parents. A durable installer
-service journal entry binds that rename to the operation token, and the manager
-durably advances its construction phase to `FINAL_RENAMED`. The service then
-exclusively creates/fsyncs the receipt, appends a token-bound
-`RECEIPT_CREATED` journal entry, and returns the authoritative hashes and final
-root identity. The manager requires that exact response and protected receipt
-before durably advancing to `RECEIPT_CREATED`; the candidate profile may use
-only that receipt, never earlier intake hashes. Only after the lifecycle
-manager reopens and revalidates the published root does its owner record enter
-`COMPLETE` with `cleanup_required=false`.
+service journal entry binds that rename to the operation token as
+`FINAL_RENAMED`. The service then exclusively creates/fsyncs the receipt and
+appends `RECEIPT_CREATED` before sending its one terminal response. The root
+journal is authoritative for these two privileged subphases; there is no
+intermediate manager acknowledgement or impossible mid-request owner-record
+update.
+
+After the terminal response, the manager independently opens the protected
+journal and receipt, validates their sequence/hash chain and response digest,
+then mirrors `FINAL_RENAMED` and `RECEIPT_CREATED` into two separately fsynced
+owner-record transitions. A crash before either mirror leaves the manager phase
+at `INSTALLING`; recovery derives the privileged progress only from the
+token-bound root journal. The candidate profile may use only the protected
+receipt, never earlier intake hashes. Only after the lifecycle manager reopens
+and revalidates the published root does its owner record enter `COMPLETE` with
+`cleanup_required=false`.
 
 Recovery is exact and never guesses ownership. A constructor seeing an active
 matching PID/start-ticks/boot-ID owner or held lock returns
@@ -690,8 +764,9 @@ token. A token-matching staging directory whose phase precedes `INSTALLING` is
 re-manifested for evidence and then removed before a fresh build; no glob or
 user-supplied path is accepted. At `INSTALLING`, `FINAL_RENAMED`, or
 `RECEIPT_CREATED`, recovery calls only the installer service's
-token/record-bound `recover_closure` operation, sending the claimed locked
-record FD, prior operation-token hash, and fresh recovery-token hash. If the final path is absent
+token/record-bound `recover_closure` operation, sending the claimed stable
+construction-lock FD, prior operation-token hash, and fresh recovery-token
+hash. If the final path is absent
 and the exact staging path contains a valid owner-token-bound `COMPLETE.json`
 whose final metadata and full manifests agree, the installer finishes the
 atomic rename rather than rebuilding; otherwise it removes only that exact
@@ -723,9 +798,9 @@ winner from concurrent constructors and recoverers.
 of a canonical, path-independent descriptor containing schema version, source
 commit/tree/gitlinks, ordered Git-object manifest, episode-data manifest,
 immutable pre-normalization task-asset requirements, task-data source manifest,
-protected base-Python tree/root/receipt identities, canonical
-mode/HSSD-normalization policy versions, the attested PC2 installer/config/
-service/socket-unit hashes, and hashes of the locked wheel/install inputs used to construct
+the path-independent base-Python payload-tree digest, canonical
+mode/HSSD-normalization policy versions, the attested path-independent PC2
+installer executable hash, and hashes of the locked wheel/install inputs used to construct
 the venv. Absolute installation paths and the resulting venv tree hash are not
 descriptor inputs. The descriptor selects the absent final directory; all
 components are built in staging, then the complete installed source/venv/data
@@ -733,6 +808,14 @@ trees are hashed and recorded separately in the candidate profile. Runtime
 requires `pc2_input_host_path` to equal the configured input root joined with exactly
 `pc2_closure_id`. This avoids a path/hash fixed point while keeping the closure
 name stable and reviewable.
+
+Location- and installation-bound fields are deliberately excluded from the
+closure descriptor: base/closure host paths, mount IDs, devices/inodes,
+root-identity digests, completion/receipt bytes, installer configuration and
+service/socket units, lifecycle/evaluator UIDs, and timestamps. They remain
+mandatory reviewed runtime provenance and may block adoption, but moving an
+otherwise byte-identical protected base tree or regenerating location-bound
+receipt metadata cannot change `pc2_closure_id`.
 
 The descriptor never contains a document that normalization later edits. Its
 `pc2_asset_requirements_sha256` names a frozen input document created before
@@ -776,8 +859,9 @@ the profile records that path/tree as `pc2_base_python_host_path` and
 `pc2_base_python_tree_sha256`, the external completion metadata as
 `pc2_base_python_completion_sha256`, its resolved protected root as
 `pc2_base_python_root_identity_sha256`, and the receipt as
-`pc2_base_python_installer_receipt_sha256`. All five are fixed descriptor
-inputs. The
+`pc2_base_python_installer_receipt_sha256`. Only the path-independent
+`pc2_base_python_tree_sha256` is a closure-descriptor input; the other four are
+location-bound runtime provenance. The
 shared development interpreter path recorded by the current `.venv/pyvenv.cfg`
 is an intake source only and is never an allowed runtime dependency.
 
@@ -803,7 +887,8 @@ BASE_FINAL_RENAMED -> BASE_RECEIPT_CREATED -> BASE_COMPLETE
 ```
 
 The protected base digest, completion metadata, root identity, and receipt are
-known before the closure descriptor is computed. Crash recovery uses the same
+validated before the closure descriptor is computed, but only the payload-tree
+digest contributes to that descriptor. Crash recovery uses the same
 locked-FD service protocol and token-bound exclusive receipt reconstruction as
 closure publication. An incomplete or contradictory base snapshot blocks
 closure construction; it is never adopted from an ambient interpreter path.
@@ -811,8 +896,9 @@ closure construction; it is never adopted from an ambient interpreter path.
 The dedicated venv is prepared in closure staging with no embedded staging or
 final closure path. Repo-local `.pth` entries use normalized relative paths from
 `site-packages` to sibling sealed source/submodule roots; evaluation invokes
-`venv/bin/python` directly and does not depend on generated absolute-shebang
-console scripts. `pyvenv.cfg` and interpreter links may reference only the
+`venv/bin/python` only as the sealed loader's program argument and does not
+depend on its external `PT_INTERP` or generated absolute-shebang console
+scripts. `pyvenv.cfg` and interpreter links may reference only the
 exact protected base-Python snapshot. A byte scan and structured inspection of
 `.pth`, `.egg-link`, scripts, configuration, and symlinks rejects either the
 staging prefix, the future final prefix, or any path outside the closure and
@@ -822,7 +908,8 @@ publication requires `simple`, `gear_sonic`,
 to resolve beneath the sealed source, and all third-party packages beneath the
 sealed venv or an explicitly hashed base-Python/standard-library root. The
 complete venv, base interpreter, package freeze, native-extension/shared-library
-closure, Isaac/MuJoCo versions, and NVIDIA driver/CUDA identities are recorded
+closure—including the copied dynamic loader and every user-space GPU/graphics
+library—Isaac/MuJoCo versions, and NVIDIA driver/CUDA identities are recorded
 both individually and in the canonical `pc2_runtime_identity_sha256` digest.
 Import-origin records store normalized paths relative to the closure root or
 attested base-Python root, never a staging/final absolute prefix. The staging
@@ -843,11 +930,13 @@ recursive_gitlinks_sha256: 64-character lowercase hexadecimal string
 pc2_closure_id: 64-character lowercase hexadecimal string
 pc2_source_tree_sha256: 64-character lowercase hexadecimal string
 pc2_base_python_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_loader_sha256: 64-character lowercase hexadecimal string
 pc2_base_python_root_identity_sha256: 64-character lowercase hexadecimal string
 pc2_asset_requirements_sha256: 64-character lowercase hexadecimal string
 pc2_asset_normalization_results_sha256: 64-character lowercase hexadecimal string
 pc2_runtime_identity_sha256: 64-character lowercase hexadecimal string
 pc2_closure_root_identity_sha256: 64-character lowercase hexadecimal string
+pc2_runner_sandbox_contract_sha256: 64-character lowercase hexadecimal string
 ```
 
 The sidecar sits outside the component trees whose digests it carries, so it
@@ -865,21 +954,26 @@ the exact profiled base-Python snapshot root with
 the sidecar relative to the closure root with
 `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`. It verifies all three
 descriptors, both completion markers/receipts, and exact profile identities,
-then passes them as `--runtime-root-fd`, `--runtime-base-python-root-fd`, and
+then transfers them to the runner supervisor as the closure-root,
+base-Python-root, and identity-sidecar FDs. The runner exposes the first two at
+the fixed private-root mountpoints and passes all three to the evaluator as
+`--runtime-root-fd`, `--runtime-base-python-root-fd`, and
 `--runtime-identity-fd`. The closure's `venv/bin/python` path must itself be
-beneath the closure FD; its fully resolved executable, `sys.base_prefix`,
-stdlib, and allowed base shared-library origins must remain beneath the
-protected base-Python FD. Working directory, repo-local imports, venv
-site-packages, episode data, and task data must remain beneath the closure FD.
-No interpreter/import origin may resolve beneath a third root.
+beneath the closure FD. Its executable bytes, `sys.base_prefix`, stdlib, and
+allowed shared-library origins must remain beneath the protected closure or
+base-Python FDs after private-root translation. Working directory, repo-local
+imports, venv site-packages, episode data, and task data must remain beneath
+the closure FD. No interpreter, mapping, or import origin may resolve beneath
+a third root.
 
-The evaluator requires each protected pathname's current mount/device/inode to
-equal the corresponding `fstat()` identity before exec, before worker spawn,
-before `runtime_contract`, and after environment close. It opens every checked
-path relative to the appropriate retained root descriptor and revalidates the
-closure-to-base-Python interpreter link at every gate. This is the only
-exception to the closure-beneath rule; an arbitrary external
-`.venv/pyvenv.cfg` target is rejected.
+The runner and evaluator require each protected pathname's current
+mount/device/inode to equal the corresponding `fstat()` identity before
+namespace construction, before exec, before worker spawn, before
+`runtime_contract`, and after environment close. Every checked path is opened
+relative to the appropriate retained root descriptor. The venv's intake
+base-Python reference may name only the profiled base payload, but runtime
+launch uses the sealed loader and private-root paths below; an arbitrary
+external `.venv/pyvenv.cfg` target is rejected.
 
 The lifecycle account cannot rename either protected parent or snapshot,
 restore write permission, or replace an entry. A missing/non-regular descriptor,
@@ -893,6 +987,135 @@ evaluator must report the original two root identities. A fixture that
 deliberately permits any one swap must be rejected, not silently execute
 closure/base snapshot B with identity A.
 
+#### Dedicated evaluator identity and sealed loader root
+
+The lifecycle manager never executes the evaluator as its own UID. An
+operator-provisioned root supervisor consists of the exact static executable
+`/usr/local/libexec/psi0-eval-run-pc2-evaluator` (root-owned mode `0555`),
+root-owned mode-`0444` configuration
+`/etc/psi0-simple-eval/pc2-runner-v1.json`, and systemd units
+`psi0-eval-pc2-runner.socket` and `psi0-eval-pc2-runner@.service`, recorded as
+`pc2_runner_launcher_sha256`, `pc2_runner_config_sha256`,
+`pc2_runner_socket_unit_sha256`, and `pc2_runner_service_unit_sha256`. Its
+fixed socket is `/run/psi0-simple-eval/evaluator-launcher.sock`. The lifecycle
+manager may open one bounded control connection; the dedicated evaluator UID/
+GID recorded as `pc2_evaluator_uid`/`pc2_evaluator_gid` is not a member of the
+installer, lifecycle, control, or staging groups and cannot connect to either
+privileged socket.
+
+The supervisor executable is a statically linked, no-`PT_INTERP`, no-
+`DT_NEEDED` binary. Its service namespace does not mount the installer socket
+or construction roots and its path policy permits only the fixed runner
+socket, reviewed profile, and read-only GPU/device metadata. Protected input
+and workload roots enter only as validated directory FDs and may be used only by
+the fixed child-mount operations below; the service cannot traverse their host
+parents or sibling paths. This keeps installer authority out of the runner
+service itself as well as out of its evaluator child.
+
+The runner service's canonical capability bounding/ambient sets are exact and
+contain only the reviewed namespace/mount, UID/GID drop, run-root ownership,
+and model-free probe tracing capabilities; all are cleared before evaluator
+exec. Its systemd filesystem allowlist and seccomp policy are part of
+`pc2_runner_sandbox_contract_sha256`. An added capability, writable host path,
+unit override, or executable dependency fails preflight.
+
+The manager sends one strict launch request plus exactly six FDs with
+`SCM_RIGHTS`: event-write, acknowledgement-read, closure-root,
+base-Python-root, identity-sidecar, and the configured workload-parent-root FD.
+The supervisor requires that sixth FD to match the profiled workload-parent
+inode, no-follow opens the exact `<run-id>` directory and its manager-created
+exclusive nonce marker, then exclusively creates
+`<run-id>/evaluator-output`, changes only that new child to the evaluator UID
+plus lifecycle evidence group, and mounts it at `/run-output`. The request
+contains only schema version, reviewed profile
+hash, operation (`loader_probe`, `cuda_probe`, or `evaluate_episode`), run ID,
+episode index/nonce/loopback port with exact operation-specific nullability,
+and the six expected FD-role labels. Only `evaluate_episode` accepts episode
+index `2` or `3`, a fresh nonce, and a loopback port; both probes require those
+three fields to be null. The supervisor validates `SO_PEERCRED`, the
+manager PID/start ticks, all FD identities, the reviewed profile, and every
+enumerated value. It constructs the fixed argv/environment from those values;
+it never accepts an arbitrary command, path, argument, or environment
+extension. It then supervises one child in a fresh process group, reports its
+PID/start ticks/process-group ID over the same connection, and accepts only
+bounded `INT`, `KILL`, status, and close messages for that child. The evaluator
+inherits only the five existing runtime/event FDs; it receives the run output
+as a mounted path, not an authority FD. The launcher control socket and every
+unrelated FD are close-on-exec. Losing the manager connection triggers the
+same bounded owned-child cleanup and terminal evidence.
+
+Before dropping privilege, the supervisor constructs a fresh mount namespace
+and pivots into a new empty tmpfs root. FD-backed, no-follow mounts expose only:
+
+| Sandbox path | Source | Access |
+| --- | --- | --- |
+| `/sealed/closure` | inherited closure-root FD | read-only, nodev, nosuid |
+| `/sealed/base-python` | inherited base-root FD | read-only, nodev, nosuid |
+| `/run-output` | supervisor-created evaluator-output child FD | read-write, noexec, nodev, nosuid |
+| `/tmp` | new bounded tmpfs | read-write, noexec, nodev, nosuid |
+| `/proc` | new proc mount | read-only except required process-self interfaces |
+| `/dev` and `/sys` | exact profiled GPU/device and read-only hardware allowlists | no executable regular files |
+| allowlisted `/etc` and `/usr/share` aliases | fixed paths below inherited base-root FD | read-only, nodev, nosuid |
+
+The host network namespace is retained only for the existing PC2 loopback
+tunnel. Host `/`, `/home`, `/mnt/data`, `/usr`, `/lib*`, `/etc/ld.so.cache`,
+manager control/staging, and `/run/psi0-simple-eval` are absent. The small
+private-root `/etc` and `/usr/share` alias manifest is fixed in the sandbox
+contract; every alias is a no-follow read-only bind from a named path beneath
+the protected base FD and can never resolve to the host tree. Required
+configuration/ICD files and every user-space GPU/graphics library are copied
+into that protected base-Python tree. After mount setup the child drops
+all supplementary groups and capabilities, sets the exact evaluator UID/GID,
+sets `PR_SET_NO_NEW_PRIVS`, applies the reviewed runner seccomp/device policy,
+and can write only `/run-output` and `/tmp`. The canonical namespace, UID/GID,
+mount, device, capability, seccomp, and environment document is
+`pc2_runner_sandbox_contract_sha256`.
+
+The base snapshot is a complete executable closure, not merely copied Python
+bytes. It contains the exact glibc loader at
+`pc2_base_python_loader_relative_path`, whose bytes are
+`pc2_base_python_loader_sha256`, plus every recursively resolved `DT_NEEDED`,
+RPATH/RUNPATH, Python-extension, Isaac/MuJoCo, CUDA/driver, Vulkan/GL, and
+explicit `dlopen` dependency. Intake rejects absolute or escaping dependency
+targets unless the sandbox maps that exact alias back into the protected base
+tree. The manager and supervisor each open the loader relative to their
+retained base FD with `openat2`, require both opens to identify the same
+profiled inode, verify it is an executable regular ELF with no `PT_INTERP`, and
+the supervisor invokes that already-open FD with
+`execveat(..., AT_EMPTY_PATH)`.
+The exact loader argv prefix is:
+
+```text
+<sealed-loader-fd>
+--inhibit-cache
+--library-path
+/sealed/closure/venv/lib:/sealed/base-python/lib:/sealed/base-python/lib64:/sealed/base-python/usr/lib:/sealed/base-python/usr/lib64
+--argv0
+/sealed/closure/venv/bin/python
+/sealed/closure/venv/bin/python
+```
+
+The kernel therefore never follows Python's intake `/lib64/ld-linux...`
+`PT_INTERP`; the sealed loader resolves the venv program and all libraries
+inside the private root. This uses the dynamic loader's documented direct
+invocation, `--inhibit-cache`, and `--library-path` behavior
+([`ld.so(8)`](https://man7.org/linux/man-pages/man8/ld.so.8.html)). Construction
+records the loader's glibc version and rejects a version without the profiled
+`--argv0` behavior. The runner's fixed model-free `loader_probe` operation runs
+the exact loader with `--verify` and `--list`, then starts `python -I -S` with
+the loader's `LD_DEBUG=files,libs` diagnostic captured on a dedicated bounded
+pipe. The static supervisor traces that probe's `openat`/`openat2` and mapping
+syscalls, resolves dirfds through its retained root FDs, and reconciles the
+trace, loader diagnostic, and `/proc/<pid>/maps`. Every regular-file-backed
+executable mapping and regular-file loader access must resolve beneath
+`/sealed/closure` or `/sealed/base-python`; the exact kernel pseudo-mappings
+and profiled anonymous/JIT mapping classes are recorded separately and may not
+name a host path. The run/tmp/proc/dev/sys mounts may contain no executable
+regular mapping. The same audit remains active through environment close.
+Missing dependencies, host-library/cache access, an
+external executable mapping, or a namespace/UID drift fails before
+`gym.make` and stops only the supervised evaluator.
+
 The ignored development path
 `data/evals/simple-eval/G1WholebodyXMovePickTeleop-v0/dr-level-0` is not assumed
 to be part of the Git snapshot. `freeze-provenance` copies it into the sealed
@@ -905,7 +1128,7 @@ its import and input paths.
 
 The simulator also consumes ignored repository-relative `data/` resources.
 The managed path adds one explicit process configuration seam:
-`SIMPLE_DATA_ROOT=<sealed-pc2-input>/task-data`. `simple.utils.get_data_dir()`
+`SIMPLE_DATA_ROOT=/sealed/closure/task-data`. `simple.utils.get_data_dir()`
 uses that absolute root when supplied and rejects a missing, relative,
 symlinked, writable, or out-of-closure value. The manager also sets
 `SIMPLE_ASSET_OFFLINE=1`, `HF_HUB_OFFLINE=1`, and
@@ -994,9 +1217,11 @@ The protected closure and base-Python pathnames are never substituted into an
 environment by string alone: the manager derives every displayed sealed path
 relative to the appropriate verified root FD, compares it with the protected
 canonical pathname, and retains both descriptors until the evaluator and all
-descendants exit. The PC2 input installer is unavailable to the evaluator run,
-so no owned process can
-publish or replace another closure during execution.
+descendants exit. The distinct evaluator UID has no path, group, socket,
+control-record, construction-lock, staging-root, or installer-journal access;
+none is mounted in its namespace. Only the lifecycle manager retains the
+separate installer and evaluator-supervisor connections, neither FD is passed
+through exec, and no evaluator descendant can publish or replace an input.
 
 The committed runtime profile contains the expected PC2 closure identities.
 Any dirty root/submodule, gitlink mismatch, escaping import, attempted asset
@@ -1004,7 +1229,14 @@ download/write, changed local environment/input, or pre/post manifest
 difference is
 `PROVENANCE_BLOCKED`. Run outputs and caches live only under the disjoint
 `/mnt/data/jihun/psi0-simple-eval-workloads/<run-id>` root and cannot make the
-sealed Git snapshot dirty.
+sealed Git snapshot dirty. The lifecycle manager exclusively creates that run
+root and nonce marker beneath the profiled workload parent. The runner
+supervisor validates the parent FD, run directory, and marker, exclusively
+creates only `<run-id>/evaluator-output`, assigns that child to the evaluator
+UID plus lifecycle evidence group, and mounts the child at `/run-output`. The
+evaluator cannot traverse the workload parent, manager evidence, or any sibling
+staging/run directory, while the manager retains read-only access to the
+evaluator-output evidence.
 
 ## Remote lease and concurrency
 
@@ -1323,18 +1555,19 @@ is not PASS.
 
 Before acquiring the remote lease, a read-only local phase verifies the
 approved profile commit/blob, sealed SIMPLE source and exact recursive
-gitlinks, PC2 installer socket/service identities, protected closure and
+gitlinks, PC2 installer and runner socket/service identities, protected closure and
 base-Python completion/receipts, construction owner record, closure/base/
-identity descriptors, venv/base interpreter/import/native closure,
-configured path roots, and initial PC2 GPU inventory. An incomplete or
+identity descriptors, venv/base loader/interpreter/import/native closure,
+runner UID/GID/private-root contract, configured path roots, and initial PC2
+GPU inventory. An incomplete or
 recoverable local construction is handled
 under the local construction lock before this read-only gate; unknown ownership
 fails closed. Failure reaches `PROVENANCE_BLOCKED` without touching H100
 control state.
 
 After the atomic lease is acquired, the remaining preflight is read-only except
-for the tracked PC2 CUDA allocation probe and completes before the container is
-started. Across the two phases it must:
+for the two tracked runner-supervised PC2 loader/CUDA probe children and
+completes before the container is started. Across the two phases it must:
 
 1. revalidate the current lease token and heartbeat;
 2. confirm bounded SSH connectivity and collect the remote host identity,
@@ -1342,11 +1575,13 @@ started. Across the two phases it must:
 3. attest the complete sealed PC2 source, exact clean recursive gitlinks,
    venv/protected-base-Python/native environment, episode data, task assets,
    immutable requirements, normalization results, import origins, and offline
-   data-root behavior against the profile;
+   data-root behavior against the profile; attest the runner binary/config/
+   units, dedicated evaluator UID/GID and private-root contract, and pass the
+   model-free direct-loader mapping/access probe;
 4. attest the H100 input-installer executable, protected source, `.venv`,
    offline HF snapshot, profiled checkpoint tracer and exact security/argv
-   contract, installer completion metadata, and failed
-   lifecycle-account write probe;
+   contract, protected seccomp host path/digest, source installer receipt and
+   completion metadata, and failed lifecycle-account write probe;
 5. attest the protected checkpoint snapshot, installer completion metadata,
    complete tree, exact weight relative path and file size/hash, and failed
    lifecycle-account write probe, plus both source spot hashes;
@@ -1573,18 +1808,19 @@ frozen `simple.evals.api.EvalConfig` field. Parent kwargs and worker kwargs must
 carry the exact path. When set, it replaces the derived global
 `data/evals/<policy>/...` video root; it does not change `--eval-dir`.
 
-The lifecycle manager always passes a new absolute path:
+The supervisor passes `/run-output/episode_<N>/videos`; its new host-side
+evidence path is:
 
 ```text
-<run-dir>/episode_<N>/videos
+<run-dir>/evaluator-output/episode_<N>/videos
 ```
 
 The worker creates the episode subdirectory beneath it, producing these exact
 per-camera paths:
 
 ```text
-<run-dir>/episode_<N>/videos/episode_<N>/<camera>.raw.mp4
-<run-dir>/episode_<N>/videos/episode_<N>/<camera>_<verdict>.mp4
+<run-dir>/evaluator-output/episode_<N>/videos/episode_<N>/<camera>.raw.mp4
+<run-dir>/evaluator-output/episode_<N>/videos/episode_<N>/<camera>_<verdict>.mp4
 ```
 
 The output root, episode directory, raw path, temporary transcode path, and
@@ -1627,49 +1863,95 @@ evaluation cameras; it does not implement the deferred third-person camera.
 ### Episode evaluation
 
 Episodes 2 and 3 run separately in ascending order, giving each an independent
-20-minute deadline and exit record. The command is based on the already proven
-episode-1 path:
+20-minute deadline and exit record. The supervisor, not the lifecycle account,
+constructs the following effective private-root environment from the reviewed
+runner configuration. `<N>`, `<run-id>`, `<episode-nonce>`, and `<local-port>`
+are the only enumerated launch-request substitutions; `PYTHONPATH` is the exact
+ordered sandbox-path list whose relative origins are in the profiled import
+manifest:
 
-```bash
-SIMPLE_DISABLE_TUI=1 CUDA_VISIBLE_DEVICES=1 \
-PYTHONDONTWRITEBYTECODE=1 \
-SIMPLE_DATA_ROOT=<sealed-pc2-input>/task-data \
-SIMPLE_ASSET_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-HOME=<run-dir>/generated-cache/home \
-TMPDIR=<run-dir>/generated-cache/tmp TMP=<run-dir>/generated-cache/tmp \
-TEMP=<run-dir>/generated-cache/tmp \
-XDG_CACHE_HOME=<run-dir>/generated-cache/xdg \
-MPLCONFIGDIR=<run-dir>/generated-cache/matplotlib \
-TORCH_HOME=<run-dir>/generated-cache/torch \
-TRITON_CACHE_DIR=<run-dir>/generated-cache/triton \
-OV_CACHE_DIR=<run-dir>/generated-cache/ov \
-CUDA_CACHE_PATH=<run-dir>/generated-cache/cuda \
-NUMBA_CACHE_DIR=<run-dir>/generated-cache/numba \
-PYTHONPATH=<sealed-source-and-submodule-paths> \
-  <sealed-pc2-venv>/bin/python -m simple.cli.eval_decoupled_wbc \
-  simple/G1WholebodyXMovePickTeleop-v0 psi0_decoupled_wbc train \
-  --data-format lerobot \
-  --data-dir <sealed-pc2-input>/episode-data \
-  --host 127.0.0.1 --port <local-port> \
-  --sim-mode mujoco_isaac --headless \
-  --eval-dir <run-dir>/episode_<N>/eval-logs \
-  --video-output-dir <run-dir>/episode_<N>/videos \
-  --runtime-evidence-path \
-    <run-dir>/episode_<N>/wbc-runtime-contract.json \
-  --runtime-evidence-run-id <run-id> \
-  --runtime-evidence-nonce <episode-nonce> \
-  --runtime-event-fd <inherited-write-fd> \
-  --runtime-ack-fd <inherited-read-fd> \
-  --runtime-root-fd <inherited-read-only-root-fd> \
-  --runtime-base-python-root-fd <inherited-read-only-base-python-root-fd> \
-  --runtime-identity-fd <inherited-read-only-identity-fd> \
-  --num-episodes 1 --episode-start <N> --num-workers 1 --save-video
+```text
+SIMPLE_DISABLE_TUI=1
+CUDA_VISIBLE_DEVICES=1
+PYTHONDONTWRITEBYTECODE=1
+SIMPLE_DATA_ROOT=/sealed/closure/task-data
+SIMPLE_ASSET_OFFLINE=1
+HF_HUB_OFFLINE=1
+TRANSFORMERS_OFFLINE=1
+HOME=/run-output/generated-cache/home
+TMPDIR=/run-output/generated-cache/tmp
+TMP=/run-output/generated-cache/tmp
+TEMP=/run-output/generated-cache/tmp
+XDG_CACHE_HOME=/run-output/generated-cache/xdg
+MPLCONFIGDIR=/run-output/generated-cache/matplotlib
+TORCH_HOME=/run-output/generated-cache/torch
+TRITON_CACHE_DIR=/run-output/generated-cache/triton
+OV_CACHE_DIR=/run-output/generated-cache/ov
+CUDA_CACHE_PATH=/run-output/generated-cache/cuda
+NUMBA_CACHE_DIR=/run-output/generated-cache/numba
+PYTHONPATH=<profiled sandbox source/submodule paths>
 ```
 
-The displayed environment assignments describe the manager's explicit
-subprocess environment; production passes an argv plus environment mapping and
-does not invoke a shell or an external `timeout` wrapper. The lifecycle manager
-owns the evaluator process-group deadline and escalation directly.
+The supervisor duplicates event-write, acknowledgement-read, closure-root,
+base-Python-root, and identity-sidecar FDs to fixed child descriptors `3`
+through `7`, opens the loader as launcher-only FD `8`, and executes this exact
+argv without a shell or external timeout wrapper:
+
+```text
+8
+--inhibit-cache
+--library-path
+/sealed/closure/venv/lib:/sealed/base-python/lib:/sealed/base-python/lib64:/sealed/base-python/usr/lib:/sealed/base-python/usr/lib64
+--argv0
+/sealed/closure/venv/bin/python
+/sealed/closure/venv/bin/python
+-m
+simple.cli.eval_decoupled_wbc
+simple/G1WholebodyXMovePickTeleop-v0
+psi0_decoupled_wbc
+train
+--data-format
+lerobot
+--data-dir
+/sealed/closure/episode-data
+--host
+127.0.0.1
+--port
+<local-port>
+--sim-mode
+mujoco_isaac
+--headless
+--eval-dir
+/run-output/episode_<N>/eval-logs
+--video-output-dir
+/run-output/episode_<N>/videos
+--runtime-evidence-path
+/run-output/episode_<N>/wbc-runtime-contract.json
+--runtime-evidence-run-id
+<run-id>
+--runtime-evidence-nonce
+<episode-nonce>
+--runtime-event-fd
+3
+--runtime-ack-fd
+4
+--runtime-root-fd
+5
+--runtime-base-python-root-fd
+6
+--runtime-identity-fd
+7
+--num-episodes
+1
+--episode-start
+<N>
+--num-workers
+1
+--save-video
+```
+
+The manager owns the episode deadline through the supervisor control protocol;
+only the supervisor may signal or reap the evaluator process group.
 
 There is no `--third-person-video` flag. The evaluator must retain
 `sim`/`lo`/domain 0 isolation and must not open a real Unitree interface.
@@ -1701,10 +1983,14 @@ recursive_gitlinks_sha256: 64-character lowercase hexadecimal string
 pc2_closure_id: 64-character lowercase hexadecimal string
 pc2_source_tree_sha256: 64-character lowercase hexadecimal string
 pc2_base_python_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_loader_sha256: 64-character lowercase hexadecimal string
 pc2_base_python_root_identity_sha256: 64-character lowercase hexadecimal string
 pc2_runtime_identity_sha256: 64-character lowercase hexadecimal string
 pc2_closure_root_identity_sha256: 64-character lowercase hexadecimal string
+pc2_runner_sandbox_contract_sha256: 64-character lowercase hexadecimal string
 runtime_identity_sidecar_sha256: 64-character lowercase hexadecimal string
+evaluator_uid: integer exactly pc2_evaluator_uid
+evaluator_gid: integer exactly pc2_evaluator_gid
 config: exact object {ENV_TYPE: string, INTERFACE: string, DOMAIN_ID: integer}
 status: exactly "validated" or "rejected"
 error: null for validated, nonempty string for rejected
@@ -1718,29 +2004,35 @@ calling `gym.make`. Unsafe values write `status="rejected"` and raise before
 `gym.make`; a preexisting final file, missing option, write failure, or invalid
 nonce also raises before `gym.make`.
 
-The ten source/closure/base identity values in this record come only from the
-validated inherited identity FD. The evaluator computes and retains the exact
-sidecar digest before spawning its worker, the worker carries the already
-parsed immutable object, and the manager binds that digest to the reviewed
-profile through the contract event and acknowledgement; no layer calls Git.
+The source, closure, base-loader, and runner identity values in this record
+come only from the validated inherited identity FD and supervisor launch
+record. The evaluator computes and retains the exact sidecar digest before
+spawning its worker, the worker carries the already parsed immutable object,
+and the manager binds that digest plus the supervisor-attested UID/GID and
+sandbox digest to the reviewed profile through the contract event and
+acknowledgement; no layer calls Git.
 Closing, replacing, or mutating the identity descriptor before the durable
 record and contract event are emitted produces a rejected contract and zero
 environment construction.
 
 The lifecycle manager creates a fresh event pipe and acknowledgement pipe and
-opens the verified protected closure root, protected base-Python root, and
-identity sidecar before each evaluator.
-It continuously drains the event read end, retains the acknowledgement write
-end, and passes only the opposite ends plus both read-only root FDs and the identity FD
-in `subprocess.Popen(..., pass_fds=...)`. All five FD options are required
-together and accepted only with
-`--num-workers 1`; the evaluator validates their direction/type and exact
-sidecar bytes, closes them on every exit path, and does not pass them to the
-simulator, policy client, or unrelated descendants. The existing in-process
-`progress_reporter` remains a TUI consumer but is not safety evidence. Every
-worker `report()` first emits one canonical JSON line to the manager event pipe
-with a single `os.write` no larger than `PIPE_BUF`, then invokes the optional
-TUI callback.
+opens the verified protected closure root, protected base-Python root,
+identity sidecar, and new empty run-output root before each evaluator. It
+continuously drains the event read end and retains the acknowledgement write
+end. It transfers only the opposite pipe ends plus the three read-only input
+FDs and configured workload-parent FD to the runner supervisor in the strict
+six-FD launch request. The supervisor creates/mounts the output child,
+duplicates only the five
+runtime/event FDs to descriptors 3--7, and performs the evaluator exec.
+
+All five evaluator FD options are required together and accepted only with
+`--num-workers 1`; the evaluator validates their direction/type, sandbox path
+bindings, and exact sidecar bytes, closes them on every exit path, and does not
+pass them to the simulator, policy client, or unrelated descendants. The
+existing in-process `progress_reporter` remains a TUI consumer but is not
+safety evidence. Every worker `report()` first emits one canonical JSON line
+to the manager event pipe with a single `os.write` no larger than `PIPE_BUF`,
+then invokes the optional TUI callback.
 
 Each event has the exact schema below and no additional keys or coerced types:
 
@@ -1750,7 +2042,7 @@ run_id: exact current run ID
 episode_index: integer exactly 2 or 3
 sequence: positive integer starting at 1 and increasing by one
 event: nonempty enumerated string
-evaluator_pid: exact positive subprocess PID
+evaluator_pid: exact positive supervisor-reported child PID
 worker_pid: exact positive PID, equal to evaluator_pid for num_workers=1
 created_at_monotonic_ns: positive integer
 payload: exact event-specific object
@@ -1760,8 +2052,11 @@ Allowed event payloads are exact: `runtime_contract` carries `status`,
 `record_sha256`, `file_device`, `file_inode`, `file_size`, `simple_commit`,
 `simple_root_tree`, `recursive_gitlinks_sha256`, `pc2_closure_id`,
 `pc2_source_tree_sha256`, `pc2_base_python_tree_sha256`,
+`pc2_base_python_loader_sha256`,
 `pc2_base_python_root_identity_sha256`, `pc2_runtime_identity_sha256`,
-`pc2_closure_root_identity_sha256`, and `runtime_identity_sidecar_sha256`; `worker_init`
+`pc2_closure_root_identity_sha256`, `pc2_runner_sandbox_contract_sha256`,
+`runtime_identity_sidecar_sha256`, `evaluator_uid`, and `evaluator_gid`;
+`worker_init`
 with `status="creating_env"` carries `total_episodes=1`, while
 `status="ready"` also carries finite `setup_seconds`, `max_episode_steps`, and
 `video_path`; `episode_start` carries `episode`; `episode_step` carries
@@ -1777,10 +2072,13 @@ The single acknowledgement line has exact keys `schema_version=1`, `run_id`,
 `episode_index`, `accepted_sequence`, `record_sha256`, `simple_commit`,
 `simple_root_tree`, `recursive_gitlinks_sha256`, `pc2_closure_id`,
 `pc2_source_tree_sha256`, `pc2_base_python_tree_sha256`,
+`pc2_base_python_loader_sha256`,
 `pc2_base_python_root_identity_sha256`, `pc2_runtime_identity_sha256`,
-`pc2_closure_root_identity_sha256`, and `runtime_identity_sidecar_sha256`; all
-identities must equal the profile, inherited sidecar, contract event, and
-durable file. No other acknowledgement bytes or keys are accepted.
+`pc2_closure_root_identity_sha256`, `pc2_runner_sandbox_contract_sha256`,
+`runtime_identity_sidecar_sha256`, `evaluator_uid`, and `evaluator_gid`; all
+identities must equal the profile, inherited sidecar, supervisor launch record,
+contract event, and durable file. No other acknowledgement bytes or keys are
+accepted.
 
 The manager appends validated lines to
 `episode_<N>/runtime-events.jsonl`, records receive time, and rejects a line
@@ -1817,20 +2115,24 @@ The manager accepts environment construction only after it has observed the
 contract event, validated the file, acknowledged it, and then observed
 `creating_env` at the next sequence. For rejection it
 requires `runtime_contract(rejected)` followed by `worker_error`, EOF, and zero
-`creating_env` event. Subprocess-boundary tests launch the actual evaluator CLI
-with both inherited pipes and a fake `gym.make`, proving validated and rejected
-ordering, acknowledgement failures, malformed-event/early-EOF handling, and
-that no in-process callback substitution can satisfy the manager.
+`creating_env` event. Process-boundary tests launch the actual evaluator CLI
+through the runner supervisor with both inherited pipes and a fake `gym.make`,
+proving validated and rejected ordering, acknowledgement failures,
+malformed-event/early-EOF handling, exact UID/private-root state, and that no
+in-process callback substitution can satisfy the manager.
 
 Before the next episode starts, the prior evaluator must have exited and its
 local worker/WBC children must be gone. If cleanup after one episode cannot be
 proven, the second episode is not started. A normal task-level failure may
 proceed to the next episode; an infrastructure or cleanup failure may not.
 
-Each evaluator is started as a new local process group. The recorded leader
-PID, leader process start time, process-group ID, and exact argv define local
-ownership. Worker and WBC descendants are enumerated from that group and the
-process tree; cleanup never matches processes by name alone.
+The runner supervisor starts each evaluator as a new local process group. Its
+attested launch response and `/proc` reconciliation record the leader PID,
+leader process start time, process-group ID, evaluator UID/GID, sandbox
+namespace identities, and exact argv. These define local ownership. Worker and
+WBC descendants are enumerated from that group and process tree; cleanup never
+matches processes by name alone, and the lifecycle manager requests signals
+through the supervisor rather than signaling the group itself.
 
 ## Deadlines and shutdown
 
@@ -1852,7 +2154,7 @@ stopped.
 | PC2 CUDA allocation/UUID probe | 30 s | 45 s process reconciliation |
 | Model process and TCP readiness | 300 s total | owned server reconciliation |
 | Warm-up `/act` response | 120 s | owned server reconciliation |
-| Each evaluator episode | 1200 s | 75 s owned process-group escalation |
+| Each evaluator episode | 1200 s | 75 s runner-supervised INT/KILL/reap |
 | Each FFmpeg finalization | 120 s | bounded owned signal stages |
 | Tunnel signal stage | 2 s each for INT, TERM, and KILL | fresh liveness check |
 | Checkpoint tracer detach/signal | 5 s each for INT, TERM, and KILL | preserve trace and verify server identity |
@@ -1862,7 +2164,8 @@ stopped.
 Cleanup is registered before each resource is started and executes in reverse
 order. It is attempted in this order:
 
-1. interrupt and reap the active evaluator and its owned children;
+1. request bounded interrupt/KILL/reap of the active evaluator and its owned
+   children through the runner supervisor, then close its control connection;
 2. close the SSH tunnel;
 3. detach or stop the exact owned checkpoint tracer if it remains, preserving
    its bounded trace and revalidating the server child;
@@ -1873,8 +2176,9 @@ order. It is attempted in this order:
    remaining workloads are owned by the current run; and
 7. verify local and remote postconditions.
 
-INT, TERM, and KILL are used only after ownership is revalidated at that
-stage. After KILL, a fresh bounded wait and liveness check are mandatory.
+Remote INT, TERM, and KILL, and local runner INT/KILL, are used only after
+ownership is revalidated at that stage. After KILL, a fresh bounded wait and
+liveness check are mandatory.
 Failure in one cleanup action is recorded but does not skip later actions.
 Terminal restoration, open log closure, and manifest finalization are
 unconditional even after the shared cleanup budget is exceeded.
@@ -1923,13 +2227,20 @@ preflight/
   profile-hash.json
   h100-roots-identity.json
   h100-input-installer.json
+  source-installer-receipt.json
+  checkpoint-installer-receipt.json
+  seccomp-profile.json
   container-identity.json
   pc2-construction-final.json
   pc2-input-installer.json
   pc2-installer-service.json
   pc2-installer-receipt.json
+  pc2-runner-service.json
+  pc2-runner-sandbox.json
   pc2-base-python-completion.json
   pc2-base-python-manifest.json
+  pc2-loader-closure.json
+  pc2-loader-probe.json
   pc2-base-python-root-before.json
   pc2-base-python-installer-receipt.json
   pc2-closure-descriptor.json
@@ -1980,11 +2291,11 @@ tunnel/
   tunnel.log
 episode_2/
   command.json
-  evaluator.log
-  wbc-runtime-contract.json
+  runner-process.json
+  executable-map-audit.json
+  filesystem-write-audit.json
   runtime-events.jsonl
   asset-probe.json
-  filesystem-write-audit.json
   h100-gpu-before.json
   h100-gpu-after.json
   pc2-gpu-before.json
@@ -1992,15 +2303,13 @@ episode_2/
   pc2-gpu-monitor.jsonl
   result.json
   artifacts.json
-  videos/episode_2/<camera>.raw.mp4
-  videos/episode_2/<camera>_<verdict>.mp4
 episode_3/
   command.json
-  evaluator.log
-  wbc-runtime-contract.json
+  runner-process.json
+  executable-map-audit.json
+  filesystem-write-audit.json
   runtime-events.jsonl
   asset-probe.json
-  filesystem-write-audit.json
   h100-gpu-before.json
   h100-gpu-after.json
   pc2-gpu-before.json
@@ -2008,6 +2317,14 @@ episode_3/
   pc2-gpu-monitor.jsonl
   result.json
   artifacts.json
+evaluator-output/episode_2/
+  evaluator.log
+  wbc-runtime-contract.json
+  videos/episode_2/<camera>.raw.mp4
+  videos/episode_2/<camera>_<verdict>.mp4
+evaluator-output/episode_3/
+  evaluator.log
+  wbc-runtime-contract.json
   videos/episode_3/<camera>.raw.mp4
   videos/episode_3/<camera>_<verdict>.mp4
 cleanup/
@@ -2022,6 +2339,8 @@ cleanup/
   pc2-closure-root-after.json
   pc2-base-python-root-after.json
   pc2-base-python-manifest-after.json
+  pc2-runner-final.json
+  pc2-executable-map-audit-final.json
   pc2-episode-data-after.json
   pc2-task-assets-after.json
   checkpoint-after.json
@@ -2031,6 +2350,14 @@ cleanup/
   processes-final.json
   ports-final.json
 ```
+
+Only `evaluator-output/` is mounted in the child namespace and writable by the
+evaluator UID. The manager owns and writes every other evidence path, drains
+events directly into the top-level `episode_<N>/runtime-events.jsonl`, and
+copies no manager-authored evidence into the child-writable tree. After the
+supervised child exits, it no-follow hashes and validates the explicitly
+allowlisted evaluator-output files before referencing them from manager-owned
+`artifacts.json` and the final manifest.
 
 JSON documents have a schema version and use atomic write-then-rename. The
 final manifest records every external command in redacted argv form, start and
@@ -2063,6 +2390,9 @@ Infrastructure PASS requires all of the following:
 - the digest-pinned image, attested input installer, and complete protected PSI0
   source plus `.venv` snapshot matched the committed profile before and after
   execution;
+- the protected H100 source installer receipt bound the exact reviewed seccomp
+  host path and bytes, Docker consumed that protected path, and its inspect
+  contract matched the same digest;
 - the protected checkpoint snapshot, external completion metadata, complete tree, and
   exact named weight relative path matched before startup and after all H100
   cleanup, and neither lifecycle account nor container could write it;
@@ -2071,8 +2401,9 @@ Infrastructure PASS requires all of the following:
   episode dataset, task-asset requirements plus normalization results, and
   driver identities matched the committed profile before and after execution;
 - the attested PC2 installer normalized metadata before authoritative hashes,
-  its root-owned socket/service and locked-FD peer/token contract matched, the
-  local construction record, explicit rename/receipt phases, and protected
+  its root-owned socket/service and stable-construction-lock-FD plus current-
+  owner-record peer/token contract matched, the local construction record,
+  authoritative root journal, mirrored rename/receipt phases, and protected
   completion/receipt metadata were valid, and lifecycle/evaluator accounts
   could not mutate or rename either protected snapshot;
 - the inherited protected closure-root, base-Python-root, and identity
@@ -2080,6 +2411,10 @@ Infrastructure PASS requires all of the following:
   and their identities matched every
   durable WBC record, contract event, and acknowledgement without consulting
   `.git`;
+- the attested runner executed under the dedicated evaluator UID/GID in the
+  exact private-root sandbox, exposed no installer/control/staging path, used
+  the protected loader by FD, and recorded no executable mapping or loader
+  access outside the closure/base roots;
 - both episode-specific offline asset probes covered their exact manifest
   subsets with zero download, write, network, or simulator construction;
 - the real `hssd:scene0` manager path used only normalized closure-local USD
@@ -2096,7 +2431,8 @@ Infrastructure PASS requires all of the following:
 - every PC2 episode GPU poll contained only exact evaluator descendants and no
   required poll was missed;
 - the canonical warm-up digest matched and returned a finite `(24, 36)` action;
-- both episode evaluator processes reached a normal recorded exit;
+- both runner-supervised episode evaluator processes reached a normal recorded
+  exit and their supervisor control sessions closed cleanly;
 - each episode produced a recorded SIMPLE verdict, retained raw stereo MP4s,
   and valid checked verdict MP4s under its unique run directory;
 - worker-emitted runtime evidence proved the actual WBC configuration was
@@ -2134,10 +2470,14 @@ new run ID and preserves all earlier evidence.
 - **Either GPU becomes busy between probes:** stop or avoid starting only the
   current run's resources. Never signal a foreign GPU process. Do not start the
   next episode until both GPUs pass their required gates.
-- **PC2 protected closure/base-root/FD mismatch or attempted swap:** fail before worker or
-  environment construction when possible, otherwise stop only the owned
-  evaluator; preserve both descriptor/path identities and never adopt the new
-  path.
+- **PC2 protected closure/base-root/FD mismatch, loader escape, or attempted
+  swap:** fail before worker or environment construction when possible;
+  otherwise request stop of only the owned evaluator through the runner.
+  Preserve descriptor/path/mapping identities and never adopt the new path.
+- **Runner identity, namespace, or authority failure:** reject launch before
+  exec, or stop/reap only the already supervised child. A missing runner
+  terminal record, surviving child, evaluator access to either privileged
+  socket/control root, or host-library mapping is cleanup failure.
 - **Checkpoint trace failure:** stop only the owned unchanged server/tracer,
   preserve the bounded raw trace, and fail readiness; never infer a successful
   load from the HTTP listener alone.
@@ -2148,10 +2488,12 @@ new run ID and preserves all earlier evidence.
   signal it or stop a container holding it.
 - **Server crash or invalid warm-up:** preserve the complete server log and
   clean up without launching an evaluator.
-- **Tunnel failure during evaluation:** interrupt the evaluator, then perform
-  normal cleanup; do not retry within the same run directory.
-- **Evaluator timeout:** use its bounded INT/KILL behavior, prove descendants
-  are gone, and do not start another episode unless cleanup passed.
+- **Tunnel failure during evaluation:** request runner-supervised evaluator
+  interrupt, then perform normal cleanup; do not retry within the same run
+  directory.
+- **Evaluator timeout:** use the runner's bounded INT/KILL behavior, prove the
+  child and descendants are gone, and do not start another episode unless
+  cleanup passed.
 - **Artifact, FFmpeg, or FFprobe failure:** preserve the raw and diagnostic
   temporary files, close every writer, and fail without deleting or replacing
   evidence.
@@ -2182,6 +2524,10 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
 - pairwise-disjoint H100 roots, every Docker bind alias, read-only input writes,
   inaccessible control paths, writable workload path, exact labels/mounts, and
   no published ports;
+- protected seccomp materialization beneath the source snapshot, exact
+  H100-host path/receipt/completion binding, no-follow pre/post create hashes,
+  Docker inspect digest equality, and refusal of a missing, mutable,
+  path-mismatched, or run-uploaded profile before `docker create`;
 - predetermined image-digest enforcement, complete source plus `.venv` manifest
   generation, protected snapshot installation, and rejection of a changed
   source file, dependency file, symlink, image, or protected checkpoint before
@@ -2227,14 +2573,30 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   between rename and receipt, and published revalidation, with no partial final
   closure and exact adoption only after a post-rename crash;
 - privileged PC2 installer transport through the root-owned Unix socket,
-  `SO_PEERCRED` plus one `SCM_RIGHTS` locked-record FD, strict request/response
-  schemas, lifecycle refusal to reconfigure/start the service, arbitrary-path/
-  extra-FD refusal, and exactly one token-bound receipt from two concurrent
-  post-rename recoverers;
+  `SO_PEERCRED` plus one `SCM_RIGHTS` stable construction-lock FD, independent
+  no-follow opening and token/PID/phase validation of the current owner record,
+  rejection of an owner-record FD masquerading as the lock, owner-record
+  invariant mutation during a live transaction, acceptance of heartbeat-only
+  atomic replacement while the same stable lock remains held, wrong lock
+  inode, arbitrary path, or extra FD, strict request/response schemas,
+  lifecycle refusal to
+  reconfigure/start the service, and exactly one token-bound receipt from two
+  concurrent post-rename recoverers;
+- authoritative root-journal sequencing of rename then exclusive receipt
+  creation before the one terminal response, manager mirroring of
+  `FINAL_RENAMED` and `RECEIPT_CREATED` only after journal/response validation,
+  and crash recovery before response plus before/after each mirror without an
+  intermediate protocol frame;
 - protected base-Python publication and recovery through every named phase,
   exact completion/root/receipt identities before closure-ID computation,
   venv interpreter-link resolution beneath the inherited base root FD, and
   rejection of the development `.venv/pyvenv.cfg` external target;
+- complete base executable closure discovery for the loader, Python, native
+  extensions, Isaac/MuJoCo, CUDA/driver, Vulkan/GL, and declared `dlopen`
+  dependencies; direct no-`PT_INTERP` loader `execveat`, exact
+  `--inhibit-cache`/`--library-path`/`--argv0` argv, model-free verify/list
+  probe, and rejection of any host `/lib*`, loader-cache, external mapping, or
+  regular-file access;
 - staging-independent relative venv links, rejection of embedded staging/final
   prefixes, successful imports after atomic publication, invalid final marker
   fail-closed behavior, and no deletion of unknown or live-owned paths;
@@ -2257,7 +2619,10 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
 - exact run-scoped HOME/temp/cache/Omni/Isaac/log environment and filesystem
   write audits rejecting every evaluator-created path outside its run root;
 - path-independent `pc2_closure_id` reproducibility, exact profile/path mapping,
-  proof that changing an absolute installation path cannot affect the ID,
+  proof that changing base/closure paths, mount/device/inode identities,
+  completion/receipt bytes, installer service/config/socket units, or
+  lifecycle/evaluator UIDs cannot affect the ID while their runtime provenance
+  still blocks mismatches,
   immutable pre-normalization requirements changing the ID, normalization
   result/mapping changes leaving the ID fixed but failing result provenance,
   and an exact requirements-hash/closure-ID link in every normalization result;
@@ -2270,19 +2635,33 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   raw retention after success and failure, checked transcode success,
   timeout/nonzero/malformed-output handling, and independent opposite-verdict
   retries;
-- exact runtime-evidence option/five-FD pairing and schema/type validation;
+- runner supervisor attestation and strict six-FD launch transport, exact
+  operation enums/nullability and episode substitutions, SO_PEERCRED manager
+  binding, fixed private-root mount table, dedicated evaluator UID/GID with no
+  installer/control/staging access, exact workload-parent inode plus run-marker
+  validation, exclusive evaluator-output creation and arbitrary output-FD/path
+  refusal,
+  fixed five-FD evaluator inheritance, evaluator-output-only writes, launcher socket
+  closure on exec, manager-disconnect cleanup, and arbitrary argv/environment/
+  FD refusal;
+- exact runtime-evidence option/five-FD evaluator pairing and schema/type
+  validation, including loader/sandbox/UID/GID identities;
 - unsafe `ENV_TYPE`, interface, and domain values each failing before
   `gym.make`, with the rejected record present and no `creating_env` event;
 - validated event order of durable evidence, `runtime_contract`,
   `worker_init(creating_env)`, then `gym.make`, plus rejected event order of
   durable evidence, `runtime_contract(rejected)`, then worker error;
-- actual manager/evaluator subprocess pipe/closure-root-FD/base-root-FD/
-  identity-FD transport with exact sequence and identity validation, plus malformed UTF-8/JSON,
+- actual manager/runner/evaluator event-pipe, acknowledgement-pipe,
+  closure-root-FD, base-root-FD, identity-FD, and workload-parent-FD transport with
+  exact supervisor PID/start/process-group response, sequence, private-root
+  identity validation, plus malformed UTF-8/JSON,
   partial/oversize write, silence, early EOF, and callback-only rejection;
 - same-account closure/base-Python swap attempts after descriptor open and
   before evaluator exec, requiring chmod/rename/unlink/symlink/lookalike
   substitutions to fail; a deliberately swappable fixture must fail the
-  corresponding root-FD/path/interpreter identity validation;
+  corresponding root-FD/path/loader identity validation, while the evaluator
+  UID independently proves it cannot invoke either privileged service or
+  traverse construction state;
 - missing, stale, replayed, wrong-PID, wrong-commit, wrong-nonce, and replaced
   runtime evidence rejection, plus independent valid records for episodes 2
   and 3;
@@ -2327,21 +2706,26 @@ The runtime is promoted through these gates in order:
    `freeze-provenance` to install both the protected
    server and protected checkpoint snapshots. Verify the PC2 closure ID and
    completion record, both complete H100 closures, exact checkpoint weight
-   relative path, failed write probes, and digest-qualified image, then commit
-   only the candidate profile as approval commit `P` without starting the
-   dedicated container;
+   relative path, protected seccomp path/receipt, failed write probes,
+   attested runner service/UID/GID/sandbox, complete loader closure, and
+   digest-qualified image, then commit only the candidate profile as approval
+   commit `P` without starting the dedicated container;
 3. inject and recover every local base-Python/closure-construction crash point,
    including final rename before receipt creation, then run
    two concurrent local constructors/recoverers and two concurrent normal
    remote lease probes, requiring exactly one winner in each race. Attempt the
    same-account post-descriptor-open closure/base-Python swap and require every
    mutation to fail while closure-root/base-root/identity FD bindings remain
-   exact. Exercise a simulated
+   exact. Exercise the strict six-FD runner launch with a model-free loader
+   verify/list and `python -I -S` mapping audit; require the evaluator UID to be
+   unable to reach installer/control/staging state. Exercise a simulated
    1,800-second remote mutation while heartbeats remain current, and release cleanly;
 4. run `status` and local/leased preflight, including path containment, mount
-   alias, GPU, remote-helper, and pre/post provenance checks;
-5. create the container, attest every mount alias, exact seccomp/capability
-   contract, in-container read-only/inaccessible probes, and harmless
+   alias, GPU, runner-service, loader/private-root, remote-helper, and pre/post
+   provenance checks;
+5. create the container using only the protected seccomp host path, attest its
+   receipt plus every mount alias and exact seccomp/capability contract, run
+   in-container read-only/inaccessible probes and the harmless
    interruptible tracer detach probe, then leave it exited without loading a
    model;
 6. create owned stale fixtures for each operation: an incomplete freeze staging
@@ -2361,7 +2745,9 @@ The runtime is promoted through these gates in order:
 9. run official episodes 2 and 3 and validate their run-scoped raw and checked
    standard stereo artifacts, independent WBC evidence, GPU evidence, lease
    release, manager event streams, continuous PC2/H100 GPU monitors, offline
-   asset/HSSD probes, inherited protected-closure/base-root/identity-FD bindings, filesystem write audits,
+   asset/HSSD probes, runner-supervised dedicated-UID/private-root launches,
+   inherited protected-closure/base-root/identity-FD bindings, sealed-loader
+   mapping audits, filesystem write audits,
    zero live remote helpers, and all post-run execution/protected-checkpoint
    closure manifests.
 
