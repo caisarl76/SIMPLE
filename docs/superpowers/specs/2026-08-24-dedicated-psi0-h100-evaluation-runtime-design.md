@@ -226,6 +226,12 @@ checkpoint_mode_policy_version: positive integer
 checkpoint_tracer_path: absolute in-container path string
 checkpoint_tracer_sha256: 64-character lowercase hexadecimal string
 checkpoint_tracer_version: nonempty string
+checkpoint_tracer_argv_sha256: 64-character lowercase hexadecimal string
+checkpoint_tracer_probe_sha256: 64-character lowercase hexadecimal string
+checkpoint_tracer_probe_sentinel_sha256: 64-character lowercase hexadecimal string
+checkpoint_tracer_probe_argv_sha256: 64-character lowercase hexadecimal string
+container_seccomp_profile_sha256: 64-character lowercase hexadecimal string
+container_security_contract_sha256: 64-character lowercase hexadecimal string
 server_source_sha256: 64-character lowercase hexadecimal string
 launcher_source_sha256: 64-character lowercase hexadecimal string
 h100_roots_identity_sha256: 64-character lowercase hexadecimal string
@@ -237,19 +243,27 @@ pc2_closure_id: 64-character lowercase hexadecimal string
 pc2_input_host_path: absolute string ending in pc2_closure_id
 pc2_source_tree_sha256: 64-character lowercase hexadecimal string
 pc2_venv_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_host_path: absolute string ending in pc2_base_python_tree_sha256
 pc2_base_python_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_completion_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_root_identity_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_installer_receipt_sha256: 64-character lowercase hexadecimal string
 pc2_package_freeze_sha256: 64-character lowercase hexadecimal string
 pc2_import_origins_sha256: 64-character lowercase hexadecimal string
 pc2_native_closure_sha256: 64-character lowercase hexadecimal string
 pc2_episode_data_tree_sha256: 64-character lowercase hexadecimal string
 pc2_task_assets_tree_sha256: 64-character lowercase hexadecimal string
 pc2_asset_requirements_sha256: 64-character lowercase hexadecimal string
+pc2_asset_normalization_results_sha256: 64-character lowercase hexadecimal string
 pc2_runtime_identity_sha256: 64-character lowercase hexadecimal string
 pc2_runtime_identity_sidecar_sha256: 64-character lowercase hexadecimal string
 pc2_closure_completion_sha256: 64-character lowercase hexadecimal string
 pc2_closure_root_identity_sha256: 64-character lowercase hexadecimal string
 pc2_roots_identity_sha256: 64-character lowercase hexadecimal string
 pc2_input_installer_sha256: 64-character lowercase hexadecimal string
+pc2_installer_config_sha256: 64-character lowercase hexadecimal string
+pc2_installer_service_unit_sha256: 64-character lowercase hexadecimal string
+pc2_installer_socket_unit_sha256: 64-character lowercase hexadecimal string
 pc2_installer_receipt_sha256: 64-character lowercase hexadecimal string
 pc2_mode_policy_version: positive integer
 pc2_python_version: nonempty string
@@ -298,7 +312,8 @@ restart policy, or a background service.
 
 On first creation, `create` may start the idle container only long enough to
 attest the in-container GPU UUID, offline dependency probe, mounts, and
-read-only behavior. It then stops the container and succeeds only after Docker
+read-only behavior, plus the model-free interruptible tracer detach probe. It
+then stops the container and succeeds only after Docker
 reports exact `exited` state. It never launches the policy server or leaves a
 new container in `created` state.
 
@@ -311,9 +326,27 @@ The required Docker configuration is:
 - no published or host-network ports;
 - private 64 GiB shared memory rather than host IPC;
 - a read-only root filesystem with explicit writable runtime locations;
+- `--cap-drop=ALL --cap-add=SYS_PTRACE`, no `--privileged`, no host PID
+  namespace, and `--security-opt=no-new-privileges:true`;
+- the committed `configs/psi0_h100_eval_seccomp_v1.json` supplied through
+  `--security-opt=seccomp=<absolute-profile-path>`, with its exact bytes hashed
+  as `container_seccomp_profile_sha256`;
 - fixed ownership labels for SIMPLE, the selected host GPU UUID, image ID, and
-  runtime-contract version; and
+  runtime-contract version, seccomp digest, and canonical security-contract
+  digest; and
 - the mounts below.
+
+The seccomp file is the reviewed Docker-default-compatible allowlist for the
+digest-pinned image with only the `ptrace` rule needed by the direct-child
+checkpoint tracer added. It is never `unconfined`. The canonical security
+contract records the exact capability add/drop sets, seccomp digest,
+`no-new-privileges`, PID/IPC/network modes, read-only-root flag, and every
+tmpfs/mount setting; its digest is `container_security_contract_sha256`.
+Create and reuse compare the daemon-side inspect result field-for-field with
+that contract. Docker's default seccomp policy is an allowlist and may block
+`ptrace`, so merely adding `SYS_PTRACE` without the reviewed seccomp profile is
+not accepted; the security assumptions follow Docker's
+[seccomp documentation](https://docs.docker.com/engine/security/seccomp/).
 
 | Host path | Container path | Access |
 | --- | --- | --- |
@@ -482,9 +515,19 @@ does not substitute for it. Its manager-only paths are:
 The protected input root is operator-provisioned beneath root-owned
 `/mnt/data`, not beneath the lifecycle account's writable
 `/mnt/data/jihun` directory. The configured PC2 input, control, and workload
-roots are same-host, pairwise-disjoint resolved roots. The protected input and
-workload staging roots must be on one device so publication can use atomic
-rename. Before creating a staging entry, the constructor obtains an exclusive `flock` and atomically
+roots are same-host, pairwise-disjoint resolved roots. A separately protected
+base-Python input root is also operator-provisioned at:
+
+```text
+/mnt/data/psi0-simple-eval-base-python/<base-python-tree-sha256>/
+```
+
+The lifecycle account cannot write or rename either protected parent. The
+closure input root, base-Python input root, and workload staging root must be
+on one device so both protected publications can use atomic rename. The exact
+four-root identity—closure input, base-Python input, manager control, and
+workload—is `pc2_roots_identity_sha256`. Before creating a staging entry, the
+constructor obtains an exclusive `flock` and atomically
 writes an exact owner record containing schema version, closure ID, descriptor
 hash, run ID, random 256-bit owner-token hash, host name, boot ID, owner PID and
 `/proc` start ticks, state, phase, staging and final resolved paths,
@@ -493,22 +536,69 @@ error. The lock is held through construction; the owner record is the
 write-ahead crash record and is fsynced before every filesystem mutation.
 Neither record is stored in the input closure or exposed to an evaluator.
 The fixed resolved paths, mount IDs, device/inode, owner/group, and modes of
-all three roots are committed as `pc2_roots_identity_sha256`; a replaced,
+all four roots are committed as `pc2_roots_identity_sha256`; a replaced,
 symlinked, cross-device, or unexpectedly permissive root fails before lock
 acquisition.
 
-Publication uses the root-owned, digest-attested executable
-`/usr/local/sbin/psi0-eval-install-pc2-input` through one narrow
-noninteractive argv. Its SHA-256 is recorded as
-`pc2_input_installer_sha256`. It accepts only the current constructor's
-inherited locked owner-record FD, exact owner token, resolved staging directory,
-expected closure descriptor, and absent destination for the same closure ID.
-It no-follow validates both roots and may rename only from the configured
-staging root to the configured protected input root. It cannot install an
-arbitrary path, replace an existing target, launch a process, or grant general
-sudo/input-root access. The final closure and parent are owned by a dedicated
-input UID, so the lifecycle/evaluator account cannot chmod, chown, unlink,
-rename, replace, or create any entry in them.
+Publication uses an operator-provisioned root service, not ambient `sudo`, a
+setuid executable, or a lifecycle-owned daemon. Systemd owns the root-only
+executable `/usr/local/libexec/psi0-eval-install-pc2-input`, the socket unit
+`psi0-eval-pc2-installer.socket`, and the service unit
+`psi0-eval-pc2-installer@.service`. Their exact hashes are recorded as
+`pc2_input_installer_sha256`, `pc2_installer_config_sha256`,
+`pc2_installer_socket_unit_sha256`, and
+`pc2_installer_service_unit_sha256`. The socket is fixed at
+`/run/psi0-simple-eval/pc2-installer.sock`, owned by root and writable only by
+the dedicated `psi0-eval-installer` group. The lifecycle account may connect
+to that socket but cannot start, stop, replace, reconfigure, or execute the
+service with another argv.
+
+The root-owned, mode-`0444` configuration contains only the four already
+profiled root identities, lifecycle UID/group, dedicated input UID/group,
+mode-policy version, request size/deadline limits, and journal/socket paths; its
+exact bytes are `pc2_installer_config_sha256`. Unit drop-ins, environment
+files, and runtime overrides are forbidden by preflight.
+
+The reviewed service unit fixes `User=root`, `NoNewPrivileges=yes`,
+`PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`,
+`ProtectSystem=strict`, an empty executable search path beyond the single
+attested installer, a capability bounding set limited to the ownership/mode
+operations it requires, and `ReadWritePaths` limited to the two protected
+input roots plus the token-derived workload staging root. It has no shell,
+Docker socket, SSH key, device access, network listener, or arbitrary command
+field. The socket unit uses `Accept=yes`, one request per connection, bounded
+message/idle timeouts, and no filesystem path supplied by the peer.
+
+Each connection sends exactly one length-bounded canonical JSON request plus
+the already locked owner-record FD via `SCM_RIGHTS`. The service obtains the
+peer UID/PID with `SO_PEERCRED`, requires the operator-configured lifecycle UID
+and a live matching PID/start-ticks owner record, `fstat`s the received descriptor, proves that
+it is the configured owner-record inode, and independently opens that exact
+record and requires `flock(LOCK_EX|LOCK_NB)` to fail with `EWOULDBLOCK` while
+the received same-open-description FD remains live. It then binds the
+request's owner/recovery token to the durable record. The strict request
+operation is `install_closure`, `recover_closure`, `install_base_python`, or
+`recover_base_python`; it contains only schema version,
+operation, expected source/destination kind and operation-specific IDs,
+descriptor/intake digest,
+owner-token hash, and recovery-token hash or null. No arbitrary path appears
+on the wire. The service derives both roots and exact token-named staging path
+from its root-owned configuration. Closure operations require the exact
+precomputed closure ID; `install_base_python` requires an intake ID and a null
+destination ID because the service's final mode-inclusive digest selects the
+absent target. Its strict response contains operation,
+token hashes, final tree/component hashes, completion hash, receipt hash, root
+identity, and terminal installer phase. Both messages reject additional keys,
+coercion, oversize frames, missing/extra FDs, and peer mismatch.
+
+The service no-follow validates all roots and may rename only from the
+configured staging root to the corresponding protected closure or base-Python
+root. It cannot replace an existing target, launch a workload, or confer
+general root/input-root access. The final snapshots and parents are owned by a
+dedicated input UID, so the lifecycle/evaluator account cannot chmod, chown,
+unlink, rename, replace, or create any entry in them. The locked FD survives
+the privilege boundary as the same open file description; there is no
+shell/`sudo` FD-preservation ambiguity.
 
 The installer's durable receipt is exclusively created at
 `/mnt/data/psi0-simple-eval-inputs/.installations/<pc2-closure-id>.json` under
@@ -516,6 +606,28 @@ a preprovisioned root-owned directory. It is outside the closure/component
 hashes, separately hashed in the profile, and cannot be removed or replaced by
 the lifecycle account. The mutable construction owner record is concurrency
 evidence only and can never override this protected receipt or `COMPLETE.json`.
+Base-Python receipts use the equally protected
+`/mnt/data/psi0-simple-eval-base-python/.installations/<tree-sha256>.json`.
+Its separately hashed completion metadata is
+`/mnt/data/psi0-simple-eval-base-python/.completions/<tree-sha256>.json`; both
+metadata files are outside the base payload/root digest and are required by
+the inherited-base-root preflight.
+The service's append-only, fsynced operation journals are likewise outside all
+payload hashes and inaccessible to the lifecycle account:
+
+```text
+/mnt/data/psi0-simple-eval-inputs/.installer-journal/
+  <pc2-closure-id>.<operation-token-sha256>.jsonl
+/mnt/data/psi0-simple-eval-base-python/.installer-journal/
+  <tree-sha256>.<operation-token-sha256>.jsonl
+```
+
+Journal records have exact sequence numbers and phases and are hash-chained to
+the request, owner/recovery tokens, source/destination identities, rename
+postcondition, and canonical receipt bytes. Every receipt field, including any
+recorded timestamp, is fixed in the pre-rename journal record; recovery never
+generates a new value. The service fsyncs a pending record before each
+privileged mutation and a result record afterward.
 
 Construction occurs only in the token-named staging directory. An
 `INCOMPLETE.json` marker is created and fsynced before its first child. The
@@ -523,7 +635,8 @@ phase enum is exact and monotonic:
 
 ```text
 ALLOCATED -> SOURCE -> EPISODE_DATA -> VENV -> TASK_DATA_COPY ->
-HSSD_NORMALIZED -> PAYLOAD_READY -> INSTALLING -> COMPLETE
+HSSD_NORMALIZED -> PAYLOAD_READY -> INSTALLING -> FINAL_RENAMED ->
+RECEIPT_CREATED -> COMPLETE
 ```
 
 The ordering is contractual: the dedicated venv is complete and probed before
@@ -541,25 +654,33 @@ ownership and mode policy to every component payload: directories `0555`,
 ordinary files `0444`, and only descriptor-allowlisted executable files
 `0555`; it then fsyncs them. Only after this metadata normalization does it
 compute the authoritative mode-inclusive manifests for `source`, `venv`,
-`episode-data`, and normalized `task-data`, followed by
-`pc2_runtime_identity_sha256`. It writes the exact `runtime-identity.json` as
-owned mode `0444`, hashes that sidecar, and then writes `COMPLETE.json` as the
-completion metadata. The sidecar and completion marker are explicitly excluded
-from every component payload-tree hash; the sidecar has its own profile hash,
-and the marker records the owner-token hash, descriptor, final component hashes,
-sidecar hash, closure-root device/inode/mount identity, canonical mode-policy
-version, and schema. Its own SHA-256 is
+`episode-data`, and normalized `task-data`. It validates, normalizes to `0444`,
+and hashes the already complete `hssd-normalization-results.json`, then
+computes `pc2_runtime_identity_sha256`, whose canonical inputs include the
+protected base-Python tree/root/receipt and normalization-results digest. It
+writes the exact
+`runtime-identity.json` as owned mode `0444` and hashes that sidecar before
+writing `COMPLETE.json` as the completion metadata. The normalization-results
+file, identity sidecar, and completion marker are explicitly excluded from
+every component payload-tree hash; the first two have their own profile hashes,
+and the marker records the owner-token hash, descriptor, final component
+hashes, normalization-results hash, sidecar hash, closure-root
+device/inode/mount identity, canonical mode-policy version, and schema. Its own SHA-256 is
 `pc2_closure_completion_sha256` in the profile.
 
 The installer fsyncs all payloads and markers, removes `INCOMPLETE.json`, makes
 `COMPLETE.json` immutable to the lifecycle account, and makes the staging root
 `0555` last. It then atomically renames the now-final tree to the previously
 absent protected destination and fsyncs both parents. A durable installer
-receipt under the protected control protocol returns the authoritative hashes
-and final root identity; the candidate profile may use only that receipt, never
-the earlier intake hashes. Only after the lifecycle manager reopens and
-revalidates the published root does its owner record enter `COMPLETE` with
-`cleanup_required=false`.
+service journal entry binds that rename to the operation token, and the manager
+durably advances its construction phase to `FINAL_RENAMED`. The service then
+exclusively creates/fsyncs the receipt, appends a token-bound
+`RECEIPT_CREATED` journal entry, and returns the authoritative hashes and final
+root identity. The manager requires that exact response and protected receipt
+before durably advancing to `RECEIPT_CREATED`; the candidate profile may use
+only that receipt, never earlier intake hashes. Only after the lifecycle
+manager reopens and revalidates the published root does its owner record enter
+`COMPLETE` with `cleanup_required=false`.
 
 Recovery is exact and never guesses ownership. A constructor seeing an active
 matching PID/start-ticks/boot-ID owner or held lock returns
@@ -567,30 +688,44 @@ matching PID/start-ticks/boot-ID owner or held lock returns
 is proven dead, one recoverer atomically claims the owner record with a fresh
 token. A token-matching staging directory whose phase precedes `INSTALLING` is
 re-manifested for evidence and then removed before a fresh build; no glob or
-user-supplied path is accepted. At `INSTALLING`, recovery calls only the
-installer's token/record-bound recovery operation. If the final path is absent
+user-supplied path is accepted. At `INSTALLING`, `FINAL_RENAMED`, or
+`RECEIPT_CREATED`, recovery calls only the installer service's
+token/record-bound `recover_closure` operation, sending the claimed locked
+record FD, prior operation-token hash, and fresh recovery-token hash. If the final path is absent
 and the exact staging path contains a valid owner-token-bound `COMPLETE.json`
 whose final metadata and full manifests agree, the installer finishes the
 atomic rename rather than rebuilding; otherwise it removes only that exact
-owned staging tree and restarts from `ALLOCATED`. If a valid
-`COMPLETE.json` final closure exists after a crash between rename and
-owner-record completion, recovery adopts it only after all hashes, permissions,
-descriptor, root identity, and sidecar agree, then marks the record complete. A final path
+owned staging tree and restarts from `ALLOCATED`. If a valid `COMPLETE.json`
+final closure exists but the protected receipt is absent after a crash between
+rename and receipt creation, the service alone may reconstruct the receipt. It
+requires the exact prior operation token in both `COMPLETE.json` and its
+root-owned journal, the fresh recovery token/locked claim, an absent receipt
+opened with `O_CREAT|O_EXCL`, and complete revalidation of the descriptor,
+authoritative manifests, permissions, root identity, and sidecar. It creates
+exactly the receipt bytes implied by that closure, fsyncs the receipt and
+directory, and records `RECEIPT_CREATED`. An existing receipt is adopted only
+when byte-identical; a mismatch blocks. Two concurrent recoverers cannot both
+hold the constructor lock, and exclusive receipt creation provides the second
+fence. If a valid `COMPLETE.json` final closure and valid receipt exist after a
+crash between receipt creation and owner-record completion, recovery adopts
+them only after all checks, then marks the record complete. A final path
 without valid completion metadata, invalid installing-stage metadata, a
 staging/final token mismatch, live unknown child, or any contradictory state is
 `PROVENANCE_BLOCKED` and is never automatically deleted. Construction tests
 inject a crash after allocation, every named manager and installer subphase,
 metadata normalization, every authoritative hash, sidecar/marker fsync, root
-mode change, rename, and published revalidation; they require either no final path or one
+mode change, rename, `FINAL_RENAMED`, exclusive receipt creation/fsync,
+`RECEIPT_CREATED`, and published revalidation; they require either no final path or one
 fully valid final closure, deterministic stale recovery, and exactly one
 winner from concurrent constructors and recoverers.
 
 `pc2-closure-id` is computed before the destination exists. It is the SHA-256
 of a canonical, path-independent descriptor containing schema version, source
 commit/tree/gitlinks, ordered Git-object manifest, episode-data manifest,
-task-asset-requirement manifest, task-data source manifest, base-Python tree
-identity, canonical mode/HSSD-normalization policy versions, the attested PC2
-installer hash, and hashes of the locked wheel/install inputs used to construct
+immutable pre-normalization task-asset requirements, task-data source manifest,
+protected base-Python tree/root/receipt identities, canonical
+mode/HSSD-normalization policy versions, the attested PC2 installer/config/
+service/socket-unit hashes, and hashes of the locked wheel/install inputs used to construct
 the venv. Absolute installation paths and the resulting venv tree hash are not
 descriptor inputs. The descriptor selects the absent final directory; all
 components are built in staging, then the complete installed source/venv/data
@@ -598,6 +733,26 @@ trees are hashed and recorded separately in the candidate profile. Runtime
 requires `pc2_input_host_path` to equal the configured input root joined with exactly
 `pc2_closure_id`. This avoids a path/hash fixed point while keeping the closure
 name stable and reviewable.
+
+The descriptor never contains a document that normalization later edits. Its
+`pc2_asset_requirements_sha256` names a frozen input document created before
+the closure ID: logical resource names, original source identities, recursive
+dependencies/content hashes, and the required normalizer policy/version. It
+contains no generated output hash or old-to-new mapping and becomes read-only
+before staging is named. `HSSD_NORMALIZED` instead creates a distinct
+`hssd-normalization-results.json` containing the requirements digest, closure
+ID, exact USD/Sdf tool identity, source/normalized layer hashes, and ordered
+old-to-new mappings. Its digest is
+`pc2_asset_normalization_results_sha256`; it is not an input to
+`pc2_closure_id`. The results file sits beside the runtime-identity sidecar,
+is excluded from component tree hashes, and is separately normalized,
+read-only, hashed, and bound into `runtime-identity.json`, `COMPLETE.json`, the
+installer receipt, profile, and pre/post evidence. Thus a requirement or
+policy change selects a new closure ID, while deterministic result bytes are
+verified as outputs without a digest cycle. The canonical results schema has
+no timestamp, host/staging path, inode, or unordered mapping; repeated
+normalization of identical requirements/tool identities must produce
+byte-identical results.
 
 The source snapshot contains only files tracked by the exact SIMPLE commit and
 every recursively initialized submodule at the exact gitlink recorded by that
@@ -610,12 +765,55 @@ artifacts must be moved outside the worktree before this gate; they are never
 silently allowlisted. The snapshot is then copied from Git object identities,
 not worktree paths, and verified with a complete canonical file manifest.
 
-The dedicated venv is prepared in staging with no embedded staging or final
-closure path. Repo-local `.pth` entries use normalized relative paths from
+Before computing a closure descriptor, the constructor prepares or adopts one
+separate protected base-Python snapshot. The privileged installer service
+publishes the fully resolved CPython executable, standard library, and native
+runtime dependency closure beneath
+`/mnt/data/psi0-simple-eval-base-python/<pc2_base_python_tree_sha256>` using
+the same final-metadata-first manifest algorithm and a distinct completion
+marker/receipt. The final mode-inclusive tree digest selects its directory;
+the profile records that path/tree as `pc2_base_python_host_path` and
+`pc2_base_python_tree_sha256`, the external completion metadata as
+`pc2_base_python_completion_sha256`, its resolved protected root as
+`pc2_base_python_root_identity_sha256`, and the receipt as
+`pc2_base_python_installer_receipt_sha256`. All five are fixed descriptor
+inputs. The
+shared development interpreter path recorded by the current `.venv/pyvenv.cfg`
+is an intake source only and is never an allowed runtime dependency.
+
+Base-Python publication has its own write-ahead record and exact monotonic
+phases:
+
+```text
+/mnt/data/jihun/psi0-simple-eval-control/base-python-construction.lock
+/mnt/data/jihun/psi0-simple-eval-control/base-python-constructions/
+  <base-python-intake-sha256>.json
+/mnt/data/jihun/psi0-simple-eval-workloads/input-staging/
+  base-python.<base-python-intake-sha256>.<owner-token>/
+```
+
+The intake identity is path-independent and known before staging allocation.
+The owner/heartbeat/claim schema and locking rules are identical to closure
+construction, with intake ID replacing closure ID. Its exact monotonic phases
+are:
+
+```text
+BASE_ALLOCATED -> BASE_COPIED -> BASE_METADATA_NORMALIZED ->
+BASE_FINAL_RENAMED -> BASE_RECEIPT_CREATED -> BASE_COMPLETE
+```
+
+The protected base digest, completion metadata, root identity, and receipt are
+known before the closure descriptor is computed. Crash recovery uses the same
+locked-FD service protocol and token-bound exclusive receipt reconstruction as
+closure publication. An incomplete or contradictory base snapshot blocks
+closure construction; it is never adopted from an ambient interpreter path.
+
+The dedicated venv is prepared in closure staging with no embedded staging or
+final closure path. Repo-local `.pth` entries use normalized relative paths from
 `site-packages` to sibling sealed source/submodule roots; evaluation invokes
 `venv/bin/python` directly and does not depend on generated absolute-shebang
 console scripts. `pyvenv.cfg` and interpreter links may reference only the
-explicitly attested base-Python root. A byte scan and structured inspection of
+exact protected base-Python snapshot. A byte scan and structured inspection of
 `.pth`, `.egg-link`, scripts, configuration, and symlinks rejects either the
 staging prefix, the future final prefix, or any path outside the closure and
 attested base-Python roots. A clean import-origin probe after atomic
@@ -644,6 +842,10 @@ simple_root_tree: 40-character lowercase Git tree SHA
 recursive_gitlinks_sha256: 64-character lowercase hexadecimal string
 pc2_closure_id: 64-character lowercase hexadecimal string
 pc2_source_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_root_identity_sha256: 64-character lowercase hexadecimal string
+pc2_asset_requirements_sha256: 64-character lowercase hexadecimal string
+pc2_asset_normalization_results_sha256: 64-character lowercase hexadecimal string
 pc2_runtime_identity_sha256: 64-character lowercase hexadecimal string
 pc2_closure_root_identity_sha256: 64-character lowercase hexadecimal string
 ```
@@ -657,29 +859,39 @@ the installer verifies that expected identity after applying the root mode and
 atomic rename. Runtime never derives commit identity from `.git`, the current
 worktree, an environment variable, or a CLI string.
 
-Before evaluator launch, the manager opens the protected closure root with
-`O_PATH|O_DIRECTORY|O_NOFOLLOW`, obtains its mount ID/device/inode, and opens
-the sidecar relative to that root with `openat2(RESOLVE_BENEATH |
-RESOLVE_NO_SYMLINKS)`. It verifies both descriptors, the completion marker,
-installer receipt, and exact profile identities, then passes the already-open
-root and sidecar descriptors as `--runtime-root-fd` and
-`--runtime-identity-fd`. The evaluator requires `stat()` of its interpreter,
-working directory, source/import roots, episode data, and task data to remain
-beneath the same protected pathname and requires the pathname's current root
-identity to equal `fstat(runtime_root_fd)` before worker spawn, before
-`runtime_contract`, and after environment close. All repo-local import origins
-are rechecked against that root FD identity.
+Before evaluator launch, the manager opens both the protected closure root and
+the exact profiled base-Python snapshot root with
+`O_PATH|O_DIRECTORY|O_NOFOLLOW`, obtains each mount ID/device/inode, and opens
+the sidecar relative to the closure root with
+`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`. It verifies all three
+descriptors, both completion markers/receipts, and exact profile identities,
+then passes them as `--runtime-root-fd`, `--runtime-base-python-root-fd`, and
+`--runtime-identity-fd`. The closure's `venv/bin/python` path must itself be
+beneath the closure FD; its fully resolved executable, `sys.base_prefix`,
+stdlib, and allowed base shared-library origins must remain beneath the
+protected base-Python FD. Working directory, repo-local imports, venv
+site-packages, episode data, and task data must remain beneath the closure FD.
+No interpreter/import origin may resolve beneath a third root.
 
-The lifecycle account cannot rename the protected parent or closure, restore
-write permission, or replace an entry. A missing/non-regular descriptor,
+The evaluator requires each protected pathname's current mount/device/inode to
+equal the corresponding `fstat()` identity before exec, before worker spawn,
+before `runtime_contract`, and after environment close. It opens every checked
+path relative to the appropriate retained root descriptor and revalidates the
+closure-to-base-Python interpreter link at every gate. This is the only
+exception to the closure-beneath rule; an arbitrary external
+`.venv/pyvenv.cfg` target is rejected.
+
+The lifecycle account cannot rename either protected parent or snapshot,
+restore write permission, or replace an entry. A missing/non-regular descriptor,
 mount/device/inode mismatch, path-to-FD mismatch, seek/replacement, premature
 EOF, extra sidecar byte, or identity mismatch fails before worker spawn or
-`gym.make`. A required adversarial test opens both descriptors, then from a
-second same-account process attempts chmod, child replacement, closure rename,
-parent rename, symlink substitution, and a lookalike closure swap before exec;
-every mutation must fail and the evaluator must report the original root
-identity. A fixture that deliberately permits any one swap must be rejected,
-not silently execute closure B with closure A's identity.
+`gym.make`. A required adversarial test opens all three descriptors, then from
+a second same-account process attempts chmod, child replacement, closure or
+base-Python rename, either parent rename, symlink substitution, and lookalike
+closure/base-Python swaps before exec; every mutation must fail and the
+evaluator must report the original two root identities. A fixture that
+deliberately permits any one swap must be rejected, not silently execute
+closure/base snapshot B with identity A.
 
 The ignored development path
 `data/evals/simple-eval/G1WholebodyXMovePickTeleop-v0/dr-level-0` is not assumed
@@ -717,9 +929,9 @@ dependency. MJCF includes/assets, USD dependencies, YAML references, and MDL
 textures are expanded recursively with cycle and escape rejection. The exact
 files are copied with no-follow traversal into `task-data`, whose complete
 canonical tree hash is `pc2_task_assets_tree_sha256`; the ordered logical-path
-and content-hash requirement document is
-`pc2_asset_requirements_sha256`. Nothing else from mutable development `data/`
-is copied or used.
+and content-hash pre-normalization requirement document is
+`pc2_asset_requirements_sha256`. That document is immutable after closure-ID
+selection. Nothing else from mutable development `data/` is copied or used.
 
 HSSD needs one additional freeze-time normalization step. The existing
 `HssdSceneManager._hack_fix_tmp_paths()` shell pipeline and global `/tmp` copy
@@ -735,8 +947,10 @@ directory. It rejects shell metacharacters, unknown external schemes,
 unmanifested dependencies, path traversal, cycles, missing targets, and any
 resolved path outside `task-data`. It writes a new closure-local layer by
 exclusive temporary file plus fsync/atomic rename; the source and normalized
-layer hashes, USD tool version, and ordered old-to-new mapping are recorded in
-the asset-requirement manifest. The original mutable source is never edited.
+layer hashes, USD tool version, requirements digest, closure ID, and ordered
+old-to-new mapping are recorded only in the separate
+`hssd-normalization-results.json`. The pre-normalization requirements are never
+edited. The original mutable source is never edited.
 
 At runtime `HssdSceneManager.load("hssd:scene0")` resolves the already
 normalized sealed layer and performs no subprocess, shell, string scan,
@@ -771,16 +985,17 @@ user-config roots all point beneath the current run's `generated-cache` or
 the input closure or global `/tmp`; production-path tests audit created paths
 and reject any evaluator write outside its run root. The sealed source, venv,
 episode-data, and task-data are non-writable, and their complete manifests,
-asset requirements/probe results, import origins, package freeze, Git
+asset requirements/normalization/probe results, import origins, package freeze, Git
 commit/gitlinks, interpreter/shared-library hashes, and driver identities must
 match both before the remote lease is acquired and after all evaluation
 cleanup.
 
-The protected closure pathname is never substituted into an environment by
-string alone: the manager derives every displayed sealed path relative to the
-verified root FD, compares it with the protected canonical pathname, and
-retains that descriptor until the evaluator and all descendants exit. The PC2
-input installer is unavailable to the evaluator run, so no owned process can
+The protected closure and base-Python pathnames are never substituted into an
+environment by string alone: the manager derives every displayed sealed path
+relative to the appropriate verified root FD, compares it with the protected
+canonical pathname, and retains both descriptors until the evaluator and all
+descendants exit. The PC2 input installer is unavailable to the evaluator run,
+so no owned process can
 publish or replace another closure during execution.
 
 The committed runtime profile contains the expected PC2 closure identities.
@@ -1108,8 +1323,9 @@ is not PASS.
 
 Before acquiring the remote lease, a read-only local phase verifies the
 approved profile commit/blob, sealed SIMPLE source and exact recursive
-gitlinks, PC2 installer identity, protected closure completion/owner record,
-root/identity descriptors, venv/base interpreter/import/native closure,
+gitlinks, PC2 installer socket/service identities, protected closure and
+base-Python completion/receipts, construction owner record, closure/base/
+identity descriptors, venv/base interpreter/import/native closure,
 configured path roots, and initial PC2 GPU inventory. An incomplete or
 recoverable local construction is handled
 under the local construction lock before this read-only gate; unknown ownership
@@ -1124,10 +1340,12 @@ started. Across the two phases it must:
 2. confirm bounded SSH connectivity and collect the remote host identity,
    boot ID, and wall clock;
 3. attest the complete sealed PC2 source, exact clean recursive gitlinks,
-   venv/base-Python/native environment, episode data, task assets/requirements,
-   import origins, and offline data-root behavior against the profile;
+   venv/protected-base-Python/native environment, episode data, task assets,
+   immutable requirements, normalization results, import origins, and offline
+   data-root behavior against the profile;
 4. attest the H100 input-installer executable, protected source, `.venv`,
-   offline HF snapshot, profiled checkpoint tracer, installer completion metadata, and failed
+   offline HF snapshot, profiled checkpoint tracer and exact security/argv
+   contract, installer completion metadata, and failed
    lifecycle-account write probe;
 5. attest the protected checkpoint snapshot, installer completion metadata,
    complete tree, exact weight relative path and file size/hash, and failed
@@ -1176,11 +1394,57 @@ broad model cache is mounted, so the official `--run-dir=/checkpoint
 To bind that unchanged loader to the protected path, freeze requires a
 `strace` executable already present in the digest-pinned image and records its
 path, file SHA-256, and version in the profile; runtime never installs a tool.
+The fixed argv template, in this exact token order and with only the validated
+run-specific output path substituted, is:
+
+```text
+<checkpoint_tracer_path>
+--interruptible=anywhere
+--follow-forks
+--decode-fds=path
+--trace=%file
+--absolute-timestamps=format:unix,precision:ns
+--output=/runtime/runs/<run-id>/server/checkpoint-access.raw
+--
+/workspace/Psi0/.venv/bin/python
+-m
+psi.deploy.psi0_serve_simple
+--host
+0.0.0.0
+--port
+22185
+--device
+cuda:0
+--policy=psi0
+--run-dir=/checkpoint
+--ckpt-step=40000
+--action-exec-horizon=24
+--rtc
+```
+
+Canonical JSON encoding of that token template is
+`checkpoint_tracer_argv_sha256`; runtime also records the instantiated argv
+digest. `--kill-on-exit`, `--seccomp-bpf`, every `--daemonize`/`-D` form,
+attach mode, an output pipe (`-o |...` or `-o !...`), and all unprofiled
+options are forbidden. `--interruptible=anywhere` is mandatory because
+`-o FILE PROG` otherwise defaults to non-interruptible tracing, as specified by
+the [`strace(1)` interruptibility contract](https://man7.org/linux/man-pages/man1/strace.1.html).
+The manager
+sends `SIGINT` by pidfd to the tracer PID only, never its process group; the
+required terminal observation is that the tracer is reaped as
+`WIFSIGNALED && WTERMSIG == SIGINT` after detaching every tracee, while the
+recorded server PID/start-ticks remains alive and unchanged. No TERM/KILL is a
+successful detach path.
+
 After its ownership record is durable, the stopped bootstrap continues by
-`execve`ing that exact tracer with a fixed argv. The tracer starts exactly one
-official server child, follows that child and its owned descendants, records
-decoded `%file` syscalls with a 256 MiB fail-closed output limit, and writes to
-a tracer-owned file beneath the run directory. The tracer and server
+`execve`ing that exact tracer. The tracer starts exactly one official server
+child, follows that child and its owned descendants, records decoded `%file`
+syscalls, and writes to the exclusively created regular output file beneath
+the run directory. The stopped bootstrap sets and verifies
+`RLIMIT_FSIZE={268435456,268435456}` before `execve`; no descendant may raise
+it. A five-second monitor rejects a missed poll or a file reaching the limit;
+`SIGXFSZ`, truncation, replacement, non-regular output, or an unexpected writer
+is a hard failure and triggers owned cleanup. The tracer and server
 PID/start-ticks/argv/parentage/cgroup plus the first trace-header identity are
 fsynced before readiness can advance. The parser retains and validates every
 `/checkpoint` access. After model readiness and before warm-up, the manager
@@ -1194,6 +1458,39 @@ model-backed warm-up jointly attest the loaded input without changing PSI0.
 Tracer startup/detach failure, missing expected open, unexpected checkpoint path, PID
 mismatch, trace truncation, or a surviving tracer fails readiness and triggers
 owned cleanup.
+
+`create` must pass a model-free trace-and-detach probe before accepting the
+container. The profiled read-only helper
+`/workspace/Psi0/runtime-tools/checkpoint_trace_probe.py` and a fixed sentinel
+are part of the protected server snapshot; the helper digest is
+`checkpoint_tracer_probe_sha256` and the sentinel digest is
+`checkpoint_tracer_probe_sentinel_sha256`. `freeze-provenance` copies these reviewed
+manager-owned auxiliary files into the otherwise sealed snapshot after
+verifying the official PSI0 intake; `runtime-tools` is outside `src/psi`, is
+absent from `PYTHONPATH`, and cannot alter the official server module or
+checkpoint resolver. The probe argv is the exact tracer prefix
+above through `--`, with only output replaced by
+`/runtime/runs/<run-id>/create/checkpoint-trace-probe.raw` and the command
+replaced by these exact tokens:
+
+```text
+/workspace/Psi0/.venv/bin/python
+/workspace/Psi0/runtime-tools/checkpoint_trace_probe.py
+--sentinel=/workspace/Psi0/runtime-tools/checkpoint_trace_sentinel
+--ready-path=/runtime/runs/<run-id>/create/checkpoint-trace-probe.ready
+--wait-seconds=30
+```
+
+Its canonical placeholder-template digest is
+`checkpoint_tracer_probe_argv_sha256`. Under the exact container capability,
+seccomp, namespace, and no-new-privileges contract, the manager invokes the
+same tracer prefix/options against that helper, waits for the helper to open
+the sentinel and enter a bounded wait, sends tracer-only `SIGINT`, and requires
+the exact tracer terminal state above, a complete sentinel open record, and a
+still-live unchanged helper. It then signals and reaps only that owned helper
+within five seconds and proves no tracer/helper remains. Probe failure leaves
+the container stopped and blocks server launch. No model, CUDA allocation,
+network listener, or PSI0 server is started by this probe.
 
 It writes its run-specific log beneath `/runtime/runs/<run-id>`, but all
 ownership records remain outside the container at
@@ -1364,6 +1661,7 @@ PYTHONPATH=<sealed-source-and-submodule-paths> \
   --runtime-event-fd <inherited-write-fd> \
   --runtime-ack-fd <inherited-read-fd> \
   --runtime-root-fd <inherited-read-only-root-fd> \
+  --runtime-base-python-root-fd <inherited-read-only-base-python-root-fd> \
   --runtime-identity-fd <inherited-read-only-identity-fd> \
   --num-episodes 1 --episode-start <N> --num-workers 1 --save-video
 ```
@@ -1382,7 +1680,7 @@ from that worker-produced record; a separately reconstructed default or a
 hard-coded zero counter is not acceptable evidence. The worker refuses any
 other values before environment or channel construction.
 
-The three runtime-evidence options and all four runtime channel/root/identity
+The three runtime-evidence options and all five runtime channel/root/identity
 FDs are supplied as one indivisible contract or rejected by the parent before
 spawning. `run-id` must equal the manager's run ID, and the episode nonce is a
 fresh 128-bit lowercase hexadecimal value used only once.
@@ -1402,6 +1700,8 @@ simple_root_tree: 40-character lowercase Git tree SHA
 recursive_gitlinks_sha256: 64-character lowercase hexadecimal string
 pc2_closure_id: 64-character lowercase hexadecimal string
 pc2_source_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_root_identity_sha256: 64-character lowercase hexadecimal string
 pc2_runtime_identity_sha256: 64-character lowercase hexadecimal string
 pc2_closure_root_identity_sha256: 64-character lowercase hexadecimal string
 runtime_identity_sidecar_sha256: 64-character lowercase hexadecimal string
@@ -1418,7 +1718,7 @@ calling `gym.make`. Unsafe values write `status="rejected"` and raise before
 `gym.make`; a preexisting final file, missing option, write failure, or invalid
 nonce also raises before `gym.make`.
 
-The eight source/closure identity values in this record come only from the
+The ten source/closure/base identity values in this record come only from the
 validated inherited identity FD. The evaluator computes and retains the exact
 sidecar digest before spawning its worker, the worker carries the already
 parsed immutable object, and the manager binds that digest to the reviewed
@@ -1428,10 +1728,11 @@ record and contract event are emitted produces a rejected contract and zero
 environment construction.
 
 The lifecycle manager creates a fresh event pipe and acknowledgement pipe and
-opens the verified protected root plus identity sidecar before each evaluator.
+opens the verified protected closure root, protected base-Python root, and
+identity sidecar before each evaluator.
 It continuously drains the event read end, retains the acknowledgement write
-end, and passes only the opposite ends plus the read-only root and identity FDs
-in `subprocess.Popen(..., pass_fds=...)`. All four FD options are required
+end, and passes only the opposite ends plus both read-only root FDs and the identity FD
+in `subprocess.Popen(..., pass_fds=...)`. All five FD options are required
 together and accepted only with
 `--num-workers 1`; the evaluator validates their direction/type and exact
 sidecar bytes, closes them on every exit path, and does not pass them to the
@@ -1458,7 +1759,8 @@ payload: exact event-specific object
 Allowed event payloads are exact: `runtime_contract` carries `status`,
 `record_sha256`, `file_device`, `file_inode`, `file_size`, `simple_commit`,
 `simple_root_tree`, `recursive_gitlinks_sha256`, `pc2_closure_id`,
-`pc2_source_tree_sha256`, `pc2_runtime_identity_sha256`,
+`pc2_source_tree_sha256`, `pc2_base_python_tree_sha256`,
+`pc2_base_python_root_identity_sha256`, `pc2_runtime_identity_sha256`,
 `pc2_closure_root_identity_sha256`, and `runtime_identity_sidecar_sha256`; `worker_init`
 with `status="creating_env"` carries `total_episodes=1`, while
 `status="ready"` also carries finite `setup_seconds`, `max_episode_steps`, and
@@ -1474,7 +1776,8 @@ evaluator log and are not accepted as unbounded pipe payloads.
 The single acknowledgement line has exact keys `schema_version=1`, `run_id`,
 `episode_index`, `accepted_sequence`, `record_sha256`, `simple_commit`,
 `simple_root_tree`, `recursive_gitlinks_sha256`, `pc2_closure_id`,
-`pc2_source_tree_sha256`, `pc2_runtime_identity_sha256`,
+`pc2_source_tree_sha256`, `pc2_base_python_tree_sha256`,
+`pc2_base_python_root_identity_sha256`, `pc2_runtime_identity_sha256`,
 `pc2_closure_root_identity_sha256`, and `runtime_identity_sidecar_sha256`; all
 identities must equal the profile, inherited sidecar, contract event, and
 durable file. No other acknowledgement bytes or keys are accepted.
@@ -1623,7 +1926,12 @@ preflight/
   container-identity.json
   pc2-construction-final.json
   pc2-input-installer.json
+  pc2-installer-service.json
   pc2-installer-receipt.json
+  pc2-base-python-completion.json
+  pc2-base-python-manifest.json
+  pc2-base-python-root-before.json
+  pc2-base-python-installer-receipt.json
   pc2-closure-descriptor.json
   pc2-closure-completion.json
   pc2-closure-root-before.json
@@ -1637,7 +1945,7 @@ preflight/
   pc2-episode-data-before.json
   pc2-task-assets-before.json
   pc2-asset-requirements.json
-  hssd-normalization-manifest.json
+  hssd-normalization-results.json
   episode-inputs.json
   source-tree-manifest.json
   source-tree-verification-before.json
@@ -1651,6 +1959,8 @@ preflight/
   checkpoint-completion.json
   checkpoint-weight-identity.json
   checkpoint-tracer-identity.json
+  checkpoint-tracer-probe.json
+  container-security-contract.json
   checkpoint-before.json
 server/
   command.json
@@ -1710,6 +2020,8 @@ cleanup/
   pc2-runtime-identity-after.json
   pc2-construction-after.json
   pc2-closure-root-after.json
+  pc2-base-python-root-after.json
+  pc2-base-python-manifest-after.json
   pc2-episode-data-after.json
   pc2-task-assets-after.json
   checkpoint-after.json
@@ -1755,13 +2067,17 @@ Infrastructure PASS requires all of the following:
   exact named weight relative path matched before startup and after all H100
   cleanup, and neither lifecycle account nor container could write it;
 - the sealed SIMPLE source, exact recursive gitlinks, PC2 venv/base Python,
-  package/import/native closure, episode dataset, task-asset closure, and driver
-  identities matched the committed profile before and after execution;
+  protected base-Python completion/root/receipt, package/import/native closure,
+  episode dataset, task-asset requirements plus normalization results, and
+  driver identities matched the committed profile before and after execution;
 - the attested PC2 installer normalized metadata before authoritative hashes,
-  the local construction record and protected completion metadata were valid,
-  and lifecycle/evaluator accounts could not mutate or rename the closure;
-- the inherited protected-root and identity descriptors remained bound to the
-  executed interpreter/import/data paths, and their identities matched every
+  its root-owned socket/service and locked-FD peer/token contract matched, the
+  local construction record, explicit rename/receipt phases, and protected
+  completion/receipt metadata were valid, and lifecycle/evaluator accounts
+  could not mutate or rename either protected snapshot;
+- the inherited protected closure-root, base-Python-root, and identity
+  descriptors remained bound to the executed interpreter/import/data paths,
+  and their identities matched every
   durable WBC record, contract event, and acknowledgement without consulting
   `.git`;
 - both episode-specific offline asset probes covered their exact manifest
@@ -1771,8 +2087,10 @@ Infrastructure PASS requires all of the following:
   the episode run directory;
 - container CUDA device 0 UUID equalled host GPU 7 UUID;
 - every H100 GPU poll contained only the exact attested server process tree;
-- the external checkpoint-access trace attributed the profiled protected weight
-  open to the unchanged owned official server, and the tracer detached cleanly;
+- the exact seccomp/capability/no-new-privileges contract and model-free tracer
+  probe passed; the external checkpoint-access trace attributed the profiled
+  protected weight open to the unchanged owned official server, and the
+  interruptible tracer detached cleanly without kill-on-exit;
 - PC2 CUDA device 0 under `CUDA_VISIBLE_DEVICES=1` equalled physical GPU 1's
   UUID, passed allocation, and had no foreign compute process at any gate;
 - every PC2 episode GPU poll contained only exact evaluator descendants and no
@@ -1816,7 +2134,7 @@ new run ID and preserves all earlier evidence.
 - **Either GPU becomes busy between probes:** stop or avoid starting only the
   current run's resources. Never signal a foreign GPU process. Do not start the
   next episode until both GPUs pass their required gates.
-- **PC2 protected-root/FD mismatch or attempted swap:** fail before worker or
+- **PC2 protected closure/base-root/FD mismatch or attempted swap:** fail before worker or
   environment construction when possible, otherwise stop only the owned
   evaluator; preserve both descriptor/path identities and never adopt the new
   path.
@@ -1873,8 +2191,11 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   mutation after freeze having no effect on mounted bytes, lifecycle/container
   write-probe refusal, unchanged official step-40000 command/source hashes,
   stopped-bootstrap tracer launch, exact protected-weight open attribution,
-  unexpected-path/truncated-trace/failed-detach rejection, bounded tracer
-  cleanup, and startup using only `/checkpoint`;
+  exact interruptible argv-template hashing, forbidden kill-on-exit/daemonize/
+  seccomp-bpf rejection, exact capability/seccomp/no-new-privileges inspect,
+  model-free create-time trace/detach probe, unexpected-path/truncated-trace/
+  failed-detach rejection, bounded tracer cleanup, and startup using only
+  `/checkpoint`;
 - installer executable attestation, current freeze-token enforcement,
   server/checkpoint kind restriction, arbitrary source/destination and existing
   target refusal, same-device atomic publication, and absence of general input-
@@ -1902,8 +2223,18 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   and stale recoverer, write-ahead phase updates, crash injection after staging
   allocation, every source/data/venv/HSSD/installer phase, final metadata
   normalization, authoritative hashes, sidecar/completion metadata, atomic
-  rename, and published revalidation, with no partial final
+  rename, explicit `FINAL_RENAMED` and `RECEIPT_CREATED`, crash recovery
+  between rename and receipt, and published revalidation, with no partial final
   closure and exact adoption only after a post-rename crash;
+- privileged PC2 installer transport through the root-owned Unix socket,
+  `SO_PEERCRED` plus one `SCM_RIGHTS` locked-record FD, strict request/response
+  schemas, lifecycle refusal to reconfigure/start the service, arbitrary-path/
+  extra-FD refusal, and exactly one token-bound receipt from two concurrent
+  post-rename recoverers;
+- protected base-Python publication and recovery through every named phase,
+  exact completion/root/receipt identities before closure-ID computation,
+  venv interpreter-link resolution beneath the inherited base root FD, and
+  rejection of the development `.venv/pyvenv.cfg` external target;
 - staging-independent relative venv links, rejection of embedded staging/final
   prefixes, successful imports after atomic publication, invalid final marker
   fail-closed behavior, and no deletion of unknown or live-owned paths;
@@ -1926,7 +2257,10 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
 - exact run-scoped HOME/temp/cache/Omni/Isaac/log environment and filesystem
   write audits rejecting every evaluator-created path outside its run root;
 - path-independent `pc2_closure_id` reproducibility, exact profile/path mapping,
-  and proof that changing an absolute installation path cannot affect the ID;
+  proof that changing an absolute installation path cannot affect the ID,
+  immutable pre-normalization requirements changing the ID, normalization
+  result/mapping changes leaving the ID fixed but failing result provenance,
+  and an exact requirements-hash/closure-ID link in every normalization result;
 - strict run/helper/profile/recovery ID validation, `.`/`..` and symlink escape
   rejection, resolved-root containment, and existing-output refusal;
 - byte-exact production warm-up serialization including instruction and fixed
@@ -1936,18 +2270,19 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   raw retention after success and failure, checked transcode success,
   timeout/nonzero/malformed-output handling, and independent opposite-verdict
   retries;
-- exact runtime-evidence option/four-FD pairing and schema/type validation;
+- exact runtime-evidence option/five-FD pairing and schema/type validation;
 - unsafe `ENV_TYPE`, interface, and domain values each failing before
   `gym.make`, with the rejected record present and no `creating_env` event;
 - validated event order of durable evidence, `runtime_contract`,
   `worker_init(creating_env)`, then `gym.make`, plus rejected event order of
   durable evidence, `runtime_contract(rejected)`, then worker error;
-- actual manager/evaluator subprocess pipe/root-FD/identity-FD transport with
-  exact sequence and identity validation, plus malformed UTF-8/JSON,
+- actual manager/evaluator subprocess pipe/closure-root-FD/base-root-FD/
+  identity-FD transport with exact sequence and identity validation, plus malformed UTF-8/JSON,
   partial/oversize write, silence, early EOF, and callback-only rejection;
-- same-account closure-swap attempts after descriptor open and before evaluator
-  exec, requiring chmod/rename/unlink/symlink/lookalike substitutions to fail;
-  a deliberately swappable fixture must fail root-FD/path identity validation;
+- same-account closure/base-Python swap attempts after descriptor open and
+  before evaluator exec, requiring chmod/rename/unlink/symlink/lookalike
+  substitutions to fail; a deliberately swappable fixture must fail the
+  corresponding root-FD/path/interpreter identity validation;
 - missing, stale, replayed, wrong-PID, wrong-commit, wrong-nonce, and replaced
   runtime evidence rejection, plus independent valid records for episodes 2
   and 3;
@@ -1980,9 +2315,12 @@ The runtime is promoted through these gates in order:
 
 1. run focused unit tests, Ruff, formatting, compilation, and whitespace checks;
 2. seal the exact SIMPLE source commit, recursive gitlinks, dedicated PC2
-   environment, episode dataset, and complete episode-2/3 asset closure through
-   the local write-ahead constructor, with venv creation preceding HSSD
-   normalization; use the attested PC2 installer to normalize final metadata,
+   base-Python snapshot, environment, episode dataset, and complete episode-2/3
+   asset closure through the local write-ahead constructor, with protected
+   base-Python completion preceding closure-ID computation and venv creation
+   preceding HSSD normalization; freeze requirements before the closure ID and
+   emit normalization results separately; use the attested PC2 installer
+   socket service to normalize final metadata,
    compute authoritative manifests, create the identity sidecar/completion
    metadata, and publish beneath the protected root. Run both offline asset
    probes and the real `hssd:scene0` load test, then run remote
@@ -1992,23 +2330,27 @@ The runtime is promoted through these gates in order:
    relative path, failed write probes, and digest-qualified image, then commit
    only the candidate profile as approval commit `P` without starting the
    dedicated container;
-3. inject and recover every local closure-construction crash point, then run
+3. inject and recover every local base-Python/closure-construction crash point,
+   including final rename before receipt creation, then run
    two concurrent local constructors/recoverers and two concurrent normal
    remote lease probes, requiring exactly one winner in each race. Attempt the
-   same-account post-descriptor-open closure swap and require every mutation to
-   fail while root/identity FD bindings remain exact. Exercise a simulated
+   same-account post-descriptor-open closure/base-Python swap and require every
+   mutation to fail while closure-root/base-root/identity FD bindings remain
+   exact. Exercise a simulated
    1,800-second remote mutation while heartbeats remain current, and release cleanly;
 4. run `status` and local/leased preflight, including path containment, mount
    alias, GPU, remote-helper, and pre/post provenance checks;
-5. create the container, attest every mount alias and the in-container
-   read-only/inaccessible probes, and leave it exited without loading a model;
+5. create the container, attest every mount alias, exact seccomp/capability
+   contract, in-container read-only/inaccessible probes, and harmless
+   interruptible tracer detach probe, then leave it exited without loading a
+   model;
 6. create owned stale fixtures for each operation: an incomplete freeze staging
    tree, an interrupted create, and a running evaluate-labelled container with
    an inert `SIGSTOP` server-bootstrap fixture (the model is not loaded). For
    each, run two concurrent recovery claimers, require exactly one winner,
    prove old-token fencing and the operation-specific terminal predicate, and
    preserve independent evidence;
-7. launch the profiled external checkpoint tracer from the stopped bootstrap,
+7. launch the profiled exact-argv interruptible checkpoint tracer from the stopped bootstrap,
    start its unchanged official server child, prove the exact protected weight open, detach the
    tracer cleanly, complete one warm-up, exercise H100 GPU monitoring and
    bounded cleanup, and prove the container is stopped with no owned resources;
@@ -2019,7 +2361,7 @@ The runtime is promoted through these gates in order:
 9. run official episodes 2 and 3 and validate their run-scoped raw and checked
    standard stereo artifacts, independent WBC evidence, GPU evidence, lease
    release, manager event streams, continuous PC2/H100 GPU monitors, offline
-   asset/HSSD probes, inherited protected-root/identity-FD bindings, filesystem write audits,
+   asset/HSSD probes, inherited protected-closure/base-root/identity-FD bindings, filesystem write audits,
    zero live remote helpers, and all post-run execution/protected-checkpoint
    closure manifests.
 
