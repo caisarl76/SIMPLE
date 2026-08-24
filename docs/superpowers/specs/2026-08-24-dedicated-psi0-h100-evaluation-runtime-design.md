@@ -108,7 +108,7 @@ from those excluded locations.
 The verified snapshot is atomically installed at:
 
 ```text
-/mnt/data01/jhkim/psi0-simple-eval/inputs/<tree-root-sha256>/
+/mnt/data01/jhkim/psi0-simple-eval-inputs/<tree-root-sha256>/
 ```
 
 It includes the complete `.venv` used to execute the server and a dedicated
@@ -145,13 +145,35 @@ checkpoint_size: positive integer
 checkpoint_sha256: 64-character lowercase hexadecimal string
 server_source_sha256: 64-character lowercase hexadecimal string
 launcher_source_sha256: 64-character lowercase hexadecimal string
+h100_roots_identity_sha256: 64-character lowercase hexadecimal string
+simple_source_commit: 40-character lowercase Git SHA
+simple_root_tree: 40-character lowercase Git tree SHA
+recursive_gitlinks_sha256: 64-character lowercase hexadecimal string
+pc2_source_tree_sha256: 64-character lowercase hexadecimal string
+pc2_venv_tree_sha256: 64-character lowercase hexadecimal string
+pc2_base_python_tree_sha256: 64-character lowercase hexadecimal string
+pc2_package_freeze_sha256: 64-character lowercase hexadecimal string
+pc2_import_origins_sha256: 64-character lowercase hexadecimal string
+pc2_native_closure_sha256: 64-character lowercase hexadecimal string
+pc2_episode_data_tree_sha256: 64-character lowercase hexadecimal string
+pc2_runtime_identity_sha256: 64-character lowercase hexadecimal string
+pc2_python_version: nonempty string
+pc2_torch_version: nonempty string
+pc2_torch_cuda_version: nonempty string
+pc2_mujoco_version: nonempty string
+pc2_isaac_version: nonempty string
+pc2_nvidia_driver_version: nonempty string
+pc2_cuda_driver_version: nonempty string
 ```
 
 No additional keys, type coercion, mutable tag, relative path, or Boolean as an
 integer is accepted. The candidate profile is not active merely because it was
-generated: `create` and `evaluate` read only the exact tracked profile from the
-current SIMPLE commit, require a clean tracked copy of that file, and record
-its Git blob ID and SHA-256.
+generated. To avoid a self-referential source hash, implementation is first
+committed as source commit `I`; the profile names `I`, and a follow-up approval
+commit `P` may change only the single profile path. Runtime verifies `P` has
+first parent `I`, `git diff --name-only I..P` is exactly the profile path, and
+that path's blob and SHA-256 match the reviewed profile. It executes the sealed
+source from `I` while reading the profile blob approved by `P`.
 
 `create` and `evaluate` accept only the already committed profile and use the
 digest-qualified image reference. They verify the complete snapshot manifest
@@ -160,10 +182,14 @@ expected digest from a mutable tag. A profile, snapshot, or image mismatch is
 `PROVENANCE_BLOCKED` and starts no workload.
 
 Container creation records the committed profile hash in a Docker label and in
-`outputs/psi0-h100-runtime/container-identity.json`. Reuse requires exact
-agreement between that record, the label, the container image ID, and the
-committed profile. A missing identity record blocks reuse rather than silently
-adopting an existing container.
+the manager-only
+`/mnt/data01/jhkim/psi0-simple-eval-control/container-identity.json` record.
+That record is never container-visible; each run copies its verified redacted
+form into local evidence. Reuse requires exact agreement between the control
+record, the label, the container image ID, and the committed profile. A missing
+identity record blocks reuse rather than silently adopting an existing
+container. Creating or replacing the control record is an atomic, fsynced
+operation covered by the current lease token and generation.
 
 ## Container contract
 
@@ -195,9 +221,33 @@ The required Docker configuration is:
 
 | Host path | Container path | Access |
 | --- | --- | --- |
-| `/mnt/data01/jhkim/psi0-simple-eval/inputs/<tree-root-sha256>` | `/workspace/Psi0` | read-only |
+| `/mnt/data01/jhkim/psi0-simple-eval-inputs/<tree-root-sha256>` | `/workspace/Psi0` | read-only |
 | `/mnt/data01/jhkim/model_weight/Psi0` | `/hfm/cache/checkpoints/psi0` | read-only |
-| `/mnt/data01/jhkim/psi0-simple-eval` | `/runtime` | read-write |
+| `/mnt/data01/jhkim/psi0-simple-eval-workloads` | `/runtime` | read-write |
+
+Manager control state is stored separately at
+`/mnt/data01/jhkim/psi0-simple-eval-control` and is never mounted into the
+container. The sealed input, manager-control, and container-workload roots are
+pairwise sibling roots: after resolving existing parents, none may equal or be
+an ancestor/descendant of another. The container has no bind mount of a parent
+that contains either the input or control root.
+
+The three H100 root directories are an operator-provisioned prerequisite with
+fixed owner, group, mode, device, and inode identities recorded in the runtime
+profile. The lifecycle manager does not bootstrap or repair the control root
+before lease acquisition. A missing, replaced, symlinked, unexpectedly
+writable, or permission-mismatched root fails without creating a lease or
+starting a workload.
+
+Creation and every reuse audit all Docker bind sources and destinations, their
+resolved host paths, propagation, and read-only flags. Every container-visible
+alias of the sealed snapshot and checkpoint must be read-only; no alias of the
+manager-control root may exist. An in-container mount probe must prove writes
+under `/workspace/Psi0` and `/hfm/cache/checkpoints/psi0` fail with a read-only
+filesystem error, `/runtime` is writable, and control/input aliases such as
+`/runtime/lease.d`, `/runtime/control`, and `/runtime/inputs` do not exist.
+Unexpected mounts, overlapping host roots, symlinked aliases, or a successful
+input/control write are `PROVENANCE_BLOCKED` before server launch.
 
 `/tmp` is a bounded writable `tmpfs`. `XDG_CACHE_HOME`, `TORCH_HOME`, and
 `TRITON_CACHE_DIR` point beneath the current
@@ -223,6 +273,27 @@ and requires no compute process with that UUID. After container start, an
 in-container probe must see exactly one GPU and its UUID must exactly equal the
 selected host UUID. CUDA ordinal 0 alone is never accepted as identity proof.
 
+GPU exclusion continues after startup. The manager records and validates the
+H100 process table immediately before server launch, after server readiness,
+before and after each episode, immediately before server shutdown, and after
+container shutdown. During server warm-up and episode execution it polls at
+least every five seconds with a bounded remote helper; a missed or unknown poll
+is an infrastructure failure.
+
+Once the server starts, each allowed GPU process must map from the host
+`nvidia-smi` PID to an exact PID/start-time/argv in the server's process tree,
+carry the current lease token in its owned record, and belong to the dedicated
+container cgroup. Container-namespace and host PIDs are correlated through
+recorded namespace PID data; process name alone is never sufficient. The
+allowed set is the attested server PID and its fully recorded descendants.
+
+A process outside that set is foreign. The manager interrupts only its own
+evaluator, tunnel, and server resources and never signals the foreign GPU PID.
+It may stop the dedicated container only after proving the foreign process is
+outside that container and every process inside the container is owned by the
+current lease. A foreign or unknown process inside the dedicated container
+triggers the existing `FOREIGN_BLOCKED` rule and leaves the container running.
+
 Failure to query either host or container GPU state is an unknown state and
 fails preflight. The manager never starts or stops another container to make
 GPU 7 available.
@@ -236,8 +307,8 @@ use that UUID before the allocation probe or immediately before either
 episode.
 
 The allocation probe runs in a tracked, bounded subprocess with
-`CUDA_VISIBLE_DEVICES=1`. Through the CUDA runtime used by the worktree's
-PyTorch, it must observe exactly one CUDA device, report that device's UUID
+`CUDA_VISIBLE_DEVICES=1`. Through the CUDA runtime used by the sealed PC2
+environment's PyTorch, it must observe exactly one CUDA device, report its UUID
 equal to the selected physical UUID, allocate a small tensor on `cuda:0`, and
 synchronize successfully. The probe has a 30-second internal deadline plus a
 tracked PID and bounded INT/TERM/KILL cleanup; killing only a wrapper process
@@ -253,27 +324,92 @@ signals the foreign GPU process. GPU inventory, UUID, probe result, and
 before/after process tables are mandatory evidence rather than values inferred
 from `CUDA_VISIBLE_DEVICES`.
 
+### PC2 execution provenance
+
+Evaluation does not execute from the editable development worktree or its
+shared virtual-environment symlink. The provenance-freeze gate creates a
+dedicated PC2 input closure under:
+
+```text
+/mnt/data/jihun/psi0-simple-eval-inputs/<pc2-tree-sha256>/source
+/mnt/data/jihun/psi0-simple-eval-inputs/<pc2-tree-sha256>/venv
+/mnt/data/jihun/psi0-simple-eval-inputs/<pc2-tree-sha256>/episode-data
+```
+
+The source snapshot contains only files tracked by the exact SIMPLE commit and
+every recursively initialized submodule at the exact gitlink recorded by that
+commit. Preparation requires byte-empty output from root
+`git status --porcelain=v1 --untracked-files=all` and from the equivalent
+recursive submodule checks. It rejects any staged, unstaged, untracked,
+missing, prefixed (`+`, `-`, or `U`), dirty, or uninitialized root/submodule
+state and records the ordered path/commit/gitlink table. Preserved development
+artifacts must be moved outside the worktree before this gate; they are never
+silently allowlisted. The snapshot is then copied from Git object identities,
+not worktree paths, and verified with a complete canonical file manifest.
+
+The dedicated venv is prepared at its final path before hashing. Editable
+`.pth`/installation links are rewritten only during preparation to the sealed
+source and exact submodule roots; any path escaping the PC2 input root is
+rejected. A clean import-origin probe requires `simple`, `gear_sonic`,
+`decoupled_wbc`, `unitree_sdk2py`, `xrobotoolkit`, and other repo-local packages
+to resolve beneath the sealed source, and all third-party packages beneath the
+sealed venv or an explicitly hashed base-Python/standard-library root. The
+complete venv, base interpreter, package freeze, native-extension/shared-library
+closure, Isaac/MuJoCo versions, and NVIDIA driver/CUDA identities are recorded
+both individually and in the canonical `pc2_runtime_identity_sha256` digest.
+
+The ignored development path
+`data/evals/simple-eval/G1WholebodyXMovePickTeleop-v0/dr-level-0` is not assumed
+to be part of the Git snapshot. `freeze-provenance` copies it into the sealed
+`episode-data` directory using no-follow traversal, rejects special files and
+escaping links, and records the same path/mode/size/content canonical manifest
+used for other input trees. The profile records that manifest root as
+`pc2_episode_data_tree_sha256`. Evaluation reads only this sealed copy; both
+the mutable development dataset and any global `data/evals` output remain off
+its import and input paths.
+
+The evaluator is invoked as the sealed venv's Python module entry point with
+the sealed source as working directory; it does not use the development
+worktree's console script. `PYTHONDONTWRITEBYTECODE=1` and run-scoped cache
+variables prevent writes to the input closure. The sealed source and venv are
+made non-writable and their complete manifests, import origins, package freeze,
+git commit/gitlinks, interpreter/shared-library hashes, and driver identities
+must match both before the remote lease is acquired and after all evaluation
+cleanup.
+
+The committed runtime profile contains the expected PC2 closure identities.
+Any dirty root/submodule, gitlink mismatch, escaping import, changed local
+environment, source/venv write, or pre/post manifest difference is
+`PROVENANCE_BLOCKED`. Run outputs and caches live only under the disjoint
+`/mnt/data/jihun/psi0-simple-eval-workloads/<run-id>` root and cannot make the
+sealed Git snapshot dirty.
+
 ## Remote lease and concurrency
 
 Every mutating operation acquires one host-wide lease before inspecting or
 changing the fixed container, GPU, server port, or evaluation targets. The
-lease lives at:
+manager-only control paths are:
 
 ```text
-/mnt/data01/jhkim/psi0-simple-eval/lease.d
+/mnt/data01/jhkim/psi0-simple-eval-control/lease.lock
+/mnt/data01/jhkim/psi0-simple-eval-control/lease.json
+/mnt/data01/jhkim/psi0-simple-eval-control/transactions/
+/mnt/data01/jhkim/psi0-simple-eval-control/mutation.lock
 ```
 
-One bounded remote Python helper atomically creates the directory with
-`mkdir(2)` and writes `owner.json` using a temporary file, `fsync`, and rename.
-The owner schema is exact: schema version, 128-bit random lease token, run ID,
-operation, PC2 hostname, local manager PID and process start time, remote boot
-ID, creation UTC time, remote monotonic creation time, remote monotonic
-heartbeat time, and `cleanup_required`. Unknown keys or types invalidate the
-record.
+Every acquire, heartbeat, recovery-claim, cleanup mark, and release is a short
+transaction executed by one bounded remote helper. The helper opens
+`lease.lock`, takes `fcntl.flock(LOCK_EX)`, rereads `lease.json`, performs its
+compare-and-swap, atomically replaces and fsyncs the JSON plus parent directory,
+then releases the OS lock. The long-lived ownership is the persisted lease, not
+the SSH connection or `flock`. Unknown keys or types invalidate the record.
 
 ```text
 schema_version: integer exactly 1
 lease_token: 32-character lowercase hexadecimal string
+generation: positive integer
+mode: exactly "normal" or "recovery"
+recovery_of_token_sha256: null in normal mode, otherwise 64 lowercase hex
 run_id: nonempty validated string
 operation: exactly "freeze-provenance", "create", "evaluate", or "stop"
 manager_host: nonempty string
@@ -289,34 +425,63 @@ cleanup_required: Boolean
 The holder refreshes the token-checked heartbeat every 10 seconds. The lease
 expires after 45 seconds without a valid heartbeat. Loss of the heartbeat is
 an infrastructure failure, but expiry alone never authorizes another manager
-to stop a process or container. A crash between `mkdir` and `owner.json` is
-recoverable only after a 120-second initialization grace period.
+to stop a process or container. A partially written temporary transaction is
+ignored only after its recorded owner helper is proven dead; it is never
+treated as a valid lease.
 
-The holder revalidates its token and nonexpired heartbeat immediately before
-every Docker start/stop, server launch/signal, tunnel launch, and evaluator
-launch. A manager whose lease was reclaimed cannot perform another mutable
-action, even if an earlier local preflight passed.
+The holder revalidates token, generation, mode, and nonexpired heartbeat
+immediately before every Docker start/stop, server launch/signal, tunnel
+launch, evaluator launch, and remote-helper signal. A manager whose lease was
+replaced cannot perform another mutable action, even if an earlier local
+preflight passed.
 
-Stale reclamation is one compare-and-swap remote operation. It atomically
-renames the old lease directory to a token-named tombstone and creates the new
-lease only when all of these are true in the same helper invocation:
+Every remote helper that changes Docker, processes, snapshots, or control
+records also takes `mutation.lock`, revalidates its lease tuple after taking the
+lock, and holds the lock through that single bounded mutation and its daemon
+postcondition. It revalidates again before starting any later mutation. A
+recovery claim may replace the expired lease while an old mutation is already
+in flight, but it performs no cleanup signal until the old helper has reached a
+terminal state, the recoverer has acquired `mutation.lock`, and all resulting
+host/container/process state has been reconciled. Thus the old generation can
+finish at most its already-started bounded mutation and cannot race recovery
+cleanup or begin another one.
 
-- the heartbeat is expired, or the owner record is absent beyond its grace;
+Normal stale reclamation runs under `lease.lock` and replaces the expired owner
+with a new normal token and incremented generation only when all of these are
+true in the same transaction:
+
+- the heartbeat is expired;
 - the recorded remote boot identity and timestamps satisfy the stale rules;
 - the dedicated container is absent or exactly `exited`;
 - container port 22185 has no listener;
 - no server PID record names a live process; and
-- the H100 GPU has no process owned by the stale run.
+- the H100 GPU has no process owned by the stale run; and
+- no remote helper or helper descendant owned by the stale lease remains.
 
 If the dedicated container is running, `evaluate` never reclaims the lease and
 never stops it. An expired lease with a fully attested old PID/container record
 is `STALE_OWNED_BLOCKED` and requires the explicit
-`stop --recover-stale <run-id>` operation. That recovery operation may signal
-only the exact old PID and container after revalidating lease token, process
-start time, command, profile hash, labels, and port ownership. Any mismatch,
-missing fact, foreign process, foreign port occupant, or unknown liveness is
-`FOREIGN_BLOCKED`; the container is left running and no foreign process is
-signalled.
+`stop --recover-stale <run-id>` operation.
+
+That operation first performs a distinct recovery-claim transaction under
+`lease.lock`. It requires an expired exact old run ID, exact old token digest
+and generation, `cleanup_required=true`, matching container/profile labels,
+and complete PID/start-time/argv/cgroup/port/helper records. A running
+container is allowed only when every live workload in it is attributable to
+the expired lease. The transaction atomically replaces the old owner with one
+new `mode="recovery"` token, incremented generation, and
+`recovery_of_token_sha256`. This fences the old manager before any signal.
+Exactly one concurrent recoverer can win; every loser observes a token or
+generation mismatch and performs no mutation.
+
+After claiming, the recoverer revalidates its recovery token immediately
+before every signal. It may signal the exact old helper first, wait through the
+bounded post-KILL liveness check, acquire `mutation.lock`, reconcile any
+daemon-side effect of its last mutation, and only then stop the exact old
+server and container resources proven by the claim. Any mismatch, missing
+fact, surviving helper, foreign process, foreign port occupant, or unknown
+liveness prevents further cleanup or changes the result to `FOREIGN_BLOCKED`;
+the container is left running and no foreign process is signalled.
 
 `evaluate` requires the dedicated container to exist and be `exited` at its
 initial leased check. It does not accept `created`, `running`, `paused`,
@@ -326,11 +491,58 @@ owned by that same run. Detection of a foreign or unknown workload changes the
 terminal state to `FOREIGN_BLOCKED`, closes only resources proven to belong to
 the current manager, and deliberately does not stop the container.
 
-The lease is released by an atomic token comparison only after the container
-is verified `exited`. If owned cleanup is incomplete, the owner record is
+The lease is released under `lease.lock` by exact token, generation, and mode
+comparison only after the container is verified `exited` and no owned remote
+helper remains. If owned cleanup is incomplete, the owner record is atomically
 marked `cleanup_required=true`, heartbeat stops, and explicit stale recovery is
-required. Read-only `status` never acquires, refreshes, reclaims, or removes a
+required. Read-only `status` never acquires, refreshes, claims, or removes a
 lease.
+
+### Remote helper ownership and deadlines
+
+No remote operation relies on the lifetime of its local SSH client. The
+manager passes the reviewed remote-helper source directly to a fixed system
+Python interpreter and records its SHA-256; it does not install or replace an
+executable before acquiring a lease. Every Docker, hashing, snapshot, lease,
+and process-control invocation runs through that content-attested helper with
+an internal monotonic deadline shorter than the local SSH deadline.
+
+Before doing work, the helper exclusively creates a transaction record under
+`/mnt/data01/jhkim/psi0-simple-eval-control/transactions/<helper-id>.json`
+containing the helper-source digest, exact lease token
+digest/generation/mode, helper ID, run ID, operation, remote boot ID, host PID,
+process-group ID, process start ticks, normalized argv and digest, internal
+deadline, start time, and
+`state="running"`. It fsyncs the record before spawning a child. Every child
+runs in the helper's owned process group and is recorded with PID, start time,
+argv digest, and parent PID before its result can be accepted.
+
+For acquisition and recovery-claim transactions, those identity fields are
+the proposed token, generation, and mode that the same locked compare-and-swap
+will install; for all other operations they must equal the current lease.
+Transaction creation, compare-and-swap, and terminal update use the
+operator-provisioned control root and never a container-visible path.
+
+On its internal deadline, the remote helper applies bounded INT/TERM/KILL to
+its own recorded child group, performs a fresh post-KILL wait and liveness
+check, and atomically records `completed`, `failed`, `timed_out`, or
+`cleanup_required`. Docker operations additionally record and verify the
+resulting daemon-side container state; ending a Docker client is not proof that
+the daemon operation ended.
+
+The PC2 manager gives SSH an outer deadline at least 15 seconds beyond the
+helper's internal deadline. If the SSH process times out or disconnects, the
+manager records remote state as unknown, reconnects read-only, and resolves the
+transaction by exact helper PID/start-time/argv/token plus daemon postcondition.
+It never equates a dead SSH client with a dead remote helper. A live helper
+blocks normal lease reclamation. A stale recovery-claim may signal that helper
+only after the recovery token fences the old manager and all helper ownership
+fields match.
+
+`freeze-provenance` uses the same transaction protocol for tree hashing,
+snapshot installation, and offline probes. A crashed freeze therefore leaves
+an owned, inspectable helper record; no later create/evaluate or normal stale
+reclamation proceeds until the helper is proven gone or recovered explicitly.
 
 ## Host-side interface
 
@@ -360,8 +572,20 @@ operator to run `create` first. It never inspects or changes prior global
 
 No local command uses `shell=True`. Remote commands are built from fixed
 tokens and strictly validated values. A run ID is generated locally from UTC
-time, the SIMPLE short SHA, and a random suffix, and must match
-`[A-Za-z0-9._-]+` before it is included in a remote path.
+time, the SIMPLE short SHA, and a random suffix. Generated IDs, profile IDs,
+helper IDs, and user-supplied `stop --recover-stale` IDs must match
+`[A-Za-z0-9][A-Za-z0-9._-]{0,127}` and must not equal `.` or `..`; separators,
+NULs, empty values, Unicode normalization aliases, and dot segments are
+rejected before any remote command.
+
+For every input, control, workload, transaction, and evidence path, the manager
+resolves the configured root itself with `realpath`, rejects a symlinked root,
+constructs exactly one validated child segment, and verifies the existing
+parent is the configured root and the candidate is strictly below—not equal to
+or outside—that root. Existing recovery paths are resolved without following a
+final symlink and must have the same parent. Remote helpers use directory file
+descriptors plus no-follow/exclusive operations; string-prefix checks alone are
+not accepted. Path-validation failure performs no lease or workload mutation.
 
 ## Lifecycle state machine
 
@@ -369,9 +593,10 @@ The manager persists every state transition before performing the next
 external action:
 
 ```text
-NEW -> LEASED -> PREFLIGHTED -> CONTAINER_STARTED -> SERVER_STARTED
-    -> TUNNEL_READY -> SERVER_READY -> EVALUATING -> CLEANING -> CLEAN
-    | FAILED | PROVENANCE_BLOCKED | STALE_OWNED_BLOCKED | FOREIGN_BLOCKED
+NEW -> LOCAL_ATTESTED -> LEASED -> PREFLIGHTED -> CONTAINER_STARTED
+    -> SERVER_STARTED -> TUNNEL_READY -> SERVER_READY -> EVALUATING
+    -> CLEANING -> CLEAN | FAILED | PROVENANCE_BLOCKED
+    | STALE_OWNED_BLOCKED | FOREIGN_BLOCKED
 ```
 
 Any state may transition to `CLEANING`. A PASS verdict requires the terminal
@@ -384,27 +609,36 @@ is not PASS.
 
 ### Preflight
 
-After the atomic lease is acquired, preflight is read-only and completes before
-the container is started. It must:
+Before acquiring the remote lease, a read-only local phase verifies the
+approved profile commit/blob, sealed SIMPLE source and exact recursive
+gitlinks, PC2 venv/base interpreter/import/native closure, configured path
+roots, and initial PC2 GPU inventory. Failure reaches `PROVENANCE_BLOCKED`
+without touching H100 control state.
+
+After the atomic lease is acquired, the remaining preflight is read-only except
+for the tracked PC2 CUDA allocation probe and completes before the container is
+started. Across the two phases it must:
 
 1. revalidate the current lease token and heartbeat;
 2. confirm bounded SSH connectivity and collect the remote host identity,
    boot ID, and wall clock;
-3. load the committed runtime profile and attest its complete immutable source
-   plus `.venv` snapshot manifest;
-4. attest the checkpoint file, size, and hash plus both source spot hashes;
-5. verify the exact digest-qualified image reference and image ID from the
+3. attest the complete sealed PC2 source, exact clean recursive gitlinks,
+   venv/base-Python/native environment, and import origins against the profile;
+4. attest the H100 immutable source, `.venv`, and offline HF snapshot manifest;
+5. attest the checkpoint file, size, and hash plus both source spot hashes;
+6. verify the exact digest-qualified image reference and image ID from the
    committed profile;
-6. require an existing profile-matching container in exact `exited` state for
+7. require an existing profile-matching container in exact `exited` state for
    `evaluate`, or an absent container for first `create`;
-7. resolve H100 GPU 7 to its UUID and prove no active compute process uses it;
-8. resolve PC2 GPU 1 to its UUID, prove it has no active compute process, and
+8. resolve H100 GPU 7 to its UUID and prove no active compute process uses it;
+9. resolve PC2 GPU 1 to its UUID, prove it has no active compute process, and
    pass the bounded CUDA allocation/UUID probe;
-9. prove the local loopback port is free and container port 22185 has no
+10. prove the local loopback port is free and container port 22185 has no
    listener;
-10. prove no live server or stale PID record conflicts with the current lease;
-11. confirm all local episode inputs exist; and
-12. confirm both run-scoped video roots, runtime-evidence paths, and all target
+11. prove no live server/helper or stale ownership record conflicts with the
+    current lease;
+12. confirm and hash all local episode inputs; and
+13. confirm both run-scoped video roots, runtime-evidence paths, and all target
     artifacts are absent.
 
 A preflight failure starts no workload. It releases the lease only after the
@@ -423,11 +657,16 @@ PYTHONPATH=/workspace/Psi0/src \
   --action-exec-horizon=24 --rtc
 ```
 
-It is launched with a run-specific log, PID record, exact command digest, and
-Linux process start time beneath `/runtime/runs/<run-id>`. A PID is considered
-owned only when the container identity, PID record, process start time, and
-normalized command all agree. A port occupant without that complete ownership
-proof blocks startup and is never signalled.
+It writes its run-specific log beneath `/runtime/runs/<run-id>`, but all
+ownership records remain outside the container at
+`/mnt/data01/jhkim/psi0-simple-eval-control/runs/<run-id>`. The remote launch
+helper records host PID, namespace PID, cgroup/container ID, process start time,
+parentage, exact command digest, and lease token/generation before readiness.
+A PID is considered owned only when the container identity, manager-only
+record, process start time, cgroup, namespace mapping, and normalized command
+all agree. Container-writable PID files are diagnostic only and never establish
+ownership. A port occupant without complete manager-control proof blocks
+startup and is never signalled.
 
 Readiness has three gates:
 
@@ -541,12 +780,13 @@ episode-1 path:
 
 ```bash
 SIMPLE_DISABLE_TUI=1 CUDA_VISIBLE_DEVICES=1 \
-MPLCONFIGDIR=<run-dir>/matplotlib-cache \
-timeout --signal=INT --kill-after=75s 1200s \
-  .venv/bin/eval-decoupled-wbc \
+PYTHONDONTWRITEBYTECODE=1 \
+MPLCONFIGDIR=<run-dir>/generated-cache/matplotlib \
+PYTHONPATH=<sealed-source-and-submodule-paths> \
+  <sealed-pc2-venv>/bin/python -m simple.cli.eval_decoupled_wbc \
   simple/G1WholebodyXMovePickTeleop-v0 psi0_decoupled_wbc train \
   --data-format lerobot \
-  --data-dir data/evals/simple-eval/G1WholebodyXMovePickTeleop-v0/dr-level-0 \
+  --data-dir <sealed-pc2-input>/episode-data \
   --host 127.0.0.1 --port <local-port> \
   --sim-mode mujoco_isaac --headless \
   --eval-dir <run-dir>/episode_<N>/eval-logs \
@@ -557,6 +797,11 @@ timeout --signal=INT --kill-after=75s 1200s \
   --runtime-evidence-nonce <episode-nonce> \
   --num-episodes 1 --episode-start <N> --num-workers 1 --save-video
 ```
+
+The displayed environment assignments describe the manager's explicit
+subprocess environment; production passes an argv plus environment mapping and
+does not invoke a shell or an external `timeout` wrapper. The lifecycle manager
+owns the evaluator process-group deadline and escalation directly.
 
 There is no `--third-person-video` flag. The evaluator must retain
 `sim`/`lo`/domain 0 isolation and must not open a real Unitree interface.
@@ -599,9 +844,17 @@ The manager accepts only a `validated` record whose run ID, episode index,
 nonce, worker ID/PID, commit, exact config, file identity, and creation interval
 match the current evaluator. The file must be created after that evaluator's
 recorded process start and before its first environment-construction progress
-event. Missing, stale, replayed, replaced, or cross-episode evidence fails the
-run. Episodes 2 and 3 have different paths and nonces; neither record can
-satisfy the other episode.
+event. The current `worker_init(status="creating_env")` report is moved: the
+worker must durably create the evidence file, emit
+`runtime_contract(status="validated")`, then emit
+`worker_init(status="creating_env")`, and only then call `gym.make`.
+
+For an unsafe contract, the worker durably creates the rejected record, emits
+`runtime_contract(status="rejected")`, and raises to the existing worker-error
+path. It emits no `creating_env` event and makes zero `gym.make` calls. Missing,
+stale, replayed, replaced, or cross-episode evidence fails the run. Episodes 2
+and 3 have different paths and nonces; neither record can satisfy the other
+episode.
 
 Before the next episode starts, the prior evaluator must have exited and its
 local worker/WBC children must be gone. If cleanup after one episode cannot be
@@ -616,21 +869,26 @@ process tree; cleanup never matches processes by name alone.
 ## Deadlines and shutdown
 
 All deadlines use `time.monotonic()` and are passed as a shared absolute
-deadline through nested cleanup operations.
+deadline through nested cleanup operations. A remote row has both an internal
+H100-helper deadline and a longer PC2 SSH observation deadline; expiry of the
+latter triggers helper reconciliation, not an assumption that remote work
+stopped.
 
-| Operation | Deadline |
-| --- | ---: |
-| Individual SSH/Docker inspection | 15 s |
-| Complete snapshot-manifest verification | 600 s |
-| PC2 CUDA allocation/UUID probe | 30 s |
-| Container start or stop | 30 s |
-| Model process and TCP readiness | 300 s total |
-| Warm-up `/act` response | 120 s |
-| Each evaluator episode | 1200 s plus its 75 s forced-exit allowance |
-| Each FFmpeg finalization | 120 s plus bounded signal stages |
-| Tunnel signal stage | 2 s each for INT, TERM, and KILL |
-| Server signal stage | 5 s each for INT, TERM, and KILL |
-| Final cleanup verification | 30 s |
+| Operation | Internal/owned deadline | PC2 outer deadline |
+| --- | ---: | ---: |
+| Lease or short remote inspection helper | 10 s | 25 s |
+| H100 GPU ownership poll | 10 s | 25 s |
+| Complete remote snapshot verification | 600 s | 615 s |
+| Remote provenance freeze/copy/probe | 1800 s | 1815 s |
+| Remote Docker start or stop helper | 30 s | 45 s |
+| PC2 CUDA allocation/UUID probe | 30 s | 45 s process reconciliation |
+| Model process and TCP readiness | 300 s total | owned server reconciliation |
+| Warm-up `/act` response | 120 s | owned server reconciliation |
+| Each evaluator episode | 1200 s | 75 s owned process-group escalation |
+| Each FFmpeg finalization | 120 s | bounded owned signal stages |
+| Tunnel signal stage | 2 s each for INT, TERM, and KILL | fresh liveness check |
+| Server signal stage | 5 s each for INT, TERM, and KILL | fresh liveness check |
+| Final remote cleanup verification | 30 s | 45 s |
 
 Cleanup is registered before each resource is started and executes in reverse
 order. It is attempted in this order:
@@ -667,13 +925,13 @@ process, the complete source snapshot changed, or liveness is unknown.
 Local evidence is immutable beneath:
 
 ```text
-outputs/official-psi0-standard-eval/<run-id>/
+/mnt/data/jihun/psi0-simple-eval-workloads/<run-id>/
 ```
 
 Remote transient evidence is beneath:
 
 ```text
-/mnt/data01/jhkim/psi0-simple-eval/runs/<run-id>/
+/mnt/data01/jhkim/psi0-simple-eval-workloads/runs/<run-id>/
 ```
 
 The local run directory contains at least:
@@ -684,11 +942,21 @@ run-manifest.md
 lease/
   acquisition.json
   heartbeats.jsonl
+  recovery-claim.json
   final.json
 preflight/
   ssh-host.json
   runtime-profile.json
   profile-hash.json
+  h100-roots-identity.json
+  container-identity.json
+  pc2-source-before.json
+  pc2-gitlinks-before.json
+  pc2-venv-before.json
+  pc2-import-origins.json
+  pc2-native-closure.json
+  pc2-episode-data-before.json
+  episode-inputs.json
   source-tree-manifest.json
   source-tree-verification-before.json
   h100-gpu-before.json
@@ -700,9 +968,14 @@ preflight/
   checkpoint.json
 server/
   command.json
+  pid-namespace-cgroup-map.json
   server.log
   readiness.json
   warmup.json
+  h100-gpu-monitor.jsonl
+remote-helpers/
+  transactions.json
+  final-liveness.json
 tunnel/
   process.json
   tunnel.log
@@ -710,6 +983,8 @@ episode_2/
   command.json
   evaluator.log
   wbc-runtime-contract.json
+  h100-gpu-before.json
+  h100-gpu-after.json
   pc2-gpu-before.json
   pc2-gpu-after.json
   result.json
@@ -720,6 +995,8 @@ episode_3/
   command.json
   evaluator.log
   wbc-runtime-contract.json
+  h100-gpu-before.json
+  h100-gpu-after.json
   pc2-gpu-before.json
   pc2-gpu-after.json
   result.json
@@ -730,7 +1007,12 @@ cleanup/
   actions.json
   h100-gpu-after.json
   pc2-gpu-after.json
+  pc2-source-after.json
+  pc2-gitlinks-after.json
+  pc2-venv-after.json
+  pc2-episode-data-after.json
   source-tree-verification-after.json
+  remote-helpers-final.json
   container-final.json
   processes-final.json
   ports-final.json
@@ -762,9 +1044,15 @@ Infrastructure PASS requires all of the following:
 - one exclusive remote lease covered every mutable action and was released by
   matching token after clean shutdown;
 - every preflight and identity assertion passed;
+- all H100 input/control/workload and PC2 input/workload roots were disjoint,
+  with no writable container alias to an input or control root;
 - the digest-pinned image and complete immutable PSI0 source plus `.venv`
   snapshot matched the committed profile before and after execution;
+- the sealed SIMPLE source, exact recursive gitlinks, PC2 venv/base Python,
+  package/import/native closure, and driver identities matched the committed
+  profile before and after execution;
 - container CUDA device 0 UUID equalled host GPU 7 UUID;
+- every H100 GPU poll contained only the exact attested server process tree;
 - PC2 CUDA device 0 under `CUDA_VISIBLE_DEVICES=1` equalled physical GPU 1's
   UUID, passed allocation, and had no foreign compute process at any gate;
 - the canonical warm-up digest matched and returned a finite `(24, 36)` action;
@@ -777,6 +1065,7 @@ Infrastructure PASS requires all of the following:
 - no real-robot control process or non-loopback Unitree interface owned by the
   run was observed;
 - every owned process and port was absent after cleanup;
+- every remote helper and helper descendant reached a recorded terminal state;
 - the dedicated container was stopped; and
 - every mandatory evidence file was finalized.
 
@@ -825,21 +1114,34 @@ new run ID and preserves all earlier evidence.
 Tests use fake monotonic clocks and a scripted command runner. They cover:
 
 - atomic lease acquisition by two concurrent managers with exactly one winner;
-- heartbeat token checks, initialization-crash grace, expired/exited stale
-  recovery, active-lease refusal, and compare-and-swap loss;
+- transaction-lock serialization, heartbeat token/generation checks,
+  interrupted transaction cleanup, expired/exited stale recovery, active-lease
+  refusal, and compare-and-swap loss;
+- two concurrent stale recoverers with exactly one recovery-claim winner, the
+  old manager fenced before signals, and every loser issuing zero signals;
 - running-container stale leases producing `STALE_OWNED_BLOCKED`, and foreign
   or unknown process/port cases producing `FOREIGN_BLOCKED` without any stop or
   signal command;
-- exact create/inspect configuration, labels, mounts, and no published ports;
+- pairwise-disjoint H100 roots, every Docker bind alias, read-only input writes,
+  inaccessible control paths, writable workload path, exact labels/mounts, and
+  no published ports;
 - predetermined image-digest enforcement, complete source plus `.venv` manifest
   generation, immutable snapshot installation, and rejection of a changed
   source file, dependency file, symlink, image, or checkpoint before startup;
 - idle configured GPU-7 containers being allowed and active compute processes
   being rejected;
+- H100 host/container PID namespace and cgroup mapping, pre-server and
+  before/during/after-episode polls, server-descendant allowlisting, missed-poll
+  failure, and foreign-process handling that stops only owned resources;
 - PC2 GPU-1 UUID mapping, CUDA allocation success, UUID mismatch, probe timeout
   cleanup, active foreign-process refusal, and every before/between/after
   recheck without signalling foreign users;
-- strict run ID/path validation and existing-output refusal;
+- sealed PC2 SIMPLE source construction from Git objects, exact recursive clean
+  gitlinks, dirty/untracked submodule refusal, venv/base-Python/native manifest,
+  editable-path escape rejection, import-origin validation, ignored episode-data
+  sealing, and source/environment/dataset pre/post mutation detection;
+- strict run/helper/profile/recovery ID validation, `.`/`..` and symlink escape
+  rejection, resolved-root containment, and existing-output refusal;
 - byte-exact production warm-up serialization including instruction and fixed
   timestamp, canonical request digest, and exact `(24, 36)` finite validation;
 - `--video-output-dir` parent-to-worker routing, run-scoped episode paths,
@@ -849,7 +1151,10 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   retries;
 - exact runtime-evidence option pairing and schema/type validation;
 - unsafe `ENV_TYPE`, interface, and domain values each failing before
-  `gym.make`, with the rejected record present;
+  `gym.make`, with the rejected record present and no `creating_env` event;
+- validated event order of durable evidence, `runtime_contract`,
+  `worker_init(creating_env)`, then `gym.make`, plus rejected event order of
+  durable evidence, `runtime_contract(rejected)`, then worker error;
 - missing, stale, replayed, wrong-PID, wrong-commit, wrong-nonce, and replaced
   runtime evidence rejection, plus independent valid records for episodes 2
   and 3;
@@ -857,13 +1162,16 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
 - PID reuse, command mismatch, process-start-time mismatch, unknown liveness,
   and foreign-port refusal;
 - readiness, SSH, warm-up, evaluator, FFmpeg, and artifact timeout paths;
+- remote helper internal timeout, SSH outer timeout, reconnection/liveness
+  reconciliation, Docker daemon postcondition, and crashed
+  `freeze-provenance` blocking stale reclamation until exact recovery;
 - reverse-order cleanup with one cleanup action failing;
 - bounded post-KILL waits and survival detection;
 - per-episode routing for exactly episodes 2 and 3;
 - refusal to start episode 3 after episode-2 infrastructure cleanup failure;
 - task failure versus infrastructure failure classification;
 - atomic evidence writes, secret redaction, immutable reruns, and incomplete
-  evidence rejection; and
+  evidence rejection;
 - render, video-write, result-persistence, and environment-close failures still
   closing all writers and preserving raw videos; and
 - Ctrl-C during lease acquisition, preflight, server load, tunnel readiness,
@@ -877,19 +1185,27 @@ connects to a real interface.
 The runtime is promoted through these gates in order:
 
 1. run focused unit tests, Ruff, formatting, compilation, and whitespace checks;
-2. run `freeze-provenance`, verify the complete snapshot and digest-qualified
-   image, review and commit the candidate runtime profile, and start no
-   container;
-3. run two concurrent lease-only probes, require exactly one winner, release
-   it cleanly, then run `status` and leased preflight against H100 and PC2;
-4. create the container, attest it, and leave it stopped without loading a model;
-5. start the server, complete one warm-up, exercise bounded cleanup, and prove
+2. seal the exact SIMPLE source commit plus recursive gitlinks and dedicated
+   PC2 environment, run remote `freeze-provenance`, verify both complete
+   closures and the digest-qualified image, then commit only the candidate
+   profile as approval commit `P` without starting the dedicated container;
+3. run two concurrent normal lease probes and two concurrent recovery-claim
+   probes, require exactly one winner in each case, prove the old token is
+   fenced, and release cleanly;
+4. run `status` and local/leased preflight, including path containment, mount
+   alias, GPU, remote-helper, and pre/post provenance checks;
+5. create the container, attest every mount alias and the in-container
+   read-only/inaccessible probes, and leave it exited without loading a model;
+6. start the server, complete one warm-up, exercise H100 GPU monitoring and
+   bounded cleanup, and prove
    the container is stopped with no owned resources;
-6. inject one tunnel interruption during a non-control probe and prove the
-   failure manifest and cleanup behavior; and
-7. run official episodes 2 and 3 and validate their run-scoped raw and checked
+7. inject one tunnel interruption and one internally timed-out remote helper,
+   then prove remote liveness reconciliation, failure evidence, and cleanup;
+   and
+8. run official episodes 2 and 3 and validate their run-scoped raw and checked
    standard stereo artifacts, independent WBC evidence, GPU evidence, lease
-   release, and post-run complete snapshot manifest.
+   release, zero live remote helpers, and both post-run execution-closure
+   manifests.
 
 Each gate writes a new immutable run directory. A later gate does not waive an
 earlier failure.
