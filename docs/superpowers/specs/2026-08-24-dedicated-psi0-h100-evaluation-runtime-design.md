@@ -574,10 +574,16 @@ base-Python input root is also operator-provisioned at:
 ```
 
 The lifecycle account cannot write or rename either protected parent. The
-closure input root, base-Python input root, and workload staging root must be
-on one device so both protected publications can use atomic rename. The exact
-four-root identity—closure input, base-Python input, manager control, and
-workload—is `pc2_roots_identity_sha256`. Before creating a staging entry, the
+closure input root, base-Python input root, and workload staging root must have
+the same `statx` mount ID—not merely the same device number—so both protected
+publications can use atomic rename without crossing mountpoints. Provisioning
+also performs a root-owned empty-directory probe of
+`renameat2(..., RENAME_NOREPLACE)` from the workload staging parent into each
+protected parent and back, with both parents fsynced; the probe directories and
+results are fixed in the installer configuration and must be absent after the
+probe. The exact four-root identity—closure input, base-Python input, manager
+control, and workload, including every device/inode/mount ID—is
+`pc2_roots_identity_sha256`. Before creating a staging entry, the
 constructor obtains an exclusive `flock` and atomically
 writes an exact owner record containing schema version, closure ID, descriptor
 hash, run ID, random 256-bit owner-token hash, host name, boot ID, owner PID and
@@ -615,8 +621,7 @@ files, and runtime overrides are forbidden by preflight.
 The reviewed service unit fixes `User=root`, `NoNewPrivileges=yes`,
 `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`,
 `ProtectSystem=strict`, an empty executable search path beyond the single
-attested installer, a capability bounding set limited to the ownership/mode
-operations it requires, and a static `ReadWritePaths` allowlist containing only
+attested installer, and a static `ReadWritePaths` allowlist containing only
 the fixed workload-staging parent, the two protected input parents, and their
 fixed receipt/completion/journal parents. It never claims a token-derived
 systemd directive. It has no shell, Docker socket, SSH key, device access,
@@ -627,20 +632,47 @@ filesystem path supplied by the peer. This matches systemd's contract that
 unit namespace therefore exists before the instance can parse request JSON
 ([systemd `systemd.socket` source](https://github.com/systemd/systemd/blob/main/man/systemd.socket.xml)).
 
+Its exact initial capability bounding/permitted/effective sets contain only
+`CAP_SYS_ADMIN` for the mutation child's `unshare(CLONE_NEWNS)`, private-mount,
+tmpfs, bind-mount, and pivot-root setup plus `CAP_CHOWN`, `CAP_FOWNER`, and
+`CAP_DAC_OVERRIDE` for the fixed ownership/mode and FD-relative publication
+operations. The ambient and inheritable sets are empty. `CAP_SYS_ADMIN` is not
+described as an ownership capability: after the child acknowledges its private
+root, both processes clear it before any payload parsing. The child retains
+only the three metadata capabilities while normalizing and writing completion
+files, then irreversibly clears all permitted/effective capabilities before its
+final read-back. The parent retains only those metadata capabilities through
+the fixed rename, journal, and receipt fsyncs, then clears them before its
+terminal response. Neither process can exec. `CAP_NET_ADMIN`,
+`CAP_SYS_PTRACE`, `CAP_MKNOD`, `CAP_SETUID`, `CAP_SETGID`, and every unlisted
+capability are absent. Preflight parses the unit and the executable's staged
+capability transitions; any broader or out-of-order set fails.
+
 The activated instance initially has only that fixed-parent allowlist. After
 peer, stable-lock, current-owner-record, token, phase, and containment
-validation, it no-follow opens the exact token-named staging directory and the
-fixed operation-specific destination, receipt/completion, and journal parent
-directories. It then forks one mutation child, creates a private mount
-namespace with an empty tmpfs root, bind-mounts only the exact staging
-directory at `/staging`, and passes the other already-open directory FDs at
-fixed descriptor numbers. Sibling staging entries and host paths are absent.
-The child accepts no new socket input or path, derives the exact absent target
-and metadata basenames from the already validated IDs, and applies a fixed
-seccomp/capability policy permitting only the required FD-relative validation,
-metadata, hash, rename, fsync, and receipt/journal operations. The activated
-parent can only wait, enforce the deadline, and return the child's bounded
-terminal record. A validation failure forks no child and performs no mutation.
+validation, the trusted static parent no-follow opens and retains the exact
+workload-staging parent FD plus validated token basename and the fixed
+operation-specific destination, receipt/completion, and journal parent FDs.
+It proves the staging and destination parents have the configured identical
+mount ID. It then forks one mutation child, creates a private mount namespace
+with an empty tmpfs root, and bind-mounts only the already-open staging
+directory at `/staging`. The child receives no source-parent, destination,
+receipt, or journal FD—only that staging mount and a fixed result pipe.
+Sibling staging entries and host paths are absent.
+
+The child accepts no new socket input or path and applies the fixed
+capability/seccomp stages above. It validates and normalizes `/staging`, writes
+and fsyncs its final payload metadata, makes the staging root non-writable,
+clears all capabilities, then performs a read-only full-manifest verification
+and returns one bounded canonical `PREPARED` record. It cannot call `rename`,
+`renameat*`, create a receipt, or append the root journal. After child exit, the
+parent independently reopens the source entry relative to its retained source-
+parent FD and requires the same device/inode/mount ID, root mode, completion
+bytes, and authoritative manifests as the prepared record. Only the parent may
+append the prepared journal record, perform the one fixed publication rename,
+create the receipt, and return the terminal response. A validation failure
+forks no child and performs no mutation; a child or prepared-record failure
+performs no rename or receipt creation.
 
 Each connection sends exactly one length-bounded canonical JSON request plus
 the already locked stable construction-lock FD via `SCM_RIGHTS`. The service obtains the
@@ -678,9 +710,20 @@ token hashes, final tree/component hashes, completion hash, receipt hash, root
 identity, and terminal installer phase. Both messages reject additional keys,
 coercion, oversize frames, missing/extra FDs, and peer mismatch.
 
-The service no-follow validates all roots and may rename only from the
-configured staging root to the corresponding protected closure or base-Python
-root. It cannot replace an existing target, launch a workload, or confer
+The service no-follow validates all roots, but only its trusted parent may
+publish. It calls exactly
+`renameat2(source_parent_fd, validated_token_basename,
+destination_parent_fd, derived_content_basename, RENAME_NOREPLACE)` after the
+prepared-record revalidation and a fsynced `RENAME_PENDING` journal record.
+Neither operand is `.`, a bind-mount root, an absolute path, or peer-supplied;
+both parent FDs and basenames were fixed before the child ran. It rejects
+`EEXIST`, `EXDEV`, `EBUSY`, unsupported `RENAME_NOREPLACE`, or any identity
+drift, creates no receipt on failure, and reconciles source/final entries from
+the root journal after an interrupted call. This follows the Linux contract
+that relative source and destination names are resolved from their respective
+directory FDs and `RENAME_NOREPLACE` refuses an existing destination
+([`renameat2(2)`](https://man7.org/linux/man-pages/man2/renameat2.2.html)).
+The service cannot replace an existing target, launch a workload, or confer
 general root/input-root access. The final snapshots and parents are owned by a
 dedicated input UID, so the lifecycle/evaluator account cannot chmod, chown,
 unlink, rename, replace, or create any entry in them. The locked FD survives
@@ -759,14 +802,15 @@ hashes, normalization-results hash, sidecar hash, closure-root
 device/inode/mount identity, canonical mode-policy version, and schema. Its own SHA-256 is
 `pc2_closure_completion_sha256` in the profile.
 
-The installer fsyncs all payloads and markers, removes `INCOMPLETE.json`, makes
-`COMPLETE.json` immutable to the lifecycle account, and makes the staging root
-`0555` last. It then atomically renames the now-final tree to the previously
-absent protected destination and fsyncs both parents. A durable installer
-service journal entry binds that rename to the operation token as
-`FINAL_RENAMED`. The service then exclusively creates/fsyncs the receipt and
+The confined child fsyncs all payloads and markers, removes `INCOMPLETE.json`,
+makes `COMPLETE.json` immutable to the lifecycle account, and makes the staging
+root `0555` last. After the child's capability-free read-back and the parent's
+independent prepared-record revalidation, the parent writes
+`RENAME_PENDING`, executes the exact FD-relative `RENAME_NOREPLACE` call above,
+reconciles its postcondition, fsyncs both original parents, and appends
+`FINAL_RENAMED`. The parent then exclusively creates/fsyncs the receipt and
 appends `RECEIPT_CREATED` before sending its one terminal response. The root
-journal is authoritative for these two privileged subphases; there is no
+journal is authoritative for these privileged subphases; there is no
 intermediate manager acknowledgement or impossible mid-request owner-record
 update.
 
@@ -1030,6 +1074,19 @@ GID recorded as `pc2_evaluator_uid`/`pc2_evaluator_gid` is not a member of the
 installer, lifecycle, control, or staging groups and cannot connect to either
 privileged socket.
 
+The only executable the runner may start besides the sealed evaluator loader
+is root-owned mode-`0555`
+`/usr/local/libexec/psi0-eval-policy-relay`, whose exact static, no-`PT_INTERP`,
+no-`DT_NEEDED` bytes are `pc2_policy_relay_sha256`. Its root-owned mode-`0444`
+framing/endpoint/deadline contract is fixed at
+`/etc/psi0-simple-eval/pc2-policy-relay-v1.json` and hashed as
+`pc2_policy_relay_contract_sha256`. The runner opens both before forking,
+revalidates their device/inode/mode/hash against the profile, then executes the
+already-open relay FD with no shell or search path and drops it to the dedicated
+evaluator UID/GID before releasing its start barrier. The relay receives only
+its socket, barrier, bounded diagnostic pipe, and fixed contract FD; it cannot
+traverse closure, output, control, staging, or input roots.
+
 The supervisor executable is a statically linked, no-`PT_INTERP`, no-
 `DT_NEEDED` binary. Its service namespace does not mount the installer socket
 or construction roots and its path policy permits only the fixed runner
@@ -1041,10 +1098,18 @@ service itself as well as out of its evaluator child.
 
 The runner service's canonical capability bounding/ambient sets are exact and
 contain only the reviewed namespace/mount, UID/GID drop, run-root ownership,
-and model-free probe tracing capabilities; all are cleared before evaluator
-exec. Its systemd filesystem allowlist and seccomp policy are part of
-`pc2_runner_sandbox_contract_sha256`. An added capability, writable host path,
-unit override, or executable dependency fails preflight.
+model-free probe tracing, and owned-process supervision capabilities. The
+evaluator child clears all capabilities before exec. After launch, the
+supervisor clears every setup/probe capability and retains only `CAP_KILL` for
+the different-UID processes in its exact service cgroup; it clears that after
+terminal reaping. The supervisor remains in the host network
+namespace solely to own the fixed loopback policy relay, with systemd
+`IPAddressDeny=any`, `IPAddressAllow=localhost`, and address families limited
+to `AF_UNIX`, `AF_INET`, and `AF_INET6`. The evaluator receives a new private
+network namespace below. The service's filesystem allowlist, network policy,
+and seccomp policy are part of `pc2_runner_sandbox_contract_sha256`. An added
+capability, writable host path, non-loopback route, unit override, or
+executable dependency fails preflight.
 
 Runner requests have operation-specific exact FD schemas; additional, missing,
 reordered, or role-mismatched FDs are rejected:
@@ -1054,7 +1119,9 @@ reordered, or role-mismatched FDs are rejected:
 | `prepare_output` | workload-parent-root | exclusively create the one run output root; no child |
 | `loader_probe` | closure-root, base-Python-root, identity-sidecar, workload-parent-root | exclusively create `probe_loader` |
 | `cuda_probe` | closure-root, base-Python-root, identity-sidecar, workload-parent-root | exclusively create `probe_cuda` |
-| `evaluate_episode` | event-write, acknowledgement-read, closure-root, base-Python-root, identity-sidecar, workload-parent-root, policy-transport | exclusively create `episode_2` or `episode_3` |
+| `evaluate_episode` | event-write, acknowledgement-read, closure-root, base-Python-root, identity-sidecar, workload-parent-root | exclusively create `episode_2` or `episode_3`; own relay and evaluator |
+| `finalize_episode` | workload-parent-root | attest a normally stopped episode and append its terminal record; create nothing |
+| `recover_episode` | workload-parent-root | reconcile one existing episode journal/service cgroup; create nothing |
 
 `prepare_output` requires the workload-parent FD to match the profiled inode,
 no-follow opens the exact `<run-id>` directory and manager-created exclusive
@@ -1071,48 +1138,110 @@ not a collision.
 
 Every request contains only schema version, reviewed profile hash, the listed
 operation, run ID, operation-specific fields, and its exact FD-role list.
-`evaluate_episode` alone accepts episode index `2` or `3`, a fresh nonce, owned
-tunnel identity/loopback port, and policy-transport FD; all other operations
-require those fields to be null. The supervisor validates `SO_PEERCRED`, the
-manager PID/start ticks, all FD identities, the reviewed profile, output-root
-record, and every enumerated value. It constructs the fixed argv/environment
-from those values and never accepts an arbitrary command, path, argument, or
-environment extension. Child operations run in fresh process groups and
-report PID/start ticks/process-group ID over the same connection. The
-supervisor accepts only bounded `INT`, `KILL`, status, and close messages for
-that child. Losing the manager connection triggers the same bounded
-owned-child cleanup and terminal evidence.
+`evaluate_episode` alone accepts episode index `2` or `3`, a fresh nonce, and
+the manager-owned tunnel identity/loopback port. `finalize_episode` accepts the
+same already-used episode index/nonce and original live manager PID/start ticks;
+`recover_episode` accepts the recorded manager pair plus recovery mode exactly
+`live-manager` or `stale-manager`. The former requires the peer PID/start pair
+to equal the journal; the latter requires that recorded pair to be dead and the
+peer to be the configured lifecycle UID. Probes and output preparation require
+all episode/finalization/recovery/tunnel fields to be null. The supervisor
+validates
+`SO_PEERCRED`, the manager PID/start ticks, all FD identities, the reviewed
+profile, output-root record, and every enumerated value. It constructs the
+fixed argv/environment from those values and never accepts an arbitrary
+command, path, argument, or environment extension.
 
-For `evaluate_episode`, the manager first starts one attested, tracked policy
-relay whose executable/source identity is `pc2_policy_relay_sha256` and whose
-strict framing, endpoint, deadline, and cleanup document is
-`pc2_policy_relay_contract_sha256`. The relay retains the host network
-namespace but accepts no listener. One end of a fresh `AF_UNIX SOCK_STREAM`
-socketpair is its sole client; the other is the `policy-transport` FD. Each
-frame has a fixed-width length prefix and canonical JSON carrying only schema
-version, monotonically increasing sequence, and the exact object returned by
-the production `RequestMessage.serialize()` method. Both directions enforce
-profiled maximum frame sizes, exact-length reads, one request in flight, and
-reject trailing or pipelined bytes. There is no caller-supplied URL, method,
-header, or destination. The relay sends the same canonical request bytes as
-the HTTP JSON body with the fixed `application/json` content type. It opens or
-reuses only the manager-attested
-`127.0.0.1:<owned-tunnel-port>` connection, sends a bounded HTTP POST to
-exactly `/act`, and returns only sequence, HTTP status, length, and bounded
-response bytes. Timeout, malformed framing, extra data, tunnel identity drift,
-relay exit, or transport EOF fails the episode; there is no reconnect or
-ordinary network fallback inside the evaluator.
+`prepare_output` creates a root-owned `runner-journal/` directory and one
+stable lock file per permitted episode beneath the inaccessible output root.
+Before `evaluate_episode` forks anything, that connection-bound supervisor
+locks the episode file and exclusively creates a root-owned, append-only,
+hash-chained journal. Its write-ahead phases are exactly
+`RESERVED`, `OUTPUT_CHILD_PENDING`, `OUTPUT_CHILD_CREATED`,
+`RELAY_START_PENDING`, `RELAY_STARTED`,
+`EVALUATOR_START_PENDING`, `EVALUATOR_STARTED`, `STOPPING`,
+`DESCENDANTS_GONE`, and `TERMINAL`.
+The initial record binds the service instance, service cgroup identity,
+manager PID/start ticks, run/episode/nonce, profile, tunnel PID/start/port,
+relay executable/contract hashes, and the exact absent operation-child
+basename. It fsyncs `OUTPUT_CHILD_PENDING` before exclusive creation and adds
+the child's device/inode identity only in `OUTPUT_CHILD_CREATED`. The runner
+sets `cleanup_required=true` in `RESERVED`; only a later `finalize_episode` or
+`recover_episode` service instance may clear it in `TERMINAL` after the
+original cgroup, relay sockets, and operation descendants are proven absent.
 
-The supervisor verifies the transport is the expected connected Unix socket
-end and binds it to the current relay PID/start ticks, executable hash, tunnel
-record, and episode nonce. It duplicates event-write, acknowledgement-read,
-closure-root, base-Python-root, identity-sidecar, and policy-transport to fixed
-evaluator FDs `3` through `8`; the sealed loader uses launcher-only FD `9`.
-Managed evaluation adds `--policy-transport-fd 8` and rejects `--host`/`--port`
-or any client reconnect path. Unmanaged callers retain their existing HTTP
-host/port behavior. The relay and its socket are registered for cleanup before
-the evaluator starts, and relay EOF plus terminal PID evidence are required
-before the next episode.
+The runner—not the lifecycle manager—then creates one fresh
+`AF_UNIX SOCK_STREAM` socketpair and forks the attested policy relay inside
+that same dedicated service cgroup. The relay remains in the runner's loopback-filtered
+host network namespace, never daemonizes or changes cgroup, sets an exact
+parent-death signal before doing work, accepts no listener, and blocks on a
+runner-owned start barrier. The runner validates and journals relay PID/start
+ticks, executable hash, both socket inodes, tunnel identity, and episode nonce
+before releasing the barrier or starting the evaluator. Thus a crash between
+fork and `RELAY_STARTED` is still attributable through the already journaled
+service cgroup and `RELAY_START_PENDING` record.
+
+Each relay frame has a fixed-width length prefix and canonical JSON carrying
+only schema version, monotonically increasing sequence, and the exact object
+returned by the production `RequestMessage.serialize()` method. Both
+directions enforce profiled maximum frame sizes, exact-length reads, one
+request in flight, and reject trailing or pipelined bytes. There is no caller-
+supplied URL, method, header, or destination. The relay sends the same
+canonical request bytes as the HTTP JSON body with fixed `application/json`
+content type. It opens or reuses only the runner-validated
+`127.0.0.1:<owned-tunnel-port>` connection, POSTs exactly `/act`, and returns
+only sequence, HTTP status, length, and bounded response bytes. Timeout,
+malformed framing, extra data, tunnel identity drift, relay exit, or transport
+EOF fails the episode; there is no reconnect or ordinary network fallback
+inside the evaluator.
+
+After journaling `EVALUATOR_START_PENDING`, the runner constructs the private
+mount/network sandbox and forks the evaluator in the same service cgroup. It
+duplicates event-write, acknowledgement-read, closure-root, base-Python-root,
+identity-sidecar, and its internally retained policy-transport socket end to
+fixed evaluator FDs `3` through `8`; the sealed loader uses launcher-only FD
+`9`. Managed evaluation adds `--policy-transport-fd 8` and rejects
+`--host`/`--port` or any reconnect path. Unmanaged callers retain existing
+HTTP behavior. Only after validating and journaling evaluator PID/start ticks,
+process group, namespace, and socket identity does the runner report both
+relay and evaluator started identities to the manager.
+
+The same connection supervises the whole episode ownership unit, not only the
+evaluator. Normal stop or manager EOF interrupts/reaps the evaluator and all
+of its descendants first, closes both policy socket ends, interrupts/reaps the
+exact relay, and requires the original service cgroup membership to be exactly
+the supervisor itself. It then writes `DESCENDANTS_GONE`, releases its
+operation lock, and exits; it cannot claim its own cgroup is empty while still
+a member. For normal cleanup, the manager waits for that systemd instance to
+become inactive and its cgroup to disappear, then sends one
+`finalize_episode` request. The new instance locks the journal, requires its
+`SO_PEERCRED` PID/start pair to equal the original live manager, independently
+proves the original service cgroup, relay/evaluator PIDs, and both socket inodes
+absent, and appends `TERMINAL`. Service `KillMode=control-group`, a bounded
+`RuntimeMaxSec`, no child cgroup migration, and parent-death signaling provide
+independent containment if the original supervisor exits. A missing terminal
+record, surviving original cgroup member/socket, or unknown liveness is never
+reported as stopped.
+
+`recover_episode` no-follow opens the exact existing output-root record,
+stable operation lock, and hash-chained episode journal. It requires the old
+control connection to have reached EOF and enforces the selected live/dead
+manager predicate above. In stale-manager mode, remote lease recovery remains
+the lifecycle manager's prerequisite but is not presented as an unverifiable
+runner-service credential. Local authorization derives from `SO_PEERCRED`,
+the manager liveness predicate, the exact root-owned journal, and exclusive
+stable operation lock. If the old
+supervisor still holds the operation lock, recovery waits only its bounded
+systemd stop allowance and otherwise returns `STALE_OWNED_BLOCKED`. Once the
+lock is acquired, the new root supervisor reconciles the exact recorded
+service instance/cgroup, every recorded or cgroup-discovered descendant,
+relay/evaluator PID/start/executable, socket inode, tunnel, episode, and nonce.
+It may signal only members of that exact cgroup, including a relay forked after
+`RELAY_START_PENDING` but before its PID record. It requires an empty cgroup,
+no matching relay/evaluator process, no live policy socket inode, and a durable
+recovery-terminal journal record. A mismatch or foreign member is
+`FOREIGN_BLOCKED`; the recoverer creates no output child and never pattern-
+kills a process.
 
 Before dropping privilege, the supervisor constructs fresh mount and network
 namespaces and pivots into a new empty tmpfs root. FD-backed, no-follow mounts
@@ -1445,15 +1574,20 @@ Recovery then applies one exact predicate:
   happened, stop only that attributable container, require exact `exited`
   state, reconcile the manager-only identity record, and require no server or
   helper.
-- **evaluate:** require the exact container labels plus every available
-  local evaluator/tunnel and remote server/helper PID, start-time, argv,
-  namespace, process-group, cgroup, port, and GPU mapping, including the
-  checkpoint tracer and its server child. Evaluate recovery
-  must run on the recorded PC2 manager host so it can reconcile local process
-  identities and event-pipe EOF; another host is `FOREIGN_BLOCKED`. It stops
-  only those attributed workloads and reaches exited/no-helper/no-port
-  postconditions, then completes the post-cleanup source and checkpoint
-  manifests before clearing the cleanup flag.
+- **evaluate:** require the exact container labels plus the root-owned runner
+  output/journal record, service instance/cgroup, manager connection state,
+  relay and evaluator PID/start/executable/process-group/namespace identities,
+  both policy-socket inodes, tunnel identity, and every remote server/helper
+  PID, argv, cgroup, port, and GPU mapping, including the checkpoint tracer and
+  its server child. Evaluate recovery must run on the recorded PC2 manager host
+  so it can invoke the fixed runner `recover_episode` transaction, reconcile
+  local event-pipe EOF, and prove the exact episode service cgroup empty;
+  another host is `FOREIGN_BLOCKED`. It stops only those attributed workloads
+  and reaches no-runner/no-evaluator/no-relay/no-policy-socket plus exited/no-
+  helper/no-port postconditions, then completes the post-cleanup source and
+  checkpoint manifests before clearing the cleanup flag. A missing relay PID
+  after `RELAY_START_PENDING` is reconciled from the exact recorded service
+  cgroup rather than treated as proof that no relay started.
 
 A record missing a fact required by its own operation becomes
 `FOREIGN_BLOCKED`; missing records that the operation could never create are
@@ -2113,14 +2247,15 @@ environment construction.
 
 The lifecycle manager creates a fresh event pipe and acknowledgement pipe,
 opens the verified protected closure root, protected base-Python root,
-identity sidecar, and configured workload-parent root, and starts the fresh
-policy relay/socketpair before each evaluator. It continuously drains the
-event read end and retains the acknowledgement write end. The strict
-`evaluate_episode` request transfers the opposite pipe ends, three read-only
-identity/root FDs, workload-parent FD, and policy-transport FD—exactly the
-seven roles in the operation table. The supervisor creates/mounts only that
-episode's child, duplicates the six evaluator FDs to descriptors 3--8, and
-performs the sealed-loader exec through descriptor 9.
+identity sidecar, and configured workload-parent root before each evaluator.
+It continuously drains the event read end and retains the acknowledgement
+write end. The strict `evaluate_episode` request transfers the opposite pipe
+ends, three read-only identity/root FDs, and workload-parent FD—exactly the six
+roles in the operation table. The supervisor journals and creates the relay/
+socketpair itself, creates/mounts only that episode's child, duplicates the six
+evaluator FDs to descriptors 3--8, and performs the sealed-loader exec through
+descriptor 9. The lifecycle manager never owns an unjournaled relay process or
+policy socket.
 
 All six evaluator FD options are required together and accepted only with
 `--num-workers 1`; the evaluator validates their direction/type, sandbox path
@@ -2229,18 +2364,22 @@ proving validated and rejected ordering, acknowledgement failures,
 malformed-event/early-EOF handling, exact UID/private-root state, and that no
 in-process callback substitution can satisfy the manager.
 
-Before the next episode starts, the prior evaluator must have exited and its
-local worker/WBC children must be gone. If cleanup after one episode cannot be
+Before the next episode starts, the prior runner journal must be terminal, its
+service cgroup empty, both policy socket inodes absent, and its evaluator,
+relay, local worker, and WBC children gone. If any postcondition cannot be
 proven, the second episode is not started. A normal task-level failure may
-proceed to the next episode; an infrastructure or cleanup failure may not.
+proceed only after those ownership postconditions; an infrastructure or
+cleanup failure may not.
 
-The runner supervisor starts each evaluator as a new local process group. Its
-attested launch response and `/proc` reconciliation record the leader PID,
-leader process start time, process-group ID, evaluator UID/GID, sandbox
-namespace identities, and exact argv. These define local ownership. Worker and
-WBC descendants are enumerated from that group and process tree; cleanup never
-matches processes by name alone, and the lifecycle manager requests signals
-through the supervisor rather than signaling the group itself.
+The runner supervisor starts each relay/evaluator ownership unit in one
+dedicated service cgroup and the evaluator itself in a new local process group.
+Its attested launch response and `/proc` reconciliation record the supervisor,
+relay, and evaluator PIDs/start times, service cgroup, evaluator process-group
+ID, socket inodes, evaluator UID/GID, sandbox namespace identities, and exact
+argv. These define local ownership. Worker and WBC descendants are enumerated
+from the service cgroup plus evaluator group/process tree; cleanup never matches
+processes by name alone, and the lifecycle manager requests all signals through
+the supervisor rather than signaling either process itself.
 
 ## Deadlines and shutdown
 
@@ -2274,18 +2413,21 @@ stopped.
 Cleanup is registered before each resource is started and executes in reverse
 order. It is attempted in this order:
 
-1. request bounded interrupt/KILL/reap of the active evaluator and its owned
-   children through the runner supervisor, then close its control connection;
-2. close the policy-transport socket and stop/reap the exact owned relay;
-3. close the SSH tunnel;
-4. detach or stop the exact owned checkpoint tracer if it remains, preserving
+1. request the runner's bounded ownership-unit cleanup: interrupt/KILL/reap the
+   evaluator and descendants, close both policy socket ends, interrupt/KILL/
+   reap the relay, require the original cgroup contains only its supervisor,
+   write `DESCENDANTS_GONE`, and close the manager control connection; after
+   that instance exits and its cgroup disappears, call `finalize_episode` to
+   append the terminal journal record;
+2. close the SSH tunnel;
+3. detach or stop the exact owned checkpoint tracer if it remains, preserving
    its bounded trace and revalidating the server child;
-5. stop the owned server inside the container, unless ownership has become
+4. stop the owned server inside the container, unless ownership has become
    foreign or unknown;
-6. copy final remote evidence;
-7. stop the dedicated container only when the current lease started it and all
+5. copy final remote evidence;
+6. stop the dedicated container only when the current lease started it and all
    remaining workloads are owned by the current run; and
-8. verify local and remote postconditions.
+7. verify local and remote postconditions.
 
 Remote INT, TERM, and KILL, and local runner INT/KILL, are used only after
 ownership is revalidated at that stage. After KILL, a fresh bounded wait and
@@ -2294,18 +2436,21 @@ Failure in one cleanup action is recorded but does not skip later actions.
 Terminal restoration, open log closure, and manifest finalization are
 unconditional even after the shared cleanup budget is exceeded.
 
-If an ownership check in steps 4, 5, or 7 is foreign or unknown, the manager
+If an ownership check in steps 3, 4, or 6 is foreign or unknown, the manager
 records `FOREIGN_BLOCKED` and does not send a signal or stop the container. It
-still closes its proven local evaluator/tunnel resources and finalizes
-evidence. This exception to the desired exited postcondition is always a
-non-PASS terminal state and leaves the lease marked for operator inspection.
+still invokes only the exact runner operation cleanup whose journal/cgroup is
+proven owned, closes its tunnel, and finalizes evidence. An unknown runner
+journal or service cgroup is not signaled. This exception to the desired exited
+postcondition is always a non-PASS terminal state and leaves the lease marked
+for operator inspection.
 
 The persistent container object remains for reuse, but its required terminal
 state for PASS is `exited`. A run cannot pass if the container is running, the
-owned server, checkpoint tracer, tunnel, or policy relay is alive, either relevant port is listening, an
-evaluator or owned WBC child remains, either selected GPU retains an owned
-process, any sealed PC2/H100 input or the checkpoint tree changed, or liveness
-is unknown.
+owned server, checkpoint tracer, tunnel, runner service cgroup, or policy relay
+is alive; a runner journal is nonterminal; a policy socket inode or relevant
+listener remains; an evaluator or owned WBC child remains; either selected GPU
+retains an owned process; any sealed PC2/H100 input or checkpoint tree changed;
+or liveness is unknown.
 
 ## Evidence contract
 
@@ -2437,6 +2582,10 @@ episode_3/
   result.json
   artifacts.json
 evaluator-output/OUTPUT.json
+evaluator-output/runner-journal/episode_2.lock
+evaluator-output/runner-journal/episode_2.jsonl
+evaluator-output/runner-journal/episode_3.lock
+evaluator-output/runner-journal/episode_3.jsonl
 evaluator-output/probe_loader/
   loader-probe.log
   loader-probe.json
@@ -2612,9 +2761,10 @@ new run ID and preserves all earlier evidence.
   otherwise request stop of only the owned evaluator through the runner.
   Preserve descriptor/path/mapping identities and never adopt the new path.
 - **Runner identity, namespace, or authority failure:** reject launch before
-  exec, or stop/reap only the already supervised child. A missing runner
-  terminal record, surviving child, evaluator access to either privileged
-  socket/control root, or host-library mapping is cleanup failure.
+  exec, or stop/reap only the journaled relay/evaluator ownership unit. A
+  missing runner terminal record, nonempty service cgroup, surviving relay,
+  evaluator access to either privileged socket/control root, or host-library
+  mapping is cleanup failure.
 - **Run-output collision:** a preexisting output root makes `prepare_output`
   fail; a preexisting operation child fails only that new run. A completed
   sibling operation never collides and is never mounted or modified.
@@ -2622,7 +2772,7 @@ new run ID and preserves all earlier evidence.
   host network namespace, unexpected interface/route, reachable host sentinel,
   wrong/missing relay/socket identity, or host/port fallback. During execution,
   malformed relay frames, EOF, timeout, or tunnel drift faults the episode and
-  triggers owned evaluator/relay cleanup.
+  triggers runner-owned evaluator/relay cleanup and a terminal journal check.
 - **Checkpoint trace failure:** stop only the owned unchanged server/tracer,
   preserve the bounded raw trace, and fail readiness; never infer a successful
   load from the HTTP listener alone.
@@ -2633,12 +2783,13 @@ new run ID and preserves all earlier evidence.
   signal it or stop a container holding it.
 - **Server crash or invalid warm-up:** preserve the complete server log and
   clean up without launching an evaluator.
-- **Tunnel failure during evaluation:** request runner-supervised evaluator
-  interrupt, close the policy transport, stop/reap the exact owned relay, then
-  perform normal cleanup; do not retry within the same run directory.
-- **Evaluator timeout:** use the runner's bounded INT/KILL behavior, prove the
-  child and descendants are gone, and do not start another episode unless
-  cleanup passed.
+- **Tunnel failure during evaluation:** request cleanup of the exact runner
+  ownership unit, require its evaluator, policy sockets, relay, and service
+  cgroup absent, then perform normal cleanup; do not retry within the same run
+  directory.
+- **Evaluator timeout:** use the runner's bounded ownership-unit INT/KILL
+  behavior, prove the evaluator descendants, relay, sockets, and service cgroup
+  are gone, and do not start another episode unless cleanup passed.
 - **Artifact, FFmpeg, or FFprobe failure:** preserve the raw and diagnostic
   temporary files, close every writer, and fail without deleting or replacing
   evidence.
@@ -2729,11 +2880,23 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   concurrent post-rename recoverers;
 - systemd-unit parsing that permits only fixed-parent `ReadWritePaths`, rejects
   token placeholders/specifiers, and confirms `Accept=yes` instances start
-  before request parsing; post-validation mutation-child tests expose only the
-  exact token staging directory and fixed directory FDs, reject sibling-token
-  access and arbitrary basenames, and fork no child on validation failure;
-- authoritative root-journal sequencing of rename then exclusive receipt
-  creation before the one terminal response, manager mirroring of
+  before request parsing; exact capability-set/stage tests require
+  `CAP_SYS_ADMIN` only through private-root setup in both processes, the three
+  declared metadata capabilities only through child normalization and parent
+  publication, zero child capabilities during final read-back, and zero parent
+  capabilities before response; post-validation child tests expose only the exact token
+  staging mount and result pipe, expose no source-parent/destination/receipt/
+  journal FD, reject sibling-token access and arbitrary basenames, forbid every
+  rename syscall in the child, and fork no child on validation failure;
+- same-mount-ID and `RENAME_NOREPLACE` provisioning probes for both protected
+  parents, with different-mount, bind-mount-root, `.`, `EEXIST`, `EXDEV`,
+  `EBUSY`, unsupported-flag, wrong-source-parent/basename, and identity-drift
+  publication rejection; successful publication must call parent-owned
+  `renameat2` once with the retained source/destination parent FDs and derived
+  basenames, then fsync both parents;
+- authoritative root-journal sequencing of `PREPARED`, `RENAME_PENDING`, the
+  parent-only rename, then exclusive receipt creation before the one terminal
+  response, manager mirroring of
   `FINAL_RENAMED` and `RECEIPT_CREATED` only after journal/response validation,
   and crash recovery before response plus before/after each mirror without an
   intermediate protocol frame;
@@ -2793,9 +2956,11 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   `probe_loader`, `probe_cuda`, `episode_2`, and `episode_3` children,
   a full prepare→loader→CUDA→episode-2→episode-3 sentinel sequence, repeated-
   operation collision with all siblings preserved, cross-operation
-  nonvisibility, arbitrary output-FD/path refusal, launcher
-  socket closure on exec, manager-disconnect cleanup, and arbitrary argv/
-  environment/FD refusal;
+  nonvisibility, arbitrary output-FD/path refusal, root-owned stable operation
+  locks and hash-chained write-ahead journals, launcher socket closure on exec,
+  `DESCENDANTS_GONE` before original-service exit, separate
+  `finalize_episode` proof of absent original cgroup before `TERMINAL`, manager-
+  disconnect ownership-unit cleanup, and arbitrary argv/environment/FD refusal;
 - exact runtime-evidence option/six-FD evaluator pairing and schema/type
   validation, including loader/sandbox/UID/GID, network, policy socket, and
   relay identities;
@@ -2807,17 +2972,26 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   PID/start attribution, serialized-request framing, sequence/size/deadline and
   one-in-flight enforcement, fixed owned-tunnel `/act` destination, host/port/
   URL/reconnect refusal inside both CLI and managed client, malformed/EOF/
-  timeout handling, and relay cleanup before the next episode;
+  timeout handling, runner-only relay/socket creation, and relay cleanup before
+  the next episode;
+- crash injection after `OUTPUT_CHILD_PENDING`, after child creation but before
+  its identity record, immediately after `RELAY_START_PENDING`, after relay
+  fork but before its PID record, after `RELAY_STARTED`, after evaluator launch,
+  and during an in-flight policy request; manager-EOF and `recover_episode` tests
+  must reconcile the exact operation journal/service cgroup, kill no foreign
+  process, leave no relay/evaluator/policy-socket member, and permit exactly one
+  concurrent stale recoverer; live-manager recovery after runner failure must
+  satisfy the same postconditions without pretending the manager is dead;
 - unsafe `ENV_TYPE`, interface, and domain values each failing before
   `gym.make`, with the rejected record present and no `creating_env` event;
 - validated event order of durable evidence, `runtime_contract`,
   `worker_init(creating_env)`, then `gym.make`, plus rejected event order of
   durable evidence, `runtime_contract(rejected)`, then worker error;
 - actual manager/runner/evaluator event-pipe, acknowledgement-pipe,
-  closure-root-FD, base-root-FD, identity-FD, workload-parent-FD, and managed
-  policy-transport-FD transport with exact supervisor/relay PID-start records,
-  process-group response, sequence, private-root/network identity validation,
-  plus malformed UTF-8/JSON,
+  closure-root-FD, base-root-FD, identity-FD, and workload-parent-FD transport,
+  plus runner-internal policy-transport-FD creation/inheritance, with exact
+  supervisor/relay PID-start/cgroup records, process-group response, sequence,
+  private-root/network identity validation, plus malformed UTF-8/JSON,
   partial/oversize write, silence, early EOF, and callback-only rejection;
 - same-account closure/base-Python swap attempts after descriptor open and
   before evaluator exec, requiring chmod/rename/unlink/symlink/lookalike
@@ -2874,7 +3048,9 @@ The runtime is promoted through these gates in order:
    digest-qualified image, then commit only the candidate profile as approval
    commit `P` without starting the dedicated container;
 3. inject and recover every local base-Python/closure-construction crash point,
-   including final rename before receipt creation, then run
+   including capability-stage boundaries, parent-only FD-relative final rename,
+   and final rename before receipt creation; require the same-mount and
+   `RENAME_NOREPLACE` probes to pass, then run
    two concurrent local constructors/recoverers and two concurrent normal
    remote lease probes, requiring exactly one winner in each race. Attempt the
    same-account post-descriptor-open closure/base-Python swap and require every
@@ -2884,7 +3060,11 @@ The runtime is promoted through these gates in order:
    mapping audit; require the evaluator UID to be unable to reach sibling
    outputs or installer/control/staging state. Exercise the loopback-only
    private network against host-interface/loopback sentinels and the exact
-   policy-FD relay protocol without starting a model. Exercise a simulated
+   runner-owned policy-FD relay protocol without starting a model. Inject
+   manager/runner crashes after relay creation, after evaluator launch, and
+   during a fake in-flight request; require `finalize_episode` or
+   `recover_episode` to leave a terminal journal, absent original service
+   cgroup, relay, evaluator, and sockets. Exercise a simulated
    1,800-second remote mutation while heartbeats remain current, and release cleanly;
 4. run `status` and local/leased preflight, including path containment, mount
    alias, GPU, runner-service, output-root/subdirectory, loader/private-root,
