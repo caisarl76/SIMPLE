@@ -20,7 +20,8 @@ This design does not:
   remain byte-identical, and checkpoint-load evidence is collected externally;
 - certify the step-40000 checkpoint for the PC2 real-time bridge;
 - add `/contract` or `/act-rtc-v1` to the official server;
-- enable DDS, a real network interface, or a real robot; or
+- expose evaluator-local DDS outside its private loopback-only namespace,
+  enable a real network interface, or enable a real robot; or
 - stop, restart, or otherwise modify the existing shared
   `jihun_psi0_sonic_train_gpu23_20260805` container.
 
@@ -303,6 +304,8 @@ pc2_runner_config_sha256: 64-character lowercase hexadecimal string
 pc2_runner_service_unit_sha256: 64-character lowercase hexadecimal string
 pc2_runner_socket_unit_sha256: 64-character lowercase hexadecimal string
 pc2_runner_sandbox_contract_sha256: 64-character lowercase hexadecimal string
+pc2_policy_relay_sha256: 64-character lowercase hexadecimal string
+pc2_policy_relay_contract_sha256: 64-character lowercase hexadecimal string
 pc2_evaluator_uid: positive integer
 pc2_evaluator_gid: positive integer
 pc2_mode_policy_version: positive integer
@@ -613,11 +616,31 @@ The reviewed service unit fixes `User=root`, `NoNewPrivileges=yes`,
 `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`,
 `ProtectSystem=strict`, an empty executable search path beyond the single
 attested installer, a capability bounding set limited to the ownership/mode
-operations it requires, and `ReadWritePaths` limited to the two protected
-input roots plus the token-derived workload staging root. It has no shell,
-Docker socket, SSH key, device access, network listener, or arbitrary command
-field. The socket unit uses `Accept=yes`, one request per connection, bounded
-message/idle timeouts, and no filesystem path supplied by the peer.
+operations it requires, and a static `ReadWritePaths` allowlist containing only
+the fixed workload-staging parent, the two protected input parents, and their
+fixed receipt/completion/journal parents. It never claims a token-derived
+systemd directive. It has no shell, Docker socket, SSH key, device access,
+network listener, or arbitrary command field. The socket unit uses
+`Accept=yes`, one request per connection, bounded message/idle timeouts, and no
+filesystem path supplied by the peer. This matches systemd's contract that
+`Accept=yes` instantiates a template service for each accepted connection; the
+unit namespace therefore exists before the instance can parse request JSON
+([systemd `systemd.socket` source](https://github.com/systemd/systemd/blob/main/man/systemd.socket.xml)).
+
+The activated instance initially has only that fixed-parent allowlist. After
+peer, stable-lock, current-owner-record, token, phase, and containment
+validation, it no-follow opens the exact token-named staging directory and the
+fixed operation-specific destination, receipt/completion, and journal parent
+directories. It then forks one mutation child, creates a private mount
+namespace with an empty tmpfs root, bind-mounts only the exact staging
+directory at `/staging`, and passes the other already-open directory FDs at
+fixed descriptor numbers. Sibling staging entries and host paths are absent.
+The child accepts no new socket input or path, derives the exact absent target
+and metadata basenames from the already validated IDs, and applies a fixed
+seccomp/capability policy permitting only the required FD-relative validation,
+metadata, hash, rename, fsync, and receipt/journal operations. The activated
+parent can only wait, enforce the deadline, and return the child's bounded
+terminal record. A validation failure forks no child and performs no mutation.
 
 Each connection sends exactly one length-bounded canonical JSON request plus
 the already locked stable construction-lock FD via `SCM_RIGHTS`. The service obtains the
@@ -725,7 +748,8 @@ compute the authoritative mode-inclusive manifests for `source`, `venv`,
 and hashes the already complete `hssd-normalization-results.json`, then
 computes `pc2_runtime_identity_sha256`, whose canonical inputs include the
 protected base-Python tree/root/receipt, loader hash, normalization-results
-digest, runner sandbox digest, and evaluator UID/GID. It writes the exact
+digest, runner sandbox digest, policy-relay executable/contract hashes, and
+evaluator UID/GID. It writes the exact
 `runtime-identity.json` as owned mode `0444` and hashes that sidecar before
 writing `COMPLETE.json` as the completion metadata. The normalization-results
 file, identity sidecar, and completion marker are explicitly excluded from
@@ -812,7 +836,8 @@ name stable and reviewable.
 Location- and installation-bound fields are deliberately excluded from the
 closure descriptor: base/closure host paths, mount IDs, devices/inodes,
 root-identity digests, completion/receipt bytes, installer configuration and
-service/socket units, lifecycle/evaluator UIDs, and timestamps. They remain
+service/socket units, runner/relay/service/sandbox identities,
+lifecycle/evaluator UIDs, and timestamps. They remain
 mandatory reviewed runtime provenance and may block adoption, but moving an
 otherwise byte-identical protected base tree or regenerating location-bound
 receipt metadata cannot change `pc2_closure_id`.
@@ -937,6 +962,8 @@ pc2_asset_normalization_results_sha256: 64-character lowercase hexadecimal strin
 pc2_runtime_identity_sha256: 64-character lowercase hexadecimal string
 pc2_closure_root_identity_sha256: 64-character lowercase hexadecimal string
 pc2_runner_sandbox_contract_sha256: 64-character lowercase hexadecimal string
+pc2_policy_relay_sha256: 64-character lowercase hexadecimal string
+pc2_policy_relay_contract_sha256: 64-character lowercase hexadecimal string
 ```
 
 The sidecar sits outside the component trees whose digests it carries, so it
@@ -1019,47 +1046,96 @@ exec. Its systemd filesystem allowlist and seccomp policy are part of
 `pc2_runner_sandbox_contract_sha256`. An added capability, writable host path,
 unit override, or executable dependency fails preflight.
 
-The manager sends one strict launch request plus exactly six FDs with
-`SCM_RIGHTS`: event-write, acknowledgement-read, closure-root,
-base-Python-root, identity-sidecar, and the configured workload-parent-root FD.
-The supervisor requires that sixth FD to match the profiled workload-parent
-inode, no-follow opens the exact `<run-id>` directory and its manager-created
-exclusive nonce marker, then exclusively creates
-`<run-id>/evaluator-output`, changes only that new child to the evaluator UID
-plus lifecycle evidence group, and mounts it at `/run-output`. The request
-contains only schema version, reviewed profile
-hash, operation (`loader_probe`, `cuda_probe`, or `evaluate_episode`), run ID,
-episode index/nonce/loopback port with exact operation-specific nullability,
-and the six expected FD-role labels. Only `evaluate_episode` accepts episode
-index `2` or `3`, a fresh nonce, and a loopback port; both probes require those
-three fields to be null. The supervisor validates `SO_PEERCRED`, the
-manager PID/start ticks, all FD identities, the reviewed profile, and every
-enumerated value. It constructs the fixed argv/environment from those values;
-it never accepts an arbitrary command, path, argument, or environment
-extension. It then supervises one child in a fresh process group, reports its
-PID/start ticks/process-group ID over the same connection, and accepts only
-bounded `INT`, `KILL`, status, and close messages for that child. The evaluator
-inherits only the five existing runtime/event FDs; it receives the run output
-as a mounted path, not an authority FD. The launcher control socket and every
-unrelated FD are close-on-exec. Losing the manager connection triggers the
-same bounded owned-child cleanup and terminal evidence.
+Runner requests have operation-specific exact FD schemas; additional, missing,
+reordered, or role-mismatched FDs are rejected:
 
-Before dropping privilege, the supervisor constructs a fresh mount namespace
-and pivots into a new empty tmpfs root. FD-backed, no-follow mounts expose only:
+| Operation | Required `SCM_RIGHTS` roles | Output behavior |
+| --- | --- | --- |
+| `prepare_output` | workload-parent-root | exclusively create the one run output root; no child |
+| `loader_probe` | closure-root, base-Python-root, identity-sidecar, workload-parent-root | exclusively create `probe_loader` |
+| `cuda_probe` | closure-root, base-Python-root, identity-sidecar, workload-parent-root | exclusively create `probe_cuda` |
+| `evaluate_episode` | event-write, acknowledgement-read, closure-root, base-Python-root, identity-sidecar, workload-parent-root, policy-transport | exclusively create `episode_2` or `episode_3` |
+
+`prepare_output` requires the workload-parent FD to match the profiled inode,
+no-follow opens the exact `<run-id>` directory and manager-created exclusive
+nonce marker, then exclusively creates `<run-id>/evaluator-output` once. It
+leaves that directory root-owned, lifecycle-readable, and evaluator-
+inaccessible, and writes a root-owned `OUTPUT.json` binding its device/inode,
+run ID, nonce-marker identity, profile, evaluator UID/GID, and sandbox digest.
+Every later operation requires that exact directory and marker and never
+creates or changes the output root. It exclusively creates only its distinct
+child shown above, assigns that child to the evaluator UID plus lifecycle
+evidence group, and mounts only that child at `/run-output`. A preexisting
+operation child is a collision failure; another operation's completed child is
+not a collision.
+
+Every request contains only schema version, reviewed profile hash, the listed
+operation, run ID, operation-specific fields, and its exact FD-role list.
+`evaluate_episode` alone accepts episode index `2` or `3`, a fresh nonce, owned
+tunnel identity/loopback port, and policy-transport FD; all other operations
+require those fields to be null. The supervisor validates `SO_PEERCRED`, the
+manager PID/start ticks, all FD identities, the reviewed profile, output-root
+record, and every enumerated value. It constructs the fixed argv/environment
+from those values and never accepts an arbitrary command, path, argument, or
+environment extension. Child operations run in fresh process groups and
+report PID/start ticks/process-group ID over the same connection. The
+supervisor accepts only bounded `INT`, `KILL`, status, and close messages for
+that child. Losing the manager connection triggers the same bounded
+owned-child cleanup and terminal evidence.
+
+For `evaluate_episode`, the manager first starts one attested, tracked policy
+relay whose executable/source identity is `pc2_policy_relay_sha256` and whose
+strict framing, endpoint, deadline, and cleanup document is
+`pc2_policy_relay_contract_sha256`. The relay retains the host network
+namespace but accepts no listener. One end of a fresh `AF_UNIX SOCK_STREAM`
+socketpair is its sole client; the other is the `policy-transport` FD. Each
+frame has a fixed-width length prefix and canonical JSON carrying only schema
+version, monotonically increasing sequence, and the exact object returned by
+the production `RequestMessage.serialize()` method. Both directions enforce
+profiled maximum frame sizes, exact-length reads, one request in flight, and
+reject trailing or pipelined bytes. There is no caller-supplied URL, method,
+header, or destination. The relay sends the same canonical request bytes as
+the HTTP JSON body with the fixed `application/json` content type. It opens or
+reuses only the manager-attested
+`127.0.0.1:<owned-tunnel-port>` connection, sends a bounded HTTP POST to
+exactly `/act`, and returns only sequence, HTTP status, length, and bounded
+response bytes. Timeout, malformed framing, extra data, tunnel identity drift,
+relay exit, or transport EOF fails the episode; there is no reconnect or
+ordinary network fallback inside the evaluator.
+
+The supervisor verifies the transport is the expected connected Unix socket
+end and binds it to the current relay PID/start ticks, executable hash, tunnel
+record, and episode nonce. It duplicates event-write, acknowledgement-read,
+closure-root, base-Python-root, identity-sidecar, and policy-transport to fixed
+evaluator FDs `3` through `8`; the sealed loader uses launcher-only FD `9`.
+Managed evaluation adds `--policy-transport-fd 8` and rejects `--host`/`--port`
+or any client reconnect path. Unmanaged callers retain their existing HTTP
+host/port behavior. The relay and its socket are registered for cleanup before
+the evaluator starts, and relay EOF plus terminal PID evidence are required
+before the next episode.
+
+Before dropping privilege, the supervisor constructs fresh mount and network
+namespaces and pivots into a new empty tmpfs root. FD-backed, no-follow mounts
+expose only:
 
 | Sandbox path | Source | Access |
 | --- | --- | --- |
 | `/sealed/closure` | inherited closure-root FD | read-only, nodev, nosuid |
 | `/sealed/base-python` | inherited base-root FD | read-only, nodev, nosuid |
-| `/run-output` | supervisor-created evaluator-output child FD | read-write, noexec, nodev, nosuid |
+| `/run-output` | supervisor-created operation child FD | read-write, noexec, nodev, nosuid |
 | `/tmp` | new bounded tmpfs | read-write, noexec, nodev, nosuid |
 | `/proc` | new proc mount | read-only except required process-self interfaces |
 | `/dev` and `/sys` | exact profiled GPU/device and read-only hardware allowlists | no executable regular files |
 | allowlisted `/etc` and `/usr/share` aliases | fixed paths below inherited base-root FD | read-only, nodev, nosuid |
 
-The host network namespace is retained only for the existing PC2 loopback
-tunnel. Host `/`, `/home`, `/mnt/data`, `/usr`, `/lib*`, `/etc/ld.so.cache`,
-manager control/staging, and `/run/psi0-simple-eval` are absent. The small
+The evaluator network namespace contains only a new `lo` interface, has no
+veth, physical interface, non-loopback address, default route, or host-network
+namespace socket, and forbids raw/packet sockets and namespace changes. DDS
+domain 0 traffic is therefore confined to evaluator descendants in that same
+namespace; host-loopback DDS peers and every real interface are unreachable.
+Policy traffic uses only the inherited Unix policy-transport FD above. Host
+`/`, `/home`, `/mnt/data`, `/usr`, `/lib*`, `/etc/ld.so.cache`, manager
+control/staging, and `/run/psi0-simple-eval` are absent. The small
 private-root `/etc` and `/usr/share` alias manifest is fixed in the sandbox
 contract; every alias is a no-follow read-only bind from a named path beneath
 the protected base FD and can never resolve to the host tree. Required
@@ -1067,8 +1143,8 @@ configuration/ICD files and every user-space GPU/graphics library are copied
 into that protected base-Python tree. After mount setup the child drops
 all supplementary groups and capabilities, sets the exact evaluator UID/GID,
 sets `PR_SET_NO_NEW_PRIVS`, applies the reviewed runner seccomp/device policy,
-and can write only `/run-output` and `/tmp`. The canonical namespace, UID/GID,
-mount, device, capability, seccomp, and environment document is
+and can write only `/run-output` and `/tmp`. The canonical mount/network
+namespace, UID/GID, device, capability, seccomp, FD, and environment document is
 `pc2_runner_sandbox_contract_sha256`.
 
 The base snapshot is a complete executable closure, not merely copied Python
@@ -1231,12 +1307,13 @@ difference is
 `/mnt/data/jihun/psi0-simple-eval-workloads/<run-id>` root and cannot make the
 sealed Git snapshot dirty. The lifecycle manager exclusively creates that run
 root and nonce marker beneath the profiled workload parent. The runner
-supervisor validates the parent FD, run directory, and marker, exclusively
-creates only `<run-id>/evaluator-output`, assigns that child to the evaluator
-UID plus lifecycle evidence group, and mounts the child at `/run-output`. The
-evaluator cannot traverse the workload parent, manager evidence, or any sibling
-staging/run directory, while the manager retains read-only access to the
-evaluator-output evidence.
+supervisor's one `prepare_output` transaction validates the parent FD, run
+directory, and marker and exclusively creates
+`<run-id>/evaluator-output`. Each later operation exclusively creates and
+mounts only its own `probe_loader`, `probe_cuda`, `episode_2`, or `episode_3`
+child. The evaluator cannot traverse the output-root parent, other operation
+children, manager evidence, workload parent, or sibling staging/run directory,
+while the manager retains read-only access to completed operation evidence.
 
 ## Remote lease and concurrency
 
@@ -1566,18 +1643,21 @@ fails closed. Failure reaches `PROVENANCE_BLOCKED` without touching H100
 control state.
 
 After the atomic lease is acquired, the remaining preflight is read-only except
-for the two tracked runner-supervised PC2 loader/CUDA probe children and
-completes before the container is started. Across the two phases it must:
+for one tracked `prepare_output` transaction and the two runner-supervised PC2
+loader/CUDA probe children, each using its distinct output path. It completes
+before the container is started. Across the two phases it must:
 
 1. revalidate the current lease token and heartbeat;
 2. confirm bounded SSH connectivity and collect the remote host identity,
    boot ID, and wall clock;
-3. attest the complete sealed PC2 source, exact clean recursive gitlinks,
+3. exclusively prepare and attest the single run output root, then attest the
+   complete sealed PC2 source, exact clean recursive gitlinks,
    venv/protected-base-Python/native environment, episode data, task assets,
    immutable requirements, normalization results, import origins, and offline
    data-root behavior against the profile; attest the runner binary/config/
-   units, dedicated evaluator UID/GID and private-root contract, and pass the
-   model-free direct-loader mapping/access probe;
+   units, policy-relay binary/contract, dedicated evaluator UID/GID and
+   private-root/network contract, and pass the model-free direct-loader
+   mapping/access probe;
 4. attest the H100 input-installer executable, protected source, `.venv`,
    offline HF snapshot, profiled checkpoint tracer and exact security/argv
    contract, protected seccomp host path/digest, source installer receipt and
@@ -1808,7 +1888,7 @@ frozen `simple.evals.api.EvalConfig` field. Parent kwargs and worker kwargs must
 carry the exact path. When set, it replaces the derived global
 `data/evals/<policy>/...` video root; it does not change `--eval-dir`.
 
-The supervisor passes `/run-output/episode_<N>/videos`; its new host-side
+The supervisor passes `/run-output/videos`; its new host-side
 evidence path is:
 
 ```text
@@ -1866,7 +1946,8 @@ Episodes 2 and 3 run separately in ascending order, giving each an independent
 20-minute deadline and exit record. The supervisor, not the lifecycle account,
 constructs the following effective private-root environment from the reviewed
 runner configuration. `<N>`, `<run-id>`, `<episode-nonce>`, and `<local-port>`
-are the only enumerated launch-request substitutions; `PYTHONPATH` is the exact
+are the only enumerated launch-request substitutions; the port is consumed by
+the outer relay and never appears in evaluator argv. `PYTHONPATH` is the exact
 ordered sandbox-path list whose relative origins are in the profiled import
 manifest:
 
@@ -1893,12 +1974,12 @@ PYTHONPATH=<profiled sandbox source/submodule paths>
 ```
 
 The supervisor duplicates event-write, acknowledgement-read, closure-root,
-base-Python-root, and identity-sidecar FDs to fixed child descriptors `3`
-through `7`, opens the loader as launcher-only FD `8`, and executes this exact
-argv without a shell or external timeout wrapper:
+base-Python-root, identity-sidecar, and policy-transport FDs to fixed child
+descriptors `3` through `8`, opens the loader as launcher-only FD `9`, and
+executes this exact argv without a shell or external timeout wrapper:
 
 ```text
-8
+9
 --inhibit-cache
 --library-path
 /sealed/closure/venv/lib:/sealed/base-python/lib:/sealed/base-python/lib64:/sealed/base-python/usr/lib:/sealed/base-python/usr/lib64
@@ -1914,19 +1995,17 @@ train
 lerobot
 --data-dir
 /sealed/closure/episode-data
---host
-127.0.0.1
---port
-<local-port>
+--policy-transport-fd
+8
 --sim-mode
 mujoco_isaac
 --headless
 --eval-dir
-/run-output/episode_<N>/eval-logs
+/run-output/eval-logs
 --video-output-dir
-/run-output/episode_<N>/videos
+/run-output/videos
 --runtime-evidence-path
-/run-output/episode_<N>/wbc-runtime-contract.json
+/run-output/wbc-runtime-contract.json
 --runtime-evidence-run-id
 <run-id>
 --runtime-evidence-nonce
@@ -1962,8 +2041,16 @@ from that worker-produced record; a separately reconstructed default or a
 hard-coded zero counter is not acceptable evidence. The worker refuses any
 other values before environment or channel construction.
 
-The three runtime-evidence options and all five runtime channel/root/identity
-FDs are supplied as one indivisible contract or rejected by the parent before
+Before writing that record, the evaluator also proves its network namespace
+inode differs from the manager/runner host namespace, its normalized interface
+and route inventories equal the loopback-only contract, and the policy FD is
+the supervisor-attested Unix socket connected to the current relay. The managed
+`Psi0DecoupledWbcAgent` constructs its client from that FD and cannot accept a
+host, port, URL, or fallback connector. These checks and the WBC configuration
+must all pass before `gym.make`; either isolation alone is insufficient.
+
+The three runtime-evidence options and all six event/root/identity/policy FDs
+are supplied as one indivisible managed contract or rejected by the parent before
 spawning. `run-id` must equal the manager's run ID, and the episode nonce is a
 fresh 128-bit lowercase hexadecimal value used only once.
 The exact JSON schema is:
@@ -1988,9 +2075,17 @@ pc2_base_python_root_identity_sha256: 64-character lowercase hexadecimal string
 pc2_runtime_identity_sha256: 64-character lowercase hexadecimal string
 pc2_closure_root_identity_sha256: 64-character lowercase hexadecimal string
 pc2_runner_sandbox_contract_sha256: 64-character lowercase hexadecimal string
+pc2_policy_relay_sha256: 64-character lowercase hexadecimal string
+pc2_policy_relay_contract_sha256: 64-character lowercase hexadecimal string
 runtime_identity_sidecar_sha256: 64-character lowercase hexadecimal string
 evaluator_uid: integer exactly pc2_evaluator_uid
 evaluator_gid: integer exactly pc2_evaluator_gid
+network_namespace_inode: positive integer, unequal to the manager host-network namespace inode
+network_interfaces_sha256: digest of exact loopback-only normalized interface inventory
+network_routes_sha256: digest of exact loopback-only normalized route inventory
+policy_transport_socket_inode: positive integer
+policy_relay_pid: positive integer
+policy_relay_start_ticks: positive integer
 config: exact object {ENV_TYPE: string, INTERFACE: string, DOMAIN_ID: integer}
 status: exactly "validated" or "rejected"
 error: null for validated, nonempty string for rejected
@@ -2009,26 +2104,30 @@ come only from the validated inherited identity FD and supervisor launch
 record. The evaluator computes and retains the exact sidecar digest before
 spawning its worker, the worker carries the already parsed immutable object,
 and the manager binds that digest plus the supervisor-attested UID/GID and
-sandbox digest to the reviewed profile through the contract event and
-acknowledgement; no layer calls Git.
+sandbox/relay digests, namespace inventory, policy socket, and relay process
+identity to the reviewed profile and owned tunnel through the contract event
+and acknowledgement; no layer calls Git.
 Closing, replacing, or mutating the identity descriptor before the durable
 record and contract event are emitted produces a rejected contract and zero
 environment construction.
 
-The lifecycle manager creates a fresh event pipe and acknowledgement pipe and
+The lifecycle manager creates a fresh event pipe and acknowledgement pipe,
 opens the verified protected closure root, protected base-Python root,
-identity sidecar, and new empty run-output root before each evaluator. It
-continuously drains the event read end and retains the acknowledgement write
-end. It transfers only the opposite pipe ends plus the three read-only input
-FDs and configured workload-parent FD to the runner supervisor in the strict
-six-FD launch request. The supervisor creates/mounts the output child,
-duplicates only the five
-runtime/event FDs to descriptors 3--7, and performs the evaluator exec.
+identity sidecar, and configured workload-parent root, and starts the fresh
+policy relay/socketpair before each evaluator. It continuously drains the
+event read end and retains the acknowledgement write end. The strict
+`evaluate_episode` request transfers the opposite pipe ends, three read-only
+identity/root FDs, workload-parent FD, and policy-transport FD—exactly the
+seven roles in the operation table. The supervisor creates/mounts only that
+episode's child, duplicates the six evaluator FDs to descriptors 3--8, and
+performs the sealed-loader exec through descriptor 9.
 
-All five evaluator FD options are required together and accepted only with
+All six evaluator FD options are required together and accepted only with
 `--num-workers 1`; the evaluator validates their direction/type, sandbox path
-bindings, and exact sidecar bytes, closes them on every exit path, and does not
-pass them to the simulator, policy client, or unrelated descendants. The
+bindings, exact sidecar bytes, policy socket identity, private-network
+inventory, and relay identity. It closes them on every exit path and passes
+the policy FD only to the managed policy client, never to the simulator or
+unrelated descendants. The
 existing in-process `progress_reporter` remains a TUI consumer but is not
 safety evidence. Every worker `report()` first emits one canonical JSON line
 to the manager event pipe with a single `os.write` no larger than `PIPE_BUF`,
@@ -2055,7 +2154,11 @@ Allowed event payloads are exact: `runtime_contract` carries `status`,
 `pc2_base_python_loader_sha256`,
 `pc2_base_python_root_identity_sha256`, `pc2_runtime_identity_sha256`,
 `pc2_closure_root_identity_sha256`, `pc2_runner_sandbox_contract_sha256`,
-`runtime_identity_sidecar_sha256`, `evaluator_uid`, and `evaluator_gid`;
+`pc2_policy_relay_sha256`, `pc2_policy_relay_contract_sha256`,
+`runtime_identity_sidecar_sha256`, `evaluator_uid`, `evaluator_gid`,
+`network_namespace_inode`, `network_interfaces_sha256`,
+`network_routes_sha256`, `policy_transport_socket_inode`, `policy_relay_pid`,
+and `policy_relay_start_ticks`;
 `worker_init`
 with `status="creating_env"` carries `total_episodes=1`, while
 `status="ready"` also carries finite `setup_seconds`, `max_episode_steps`, and
@@ -2075,10 +2178,13 @@ The single acknowledgement line has exact keys `schema_version=1`, `run_id`,
 `pc2_base_python_loader_sha256`,
 `pc2_base_python_root_identity_sha256`, `pc2_runtime_identity_sha256`,
 `pc2_closure_root_identity_sha256`, `pc2_runner_sandbox_contract_sha256`,
-`runtime_identity_sidecar_sha256`, `evaluator_uid`, and `evaluator_gid`; all
-identities must equal the profile, inherited sidecar, supervisor launch record,
-contract event, and durable file. No other acknowledgement bytes or keys are
-accepted.
+`pc2_policy_relay_sha256`, `pc2_policy_relay_contract_sha256`,
+`runtime_identity_sidecar_sha256`, `evaluator_uid`, `evaluator_gid`,
+`network_namespace_inode`, `network_interfaces_sha256`,
+`network_routes_sha256`, `policy_transport_socket_inode`, `policy_relay_pid`,
+and `policy_relay_start_ticks`; all identities must equal the profile,
+inherited sidecar, supervisor/relay launch records, contract event, and durable
+file. No other acknowledgement bytes or keys are accepted.
 
 The manager appends validated lines to
 `episode_<N>/runtime-events.jsonl`, records receive time, and rejects a line
@@ -2090,8 +2196,10 @@ fail before proceeding; safety events are never dropped.
 
 The manager accepts only a `validated` record whose run ID, episode index,
 nonce, worker ID/PID, commit/tree/gitlinks, closure/runtime identity, exact
-config, file identity, and creation interval match the current evaluator,
-profile, and inherited sidecar. The file must be created after that evaluator's
+config, dedicated UID/GID, private loopback network inventory, policy socket/
+relay identity, file identity, and creation interval match the current
+evaluator, profile, supervisor, owned tunnel, and inherited sidecar. The file
+must be created after that evaluator's
 recorded process start and before its first environment-construction progress
 event. The current `worker_init(status="creating_env")` report is moved: the
 worker must durably create the evidence file, emit
@@ -2155,6 +2263,8 @@ stopped.
 | Model process and TCP readiness | 300 s total | owned server reconciliation |
 | Warm-up `/act` response | 120 s | owned server reconciliation |
 | Each evaluator episode | 1200 s | 75 s runner-supervised INT/KILL/reap |
+| Policy relay request | profiled request timeout | evaluator fault before next action |
+| Policy relay signal stage | 2 s each for INT, TERM, and KILL | fresh liveness/socket check |
 | Each FFmpeg finalization | 120 s | bounded owned signal stages |
 | Tunnel signal stage | 2 s each for INT, TERM, and KILL | fresh liveness check |
 | Checkpoint tracer detach/signal | 5 s each for INT, TERM, and KILL | preserve trace and verify server identity |
@@ -2166,15 +2276,16 @@ order. It is attempted in this order:
 
 1. request bounded interrupt/KILL/reap of the active evaluator and its owned
    children through the runner supervisor, then close its control connection;
-2. close the SSH tunnel;
-3. detach or stop the exact owned checkpoint tracer if it remains, preserving
+2. close the policy-transport socket and stop/reap the exact owned relay;
+3. close the SSH tunnel;
+4. detach or stop the exact owned checkpoint tracer if it remains, preserving
    its bounded trace and revalidating the server child;
-4. stop the owned server inside the container, unless ownership has become
+5. stop the owned server inside the container, unless ownership has become
    foreign or unknown;
-5. copy final remote evidence;
-6. stop the dedicated container only when the current lease started it and all
+6. copy final remote evidence;
+7. stop the dedicated container only when the current lease started it and all
    remaining workloads are owned by the current run; and
-7. verify local and remote postconditions.
+8. verify local and remote postconditions.
 
 Remote INT, TERM, and KILL, and local runner INT/KILL, are used only after
 ownership is revalidated at that stage. After KILL, a fresh bounded wait and
@@ -2183,7 +2294,7 @@ Failure in one cleanup action is recorded but does not skip later actions.
 Terminal restoration, open log closure, and manifest finalization are
 unconditional even after the shared cleanup budget is exceeded.
 
-If an ownership check in steps 3, 4, or 6 is foreign or unknown, the manager
+If an ownership check in steps 4, 5, or 7 is foreign or unknown, the manager
 records `FOREIGN_BLOCKED` and does not send a signal or stop the container. It
 still closes its proven local evaluator/tunnel resources and finalizes
 evidence. This exception to the desired exited postcondition is always a
@@ -2191,7 +2302,7 @@ non-PASS terminal state and leaves the lease marked for operator inspection.
 
 The persistent container object remains for reuse, but its required terminal
 state for PASS is `exited`. A run cannot pass if the container is running, the
-owned server, checkpoint tracer, or tunnel is alive, either relevant port is listening, an
+owned server, checkpoint tracer, tunnel, or policy relay is alive, either relevant port is listening, an
 evaluator or owned WBC child remains, either selected GPU retains an owned
 process, any sealed PC2/H100 input or the checkpoint tree changed, or liveness
 is unknown.
@@ -2237,6 +2348,8 @@ preflight/
   pc2-installer-receipt.json
   pc2-runner-service.json
   pc2-runner-sandbox.json
+  pc2-runner-output.json
+  pc2-policy-relay-contract.json
   pc2-base-python-completion.json
   pc2-base-python-manifest.json
   pc2-loader-closure.json
@@ -2292,6 +2405,9 @@ tunnel/
 episode_2/
   command.json
   runner-process.json
+  policy-relay-process.json
+  network-namespace.json
+  policy-transport.json
   executable-map-audit.json
   filesystem-write-audit.json
   runtime-events.jsonl
@@ -2306,6 +2422,9 @@ episode_2/
 episode_3/
   command.json
   runner-process.json
+  policy-relay-process.json
+  network-namespace.json
+  policy-transport.json
   executable-map-audit.json
   filesystem-write-audit.json
   runtime-events.jsonl
@@ -2317,6 +2436,13 @@ episode_3/
   pc2-gpu-monitor.jsonl
   result.json
   artifacts.json
+evaluator-output/OUTPUT.json
+evaluator-output/probe_loader/
+  loader-probe.log
+  loader-probe.json
+evaluator-output/probe_cuda/
+  cuda-probe.log
+  cuda-probe.json
 evaluator-output/episode_2/
   evaluator.log
   wbc-runtime-contract.json
@@ -2340,6 +2466,8 @@ cleanup/
   pc2-base-python-root-after.json
   pc2-base-python-manifest-after.json
   pc2-runner-final.json
+  pc2-policy-relays-final.json
+  pc2-network-namespaces-final.json
   pc2-executable-map-audit-final.json
   pc2-episode-data-after.json
   pc2-task-assets-after.json
@@ -2351,13 +2479,15 @@ cleanup/
   ports-final.json
 ```
 
-Only `evaluator-output/` is mounted in the child namespace and writable by the
-evaluator UID. The manager owns and writes every other evidence path, drains
-events directly into the top-level `episode_<N>/runtime-events.jsonl`, and
-copies no manager-authored evidence into the child-writable tree. After the
-supervised child exits, it no-follow hashes and validates the explicitly
-allowlisted evaluator-output files before referencing them from manager-owned
-`artifacts.json` and the final manifest.
+Only the current operation child below `evaluator-output/` is mounted at
+`/run-output` and writable by the evaluator UID; the output root and every
+sibling operation child remain unmounted and inaccessible. The manager owns
+and writes every other evidence path, drains events directly into the top-level
+`episode_<N>/runtime-events.jsonl`, and copies no manager-authored evidence
+into the child-writable tree. After the supervised child exits, it no-follow
+hashes and validates the explicitly allowlisted files from that operation
+child before referencing them from manager-owned `artifacts.json` and the
+final manifest.
 
 JSON documents have a schema version and use atomic write-then-rename. The
 final manifest records every external command in redacted argv form, start and
@@ -2415,6 +2545,13 @@ Infrastructure PASS requires all of the following:
   exact private-root sandbox, exposed no installer/control/staging path, used
   the protected loader by FD, and recorded no executable mapping or loader
   access outside the closure/base roots;
+- `prepare_output` created the run output root exactly once, and the loader
+  probe, CUDA probe, episode 2, and episode 3 each exclusively owned one
+  distinct operation subdirectory with no cross-operation visibility;
+- each evaluator ran in a distinct loopback-only network namespace with no host
+  interface/route or host-loopback DDS visibility; every policy request used
+  only its attested FD relay to the owned SSH tunnel and the relay exited after
+  that episode;
 - both episode-specific offline asset probes covered their exact manifest
   subsets with zero download, write, network, or simulator construction;
 - the real `hssd:scene0` manager path used only normalized closure-local USD
@@ -2441,8 +2578,8 @@ Infrastructure PASS requires all of the following:
 - the manager-owned event channel proved the durable WBC record,
   identity-bound `runtime_contract`, acknowledgement, `creating_env`, and
   construction order without malformed data or early EOF;
-- no real-robot control process or non-loopback Unitree interface owned by the
-  run was observed;
+- the private namespace made real interfaces and unrelated host DDS peers
+  unreachable, and no real-robot control process was observed;
 - every owned process and port was absent after cleanup;
 - every owned checkpoint tracer was absent after cleanup;
 - every remote helper and helper descendant reached a recorded terminal state;
@@ -2478,6 +2615,14 @@ new run ID and preserves all earlier evidence.
   exec, or stop/reap only the already supervised child. A missing runner
   terminal record, surviving child, evaluator access to either privileged
   socket/control root, or host-library mapping is cleanup failure.
+- **Run-output collision:** a preexisting output root makes `prepare_output`
+  fail; a preexisting operation child fails only that new run. A completed
+  sibling operation never collides and is never mounted or modified.
+- **Network or policy-FD isolation failure:** reject before `gym.make` for a
+  host network namespace, unexpected interface/route, reachable host sentinel,
+  wrong/missing relay/socket identity, or host/port fallback. During execution,
+  malformed relay frames, EOF, timeout, or tunnel drift faults the episode and
+  triggers owned evaluator/relay cleanup.
 - **Checkpoint trace failure:** stop only the owned unchanged server/tracer,
   preserve the bounded raw trace, and fail readiness; never infer a successful
   load from the HTTP listener alone.
@@ -2489,8 +2634,8 @@ new run ID and preserves all earlier evidence.
 - **Server crash or invalid warm-up:** preserve the complete server log and
   clean up without launching an evaluator.
 - **Tunnel failure during evaluation:** request runner-supervised evaluator
-  interrupt, then perform normal cleanup; do not retry within the same run
-  directory.
+  interrupt, close the policy transport, stop/reap the exact owned relay, then
+  perform normal cleanup; do not retry within the same run directory.
 - **Evaluator timeout:** use the runner's bounded INT/KILL behavior, prove the
   child and descendants are gone, and do not start another episode unless
   cleanup passed.
@@ -2582,6 +2727,11 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   lifecycle refusal to
   reconfigure/start the service, and exactly one token-bound receipt from two
   concurrent post-rename recoverers;
+- systemd-unit parsing that permits only fixed-parent `ReadWritePaths`, rejects
+  token placeholders/specifiers, and confirms `Accept=yes` instances start
+  before request parsing; post-validation mutation-child tests expose only the
+  exact token staging directory and fixed directory FDs, reject sibling-token
+  access and arbitrary basenames, and fork no child on validation failure;
 - authoritative root-journal sequencing of rename then exclusive receipt
   creation before the one terminal response, manager mirroring of
   `FINAL_RENAMED` and `RECEIPT_CREATED` only after journal/response validation,
@@ -2620,9 +2770,9 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   write audits rejecting every evaluator-created path outside its run root;
 - path-independent `pc2_closure_id` reproducibility, exact profile/path mapping,
   proof that changing base/closure paths, mount/device/inode identities,
-  completion/receipt bytes, installer service/config/socket units, or
-  lifecycle/evaluator UIDs cannot affect the ID while their runtime provenance
-  still blocks mismatches,
+  completion/receipt bytes, installer or runner service/config/socket units,
+  relay/sandbox identities, or lifecycle/evaluator UIDs cannot affect the ID
+  while their runtime provenance still blocks mismatches,
   immutable pre-normalization requirements changing the ID, normalization
   result/mapping changes leaving the ID fixed but failing result provenance,
   and an exact requirements-hash/closure-ID link in every normalization result;
@@ -2635,26 +2785,39 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   raw retention after success and failure, checked transcode success,
   timeout/nonzero/malformed-output handling, and independent opposite-verdict
   retries;
-- runner supervisor attestation and strict six-FD launch transport, exact
-  operation enums/nullability and episode substitutions, SO_PEERCRED manager
-  binding, fixed private-root mount table, dedicated evaluator UID/GID with no
+- runner supervisor attestation and exact operation-specific FD-role schemas,
+  enum/nullability and episode substitutions, SO_PEERCRED manager binding,
+  fixed private-root mount table, dedicated evaluator UID/GID with no
   installer/control/staging access, exact workload-parent inode plus run-marker
-  validation, exclusive evaluator-output creation and arbitrary output-FD/path
-  refusal,
-  fixed five-FD evaluator inheritance, evaluator-output-only writes, launcher socket
-  closure on exec, manager-disconnect cleanup, and arbitrary argv/environment/
-  FD refusal;
-- exact runtime-evidence option/five-FD evaluator pairing and schema/type
-  validation, including loader/sandbox/UID/GID identities;
+  validation, one exclusive output-root preparation, distinct exclusive
+  `probe_loader`, `probe_cuda`, `episode_2`, and `episode_3` children,
+  a full prepare→loader→CUDA→episode-2→episode-3 sentinel sequence, repeated-
+  operation collision with all siblings preserved, cross-operation
+  nonvisibility, arbitrary output-FD/path refusal, launcher
+  socket closure on exec, manager-disconnect cleanup, and arbitrary argv/
+  environment/FD refusal;
+- exact runtime-evidence option/six-FD evaluator pairing and schema/type
+  validation, including loader/sandbox/UID/GID, network, policy socket, and
+  relay identities;
+- private network namespace creation with a distinct inode, exact `lo`-only
+  interfaces/routes, no veth/default route/raw or packet socket, internal DDS
+  loopback success, and failed connections to real-interface plus unrelated
+  host-loopback TCP/UDP/DDS sentinels;
+- fresh per-episode policy socketpair/relay, exact relay binary/contract and
+  PID/start attribution, serialized-request framing, sequence/size/deadline and
+  one-in-flight enforcement, fixed owned-tunnel `/act` destination, host/port/
+  URL/reconnect refusal inside both CLI and managed client, malformed/EOF/
+  timeout handling, and relay cleanup before the next episode;
 - unsafe `ENV_TYPE`, interface, and domain values each failing before
   `gym.make`, with the rejected record present and no `creating_env` event;
 - validated event order of durable evidence, `runtime_contract`,
   `worker_init(creating_env)`, then `gym.make`, plus rejected event order of
   durable evidence, `runtime_contract(rejected)`, then worker error;
 - actual manager/runner/evaluator event-pipe, acknowledgement-pipe,
-  closure-root-FD, base-root-FD, identity-FD, and workload-parent-FD transport with
-  exact supervisor PID/start/process-group response, sequence, private-root
-  identity validation, plus malformed UTF-8/JSON,
+  closure-root-FD, base-root-FD, identity-FD, workload-parent-FD, and managed
+  policy-transport-FD transport with exact supervisor/relay PID-start records,
+  process-group response, sequence, private-root/network identity validation,
+  plus malformed UTF-8/JSON,
   partial/oversize write, silence, early EOF, and callback-only rejection;
 - same-account closure/base-Python swap attempts after descriptor open and
   before evaluator exec, requiring chmod/rename/unlink/symlink/lookalike
@@ -2716,13 +2879,16 @@ The runtime is promoted through these gates in order:
    remote lease probes, requiring exactly one winner in each race. Attempt the
    same-account post-descriptor-open closure/base-Python swap and require every
    mutation to fail while closure-root/base-root/identity FD bindings remain
-   exact. Exercise the strict six-FD runner launch with a model-free loader
-   verify/list and `python -I -S` mapping audit; require the evaluator UID to be
-   unable to reach installer/control/staging state. Exercise a simulated
+   exact. Exercise `prepare_output` once, then the distinct loader/CUDA probe
+   operations with their exact FD schemas, verify/list and `python -I -S`
+   mapping audit; require the evaluator UID to be unable to reach sibling
+   outputs or installer/control/staging state. Exercise the loopback-only
+   private network against host-interface/loopback sentinels and the exact
+   policy-FD relay protocol without starting a model. Exercise a simulated
    1,800-second remote mutation while heartbeats remain current, and release cleanly;
 4. run `status` and local/leased preflight, including path containment, mount
-   alias, GPU, runner-service, loader/private-root, remote-helper, and pre/post
-   provenance checks;
+   alias, GPU, runner-service, output-root/subdirectory, loader/private-root,
+   loopback-network/policy-FD, remote-helper, and pre/post provenance checks;
 5. create the container using only the protected seccomp host path, attest its
    receipt plus every mount alias and exact seccomp/capability contract, run
    in-container read-only/inaccessible probes and the harmless
@@ -2745,7 +2911,8 @@ The runtime is promoted through these gates in order:
 9. run official episodes 2 and 3 and validate their run-scoped raw and checked
    standard stereo artifacts, independent WBC evidence, GPU evidence, lease
    release, manager event streams, continuous PC2/H100 GPU monitors, offline
-   asset/HSSD probes, runner-supervised dedicated-UID/private-root launches,
+   asset/HSSD probes, distinct runner output children, supervised policy
+   relays, dedicated-UID/private-root/loopback-network launches,
    inherited protected-closure/base-root/identity-FD bindings, sealed-loader
    mapping audits, filesystem write audits,
    zero live remote helpers, and all post-run execution/protected-checkpoint
