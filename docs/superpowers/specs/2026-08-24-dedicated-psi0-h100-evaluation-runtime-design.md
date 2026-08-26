@@ -709,21 +709,28 @@ operation is `install_closure`, `recover_closure`, `install_base_python`, or
 `recover_base_python`; it contains only schema version,
 operation, expected source/destination kind and operation-specific IDs,
 descriptor/intake digest,
-owner-token hash, and recovery-token hash or null. No arbitrary path appears
-on the wire. The service derives both roots and exact token-named staging path
-from its root-owned configuration. Closure operations require the exact
-precomputed closure ID; `install_base_python` requires an intake ID and a null
-destination ID because the service's final mode-inclusive digest selects the
-absent target. Its strict response contains operation,
+owner-token hash, recovery-token hash or null, and `construction_attempt` as a
+positive integer for base-Python operations and null for closure operations. No
+arbitrary path appears on the wire. The service recomputes the canonical request
+digest and requires it to match the current owner record before journal access.
+It derives both roots and exact token-named staging path from its root-owned
+configuration. Closure operations require the exact precomputed closure ID;
+`install_base_python` requires an intake ID and a null destination ID because
+the service's final mode-inclusive digest selects the absent target. Its strict
+response contains operation,
 token hashes, final tree/component hashes, completion hash, receipt hash, root
 identity, and terminal installer phase. Both messages reject additional keys,
 coercion, oversize frames, missing/extra FDs, and peer mismatch.
-The sole pre-`PREPARED` recovery response has terminal installer phase
-`ABORTED_BEFORE_PREPARED`, requires all final tree/component, completion,
-receipt, and root-identity fields to be null, and authorizes only a new
-manager-side attempt. Install and at/post-`PREPARED` recovery responses require
-those fields to be non-null and mutually consistent; response normalization
-cannot convert one branch into the other.
+Pre-publication recovery has two exact null-result responses. If the journal is
+absent, `recover_base_python` proves the prior service instance/child absent and
+returns `NO_JOURNAL_NO_MUTATION`; it creates no journal and authorizes the
+manager to resubmit the already recorded `install_base_python` request for the
+same attempt/token. If a journal exists before `PREPARED`, the terminal phase is
+`ABORTED_BEFORE_PREPARED` and authorizes only a new manager-side attempt. Both
+responses require all final tree/component, completion, receipt, and root-
+identity fields to be null. Install and at/post-`PREPARED` recovery responses
+require those fields to be non-null and mutually consistent; response
+normalization cannot convert one branch into another.
 
 The service no-follow validates all roots, but only its trusted parent may
 publish. It calls exactly
@@ -772,60 +779,94 @@ namespace cannot see them:
 
 The closure journal is selected by the already known closure ID; the
 base-Python journal is selected by the already known intake ID. Neither path
-depends on a digest produced by the mutation it journals. The initial
-base-Python request record binds the intake ID, operation/owner/recovery token
-hashes, source-parent and staging identities, and `final_tree_sha256=null`; it
-is fsynced before the child performs its first privileged mutation. The child's
-bounded `PREPARED` result computes the authoritative final mode-inclusive tree
-digest. After independently validating that result, the parent appends and
-fsyncs the `PREPARED` journal record that first binds `final_tree_sha256`, and
-only then may append `RENAME_PENDING` or publish. Every subsequent base-Python
-journal record, derived final basename, completion, receipt, terminal response,
-and recovery decision must carry and match that bound digest; the intake-keyed
-journal filename never changes.
+depends on a digest produced by the mutation it journals. Only the authenticated
+root service may create a journal. After validating the manager's durable owner
+record, stable lock FD, exact fresh operation token, attempt number, and request
+digest, it exclusively creates the absent intake-keyed journal with
+`O_CREAT|O_EXCL`, writes an initial record binding those values plus source-
+parent/staging identities and `final_tree_sha256=null`, and fsyncs the file and
+parent before forking the mutation child. The lifecycle manager never creates,
+opens for write, or fsyncs a journal. The child's bounded `PREPARED` result
+computes the authoritative final mode-inclusive tree digest. After independently
+validating that result, the parent appends and fsyncs the `PREPARED` journal
+record that first binds `final_tree_sha256`, and only then may append
+`RENAME_PENDING` or publish. Every subsequent base-Python journal record,
+derived final basename, completion, receipt, terminal response, and recovery
+decision must carry and match that bound digest; the intake-keyed journal
+filename never changes.
+
+The fsynced owner record with `pending_action="install_base_python"` and the
+exact request digest is the write-ahead authorization for the root service's
+single `O_CREAT|O_EXCL` journal creation. After that creation and parent fsync,
+the root-owned journal is the write-ahead authority for every service mutation.
+There is no interval in which the lifecycle manager must or may manufacture a
+root-owned record.
 
 Base-Python recovery locates the prior journal only by intake ID plus operation-
 token hash and branches on its last durable phase:
 
 - **Before `PREPARED`:** every record must retain
-  `final_tree_sha256=null`, and neither a published final tree nor external
-  completion/receipt may exist. The staging tree may contain partial or
-  final-looking child output, including a staging-local completion file, but it
-  is never adopted without the durable `PREPARED` binding. After proving the
-  prior service child/cgroup absent, the recovery
+  `final_tree_sha256=null`, and the authoritative journal must contain no
+  `PREPARED`, `RENAME_PENDING`, `FINAL_RENAMED`, `RECEIPT_CREATED`, or other
+  publication mutation. Because no final digest exists, this branch does not
+  derive, enumerate, or claim absence of any digest-keyed final, completion, or
+  receipt path. Its publication postcondition is instead the root-service
+  invariant that this operation's hash-chained journal authorized no
+  publication mutation. The staging tree may contain partial or final-looking
+  child output, including a staging-local completion file, but it is never
+  adopted without the durable `PREPARED` binding. After proving the prior
+  service child/cgroup absent, the recovery
   transaction no-follow revalidates the exact token-owned staging basename,
   device, inode, mount ID, owner-token hash, intake ID, and journal chain. It
   fsyncs `STAGING_REMOVE_PENDING`, removes only that exact staging tree, fsyncs
   its parent, and appends `ABORTED_BEFORE_PREPARED`. It never derives a final
   basename or adopts bytes whose digest was not durably bound. The manager then
-  fsyncs the old attempt's `attempt_status="aborted-before-prepared"`, increments
-  the construction-attempt number, chooses a fresh operation token, sets
-  `attempt_status="active"`, creates a new intake-keyed journal, and restarts
-  from `BASE_ALLOCATED`; monotonicity is enforced independently within each
-  attempt. Recovery of a durable `STAGING_REMOVE_PENDING` record accepts only
-  the same revalidated
-  staging entry or its absence with the recorded parent unchanged; it completes
-  or confirms removal, proves the published final and external completion/
-  receipt paths absent, and appends the same terminal abort record. Any other
-  postcondition blocks.
+  validates the terminal service response/root journal and fsyncs the old
+  attempt's `attempt_status="aborted-before-prepared"`. While retaining the
+  stable construction lock, it atomically installs and fsyncs the incremented
+  attempt number, fresh operation-token hash, `attempt_status="active"`, phase
+  `BASE_ALLOCATED`, and `pending_action="allocate_base_staging"` in the owner
+  record, then reconstructs the exact fresh staging tree through `BASE_COPIED`
+  under the normal write-ahead phase rules. Only after that tree is ready does
+  it atomically install and fsync `pending_action="install_base_python"` plus the
+  canonical new-request digest and submit that exact `install_base_python`
+  request with the same stable lock FD. The authenticated root service validates
+  the new owner record and exclusively creates/fsyncs
+  the fresh intake-keyed journal as specified above; the manager has no journal
+  write authority. Monotonicity is enforced independently within each attempt.
+  Recovery of a durable `STAGING_REMOVE_PENDING` record accepts only the same
+  revalidated staging entry or its absence with the recorded parent unchanged;
+  it completes or confirms removal, revalidates that the journal contains no
+  publication authorization, and appends the same terminal abort record. Any other
+  postcondition blocks. A crash before the new owner-record update leaves only
+  the terminal aborted attempt to mirror. A crash after that update but before
+  request delivery, acceptance, or journal creation is reconciled by
+  `recover_base_python`: `NO_JOURNAL_NO_MUTATION` causes the exact same recorded
+  install request and token to be resubmitted, while an existing journal is
+  handled by its durable phase. The manager never guesses whether an unobserved
+  request was accepted and never rotates the token merely because transport
+  failed.
 - **At or after `PREPARED`:** `final_tree_sha256` must be non-null and equal the
   digest first bound by the validated `PREPARED` record. Every later pending,
   result, rename, completion, receipt, response, and recovery record must carry
   that exact digest. A null, changed, missing, or multiply bound digest is
   `PROVENANCE_BLOCKED` and is never guessed or repaired.
 
-A non-null digest before `PREPARED`, a final path or receipt in the pre-
-`PREPARED` branch, a live/unknown old child, identity drift, or any extra
-staging entry is contradictory state and blocks automatic recovery. Both the
-abort branch and the publication branch use the same stable lock, current owner
-record, recovery-token, and one-response privileged-service protocol.
+A non-null digest or publication phase before `PREPARED`, a live/unknown old
+child, identity drift, or any extra staging entry is contradictory state and
+blocks automatic recovery. Protected digest-keyed objects belonging to other
+operations are neither scanned nor attributed to this null-digest attempt. Both
+the abort branch and the publication branch use the same stable lock, current
+owner record, recovery-token, and one-response privileged-service protocol.
 
 Journal records have exact sequence numbers and phases and are hash-chained to
 the request, owner/recovery tokens, source/destination identities, rename
 postcondition, and canonical receipt bytes. Every receipt field, including any
 recorded timestamp, is fixed in the pre-rename journal record; recovery never
-generates a new value. The service fsyncs a pending record before each
-privileged mutation and a result record afterward.
+generates a new value. The durable owner-record intent is the sole bootstrap
+write-ahead record for exclusive journal-file creation; once the journal
+exists, the service fsyncs a journal pending record before each privileged
+mutation and a result record afterward.
 
 Construction occurs only in the token-named staging directory. An
 `INCOMPLETE.json` marker is created and fsynced before its first child. The
@@ -3040,10 +3081,18 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   before returning `PREPARED`, plus before/after `STAGING_REMOVE_PENDING`, the
   exact removal, parent fsync, and `ABORTED_BEFORE_PREPARED`; pre-`PREPARED`
   recovery must idempotently terminalize the old attempt, remove only the
-  revalidated token-owned staging tree, leave no published final/external
-  completion/receipt, then restart with a fresh attempt number and operation
-  token, while at/post-`PREPARED` recovery requires the one bound non-null
-  digest in every subsequent record;
+  revalidated token-owned staging tree, and prove from the authoritative journal
+  that no publication mutation was authorized without enumerating an unknown
+  digest path; tests preserve unrelated protected digest-keyed objects while
+  rejecting any injected `PREPARED`, `RENAME_PENDING`, or publication record in
+  the null-digest journal; restart tests crash before/after the aborted owner-
+  record mirror, incremented-attempt/fresh-token owner-record update, request
+  delivery and acceptance, and root-service `O_CREAT|O_EXCL` journal creation/
+  fsync, requiring `NO_JOURNAL_NO_MUTATION` plus same-request resubmission when
+  appropriate, and proving the lifecycle manager performs zero journal create/
+  write/fsync calls;
+  at/post-`PREPARED` recovery requires the one bound non-null digest in every
+  subsequent record;
 - protected base-Python publication and recovery through every named phase,
   exact completion/root/receipt identities before closure-ID computation,
   venv interpreter-link resolution beneath the inherited base root FD, and
