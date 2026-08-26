@@ -703,72 +703,130 @@ description.
 
 Before inspecting, creating, appending, or deciding absence of any journal,
 every install/recover instance independently no-follow opens the configured
-root-owned `pc2-installer-transaction.lock`, validates its exact identity and
-mode, and takes `flock(LOCK_EX)` on its own newly opened file description under
-the bounded service deadline. The global lock order is manager construction
-lock, then installer transaction lock; no code acquires them in reverse. A busy
-or timed-out transaction lock returns only `INSTALLER_TRANSACTION_BUSY` and can
+root-owned, empty `pc2-installer-transaction.lock` with
+`O_RDONLY|O_CLOEXEC|O_NOFOLLOW`, validates its exact identity and mode, and
+takes `flock(LOCK_EX)` on its own newly opened file description under the
+bounded service deadline. Provisioning must first prove that the configured
+local filesystem supports an exclusive `flock` on that read-only descriptor;
+failure blocks service activation. The global lock order is manager
+construction lock, then installer transaction lock; no code acquires them in
+reverse. A busy or timed-out transaction lock returns only
+`INSTALLER_TRANSACTION_BUSY` and can
 never return `NO_JOURNAL_NO_MUTATION`. The instance holds this lock through all
 owner/authentication revalidation, journal and child work, cleanup, and the
-complete terminal-response write. Releasing it is the instance's final action
-immediately before orderly write-side socket shutdown, so a validated terminal
-frame followed by EOF proves release. Only after acquiring it does the service
-independently
+complete terminal-response construction. Every terminal response produced
+after lock acquisition is sent with exactly one `SCM_RIGHTS` descriptor for
+that same still-locked open file description. The service never calls
+`LOCK_UN`; after a successful `sendmsg` it closes only its own descriptor and
+shuts down the socket, while the received descriptor keeps the lock held by the
+manager. The manager receives with `MSG_CMSG_CLOEXEC`, verifies `FD_CLOEXEC`,
+and never passes the descriptor to a child or writes through it.
+EOF is diagnostic only and never proves transaction exclusion. An
+error before lock acquisition, including `INSTALLER_TRANSACTION_BUSY`, carries
+no descriptor and authorizes no owner-record transition. Only after acquiring
+the lock does the service independently
 `openat2(..., RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` the current owner-record
 path, verify its regular-file inode/content/schema/token/phase and manager
 PID/start ticks, and bind its digest into the root journal. The manager is
 forbidden to advance its construction phase or change any token, identity,
 path, pending action, or cleanup field while the service transaction is live,
-except for heartbeat replacement and the one monotonic install-to-recovery
-authorization transition defined below. Both exceptions require the manager's
-same stable construction lock. A service already holding the root transaction
-lock may finish its serialized operation after that transition; recovery cannot
-enter until it releases the lock and must then observe its journal result. Any
-journal created by that service binds the immutable install authorization and
+except for heartbeat replacement and the one monotonic install-to-next-
+recovery-generation authorization transition defined below. Both exceptions
+require the manager's same stable construction lock. A service already holding
+the root transaction lock may finish its serialized operation after that
+transition; recovery cannot enter until the current holder chain—service, then
+manager after handoff—releases the lock, and must then observe its journal
+result. Any journal created by that service binds the immutable install authorization and
 its creation-time authorization sequence. Recovery accepts a newer owner-record
 digest only when its canonical diff is exactly heartbeat replacement plus the
-one recorded install-to-recovery transition; every other drift blocks. The
-service's continued authority derives from that stable
+one recorded install-to-that-recovery-generation transition; every other drift
+blocks. The service's continued authority derives from that stable
 same-open-description construction lock FD, independently opened installer
 transaction lock, active authorization, and token-bound journal—not from
 retaining a replaceable owner-record inode. A service paused before transaction-
 lock acquisition must revalidate the then-current authorization after it
 acquires the lock; a service paused while holding the lock fences every later
-install/recover instance until it exits or returns its terminal response.
+install/recover instance until it transfers the locked descriptor or exits.
+For mutation purposes, the service transaction ends at successful handoff
+`sendmsg` and the manager handoff transaction begins; socket shutdown and EOF
+do not alter that boundary.
+After receiving a terminal response, the manager validates the descriptor's
+configured device/inode/mount/mode and calls `flock(LOCK_EX|LOCK_NB)` on the
+handed-off description, requiring success; this preserves an existing same-OFD
+lock or safely acquires it if no queued holder intervened, while
+`EWOULDBLOCK` fails closed. While retaining both the stable construction lock
+and handed-off transaction-lock descriptor, it performs and fsyncs the exact
+response-driven authorization transition, then closes the handoff descriptor.
+Only that close releases queued instances; each queued instance must acquire
+the lock and revalidate the newly durable authorization before journal access.
+This uses Linux's contracts that `flock` state belongs to the open file
+description and remains until explicit unlock or the last duplicate closes
+([`flock(2)`](https://man7.org/linux/man-pages/man2/flock.2.html)), and that an
+`SCM_RIGHTS` transfer is semantically a duplicate descriptor in the receiver
+([`unix(7)`](https://man7.org/linux/man-pages/man7/unix.7.html)).
+For a valid successful install terminal response, that transition clears the
+active reference and pending action. For a valid recovery response, it first
+appends the generation result and then selects install or null according to the
+exact terminal phase. A malformed/partial terminal frame with a valid handoff is
+treated as uncertain while still holding the lock: an active install appends
+and selects the next recovery generation, whereas an active recovery remains
+on the same generation for byte-identical replay. A post-acquisition response
+with a missing or invalid handoff permits no response-driven transition; the
+manager follows the same uncertain-response rule using only its stable
+construction lock, and the next root-lock holder must revalidate that durable
+active reference. A valid pre-acquisition failure has no handoff, leaves the
+active reference unchanged, and may retry only that same request.
 Closure operations accept only `pc2-construction.lock`; base-Python operations
 accept only `base-python-construction.lock`. Their device/inode identities are
 fixed in the installer configuration, and neither request may select a lock or
 owner-record path.
 
-Each construction owner record has an exact two-slot service-authorization
-schema. `install_authorization` is an immutable object for the current
-construction attempt containing authorization ID, install operation, owner/
-operation-token hashes, closure or intake identity, base attempt number or
-null, and canonical install-request digest. `recovery_authorization` is null or
-an immutable object containing a distinct authorization ID, matching recover
-operation, the same construction identity/attempt/operation token, fresh
-recovery-token hash, reason, and canonical recovery-request digest. Its
-separate `recovery_authorization_state` is exactly `"absent"`, `"armed"`, or
-`"consumed"`. `active_service_authorization` is exactly `"install"`,
-`"recovery"`, or null, and positive `authorization_sequence` increments on
-every active-slot transition. `pending_action` must agree with the active slot
-but is not itself authorization. The original install object and request digest
-never change within an attempt, including across recovery and byte-identical
-resubmission.
+Each construction owner record has one immutable install authorization plus an
+append-only, hash-chained recovery-authorization history. The
+`install_authorization` object for the current construction attempt contains
+authorization ID, install operation, owner/operation-token hashes, closure or
+intake identity, base attempt number or null, and canonical install-request
+digest. `recovery_authorizations` is an array initially empty. Each immutable
+entry contains a contiguous positive `recovery_generation`, distinct
+authorization ID, matching recover operation, the same construction identity/
+attempt/operation token, fresh recovery-token hash, reason, canonical recovery-
+request digest, and `previous_entry_sha256` null only for generation 1 and
+otherwise equal to the preceding canonical entry digest.
+
+`recovery_results` is a second append-only hash-chained array. A result entry
+contains the corresponding generation, authorization/request/terminal-response
+digests, exact terminal phase, validated transaction-lock identity digest, and
+preceding result digest; it exists exactly when that recovery generation is
+consumed. Generations and results cannot be
+deleted, replaced, reordered, or reused. Result generations are a contiguous
+prefix of authorization generations. When install is active or the reference is
+null, the two arrays have equal length; when recovery generation `g` is active,
+it is the final authorization entry and the result array ends at `g-1`. A new
+generation may be appended only after the preceding generation has a
+`NO_JOURNAL_NO_MUTATION` result and install was durably reactivated, and the
+next generation is always the preceding generation plus one.
+`active_service_authorization` is
+exactly `{kind: "install", generation: 0}`,
+`{kind: "recovery", generation: <positive integer>}`, or null.
+`authorization_sequence` is positive and increments on every active-reference
+transition. `pending_action` must agree with the active reference but is not
+itself authorization. The original install object and request digest never
+change within an attempt, including across repeated recovery cycles and byte-
+identical install resubmission.
 
 An attempt becomes installable only after the manager atomically writes and
-fsyncs its immutable install authorization, sets the recovery object/state to
-null/`"absent"`, selects the install slot, and records the matching pending
-action while holding the stable construction lock. If an install response is
-uncertain, the manager atomically creates and fsyncs one fresh immutable
-recovery authorization, marks it `"armed"`, switches the active slot and
-pending action to recovery, and increments the authorization sequence before
-sending any recovery request. The install authorization remains byte-for-byte
-unchanged but inactive. No recovery-to-install or terminal transition is legal
-until the manager has validated the recovery terminal frame and observed EOF,
-which proves release of the root transaction lock. A crash at any transition
-leaves one fsynced active slot whose exact request is replayed; no startup logic
-infers authorization from `pending_action` alone.
+fsyncs its immutable install authorization, empty recovery arrays, active
+install reference, and matching pending action while holding the stable
+construction lock. If any install response is uncertain, including a replay
+after a prior no-journal result, the manager atomically appends and fsyncs the
+next recovery generation, switches the active reference and pending action to
+that generation, and increments the authorization sequence before sending its
+request. The install authorization and all older recovery entries/results
+remain byte-for-byte unchanged. No recovery-to-install or terminal transition
+is legal without a validated terminal frame and its still-locked handoff
+descriptor. A crash at any transition leaves one fsynced active reference whose
+exact request is replayed; no startup logic infers authorization from
+`pending_action` alone.
 
 The strict request
 operation is `install_closure`, `recover_closure`, `install_base_python`, or
@@ -777,33 +835,43 @@ operation, expected source/destination kind and operation-specific IDs,
 descriptor/intake digest,
 owner-token hash, recovery-token hash or null, and `construction_attempt` as a
 positive integer for base-Python operations and null for closure operations,
-plus the exact authorization ID. No arbitrary path appears on the wire. After
+the exact authorization ID, and `recovery_generation` as a positive integer for
+recover operations and null for install operations. No arbitrary path appears
+on the wire. After
 acquiring the installer transaction lock, the service recomputes the canonical
 request digest and requires operation, authorization ID, digest, tokens,
-construction identity, and attempt to match the current active authorization
-slot before journal access. Matching the inactive immutable install object does
-not authorize install while recovery is active, and a recovery request can
-never match the install slot.
+construction identity, attempt, and recovery generation to match the current
+active authorization reference before journal access. Matching the inactive
+immutable install object does not authorize install while recovery is active,
+and a recovery request can never match the install reference or another
+generation.
 It derives both roots and exact token-named staging path from its root-owned
 configuration. Closure operations require the exact precomputed closure ID;
 `install_base_python` requires an intake ID and a null destination ID because
 the service's final mode-inclusive digest selects the absent target. Its strict
-response contains operation,
+response contains operation, authorization ID, recovery generation or null,
 token hashes, final tree/component hashes, completion hash, receipt hash, root
 identity, and terminal installer phase. Both messages reject additional keys,
-coercion, oversize frames, missing/extra FDs, and peer mismatch.
+coercion, oversize frames, or peer mismatch. Requests require exactly the one
+stable construction-lock FD. Every response after transaction-lock acquisition
+requires exactly the one still-locked handoff FD; pre-acquisition failures
+require zero FDs. Missing, extra, wrong-identity, or inheritable descriptors, or
+a handed-off descriptor whose manager-side nonblocking lock call returns
+`EWOULDBLOCK`, fail closed.
 Pre-publication recovery has two exact null-result responses. If the journal is
 absent, `recover_base_python` may return `NO_JOURNAL_NO_MUTATION` only while it
 holds the independently opened installer transaction lock under the active
-recovery authorization. Because every installer instance must acquire that
-lock before journal inspection or creation, exclusive ownership proves that no
-prior journal-capable transaction remains in its critical section. A delayed
-instance still waiting outside the lock must revalidate authorization after
-acquisition and is fenced while recovery is active. The recovery instance
-creates no journal and holds the lock through the terminal response, releasing
-it only immediately before EOF. The manager may reactivate and resubmit the
-already recorded byte-identical `install_base_python` request for the same
-attempt/token only after validating both. If a journal exists before
+recovery generation. Because every installer instance must acquire that lock
+before journal inspection or creation, exclusive ownership proves that no prior
+journal-capable transaction remains in its critical section. A delayed instance
+still waiting outside the lock is fenced by the handoff and must revalidate
+authorization after the manager's transition. The recovery instance creates no
+journal and transfers the still-locked descriptor with its terminal response.
+While retaining that descriptor, the manager appends and fsyncs the generation's
+recovery result, reactivates the unchanged install authorization, and only then
+closes the descriptor. It may resubmit the already recorded byte-identical
+`install_base_python` request for the same attempt/token afterward. EOF neither
+authorizes nor orders this transition. If a journal exists before
 `PREPARED`, the terminal phase is
 `ABORTED_BEFORE_PREPARED` and authorizes only a new manager-side attempt. Both
 responses require all final tree/component, completion, receipt, and root-
@@ -866,7 +934,7 @@ token, attempt number, authorization ID, and request digest, it exclusively
 creates the absent intake-keyed journal with `O_CREAT|O_EXCL`. It writes an
 initial record binding those values plus source-parent/staging identities and
 `final_tree_sha256=null`, then fsyncs the file and parent before forking the
-mutation child. A delayed request whose install slot is inactive is rejected
+mutation child. A delayed request whose install reference is inactive is rejected
 before this call. The lifecycle manager never creates, opens for write, or
 fsyncs a journal. The child's bounded `PREPARED` result
 computes the authoritative final mode-inclusive tree digest. After independently
@@ -877,7 +945,7 @@ derived final basename, completion, receipt, terminal response, and recovery
 decision must carry and match that bound digest; the intake-keyed journal
 filename never changes.
 
-The fsynced immutable `install_authorization`, active install slot, matching
+The fsynced immutable `install_authorization`, active install reference, matching
 pending action, and authorization sequence in the owner record are together the
 write-ahead authorization for the root service's single `O_CREAT|O_EXCL`
 journal creation. `pending_action` or an inactive install digest alone has no
@@ -889,12 +957,12 @@ Base-Python recovery locates the prior journal only by intake ID plus operation-
 token hash and branches on its last durable phase:
 
 Before submitting `recover_base_python`, the manager retains the stable
-construction lock and performs the durable install-to-recovery authorization
+construction lock and performs the durable install-to-next-recovery-generation
 transition defined above. A crash before that transition leaves install active;
-restart performs the same transition. A crash after it but before delivery
-replays only the byte-identical recovery request. Install and recovery request
-bytes are never interchangeable, and neither request is accepted against the
-other slot.
+restart appends the next generation and performs the transition. A crash after
+it but before delivery replays only that generation's byte-identical recovery
+request. Install and recovery request bytes are never interchangeable, and no
+request is accepted against a different kind or recovery generation.
 
 - **Before `PREPARED`:** every record must retain
   `final_tree_sha256=null`, and the authoritative journal must contain no
@@ -920,8 +988,8 @@ other slot.
   record, then reconstructs the exact fresh staging tree through `BASE_COPIED`
   under the normal write-ahead phase rules. Only after that tree is ready does
   it atomically install and fsync a new immutable install authorization,
-  null/`"absent"` recovery authorization, active install slot, incremented
-  authorization sequence, and matching
+  empty recovery-authorization/result histories, active install reference,
+  incremented authorization sequence, and matching
   `pending_action="install_base_python"`, then submits that exact
   `install_base_python` request with the same stable lock FD. The authenticated
   root service validates the new owner record and exclusively creates/fsyncs
@@ -934,25 +1002,29 @@ other slot.
   postcondition blocks. A crash before the new owner-record update leaves only
   the terminal aborted attempt to mirror. A crash after that update but before
   request delivery, acceptance, or journal creation is reconciled by first
-  atomically arming the separate recovery authorization and then issuing its
+  atomically appending the next recovery authorization and then issuing its
   exact `recover_base_python` request. On `NO_JOURNAL_NO_MUTATION`, the manager
-  validates the response and EOF, atomically marks recovery consumed, reselects
-  the unchanged install authorization, restores the matching install pending
-  action, increments the authorization sequence, and resubmits the byte-
-  identical original install request and token. A delayed copy of that same
+  validates the response and handed-off locked descriptor, atomically appends
+  and fsyncs that generation's recovery result, reselects the unchanged install
+  authorization, restores the matching install pending action, increments the
+  authorization sequence, and only then closes the descriptor and resubmits the
+  byte-identical original install request and token. A delayed copy of that same
   request is equivalent to this replay: transaction-lock serialization plus
   journal `O_EXCL` permits exactly one creator and forces every duplicate to
   reconcile the same journal. An existing journal is handled by its durable
-  phase. On `ABORTED_BEFORE_PREPARED`, the manager validates response and EOF,
-  marks recovery consumed and the active slot null, terminalizes the old
-  attempt, and only then allocates the fresh attempt described above. At or
-  after `PREPARED`, validated recovery completion likewise consumes recovery
-  and clears the active slot rather than rearming install. A crash after a
-  recovery terminal frame but before its owner-record transition replays and
-  validates the same recovery outcome; a crash after install reactivation but
-  before resubmission replays the unchanged install request. The manager never
-  guesses whether an unobserved request was accepted and never rotates the
-  install token merely because transport failed.
+  phase. On `ABORTED_BEFORE_PREPARED`, the manager retains the handoff while it
+  appends the recovery result, clears the active reference, and terminalizes the
+  old attempt, then closes it before allocating the fresh attempt described
+  above. At or after `PREPARED`, validated recovery completion likewise appends
+  the generation result and clears the active reference under the handoff
+  rather than rearming install. A crash after a recovery terminal frame but
+  before its owner-record transition replays and validates the same generation's
+  recovery outcome; a crash after install reactivation but before resubmission
+  replays the unchanged install request. If that replay's response is again
+  uncertain, the manager appends generation `g+1` with a fresh recovery token
+  and distinct request digest; generation `g` and its result remain immutable.
+  The manager never guesses whether an unobserved request was accepted and
+  never rotates the install token merely because transport failed.
 - **At or after `PREPARED`:** `final_tree_sha256` must be non-null and equal the
   digest first bound by the validated `PREPARED` record. Every later pending,
   result, rename, completion, receipt, response, and recovery record must carry
@@ -964,14 +1036,16 @@ child, identity drift, or any extra staging entry is contradictory state and
 blocks automatic recovery. Protected digest-keyed objects belonging to other
 operations are neither scanned nor attributed to this null-digest attempt. Both
 the abort branch and the publication branch use the same stable lock, current
-owner record, recovery-token, and one-response privileged-service protocol.
+owner record, active recovery generation/token, one-response privileged-service
+protocol, and transaction-lock handoff.
 
 Journal records have exact sequence numbers and phases and are hash-chained to
 the install authorization ID/digest and creation-time authorization sequence,
 owner/recovery tokens, source/destination identities, rename postcondition, and
-canonical receipt bytes. A recovery record additionally binds its distinct
-authorization ID/digest and the exact allowed owner-record transition from the
-install sequence. Every receipt field, including any recorded timestamp, is
+canonical receipt bytes. A recovery record additionally binds its generation,
+distinct authorization ID/digest, previous authorization-entry digest, and the
+exact allowed owner-record transition from the install sequence. Every receipt
+field, including any recorded timestamp, is
 fixed in the pre-rename journal record; recovery never generates a new value.
 The durable owner-record intent is the sole bootstrap write-ahead record for
 exclusive journal-file creation; once the journal exists, the service fsyncs a
@@ -1170,12 +1244,12 @@ abort durably records the aborted status before incrementing the attempt,
 installing a fresh operation token, and returning the status to `"active"` at
 `BASE_ALLOCATED`; the ordered `(construction_attempt, phase)` pair never moves
 backward. Every active attempt also carries the exact immutable install
-authorization, optional immutable recovery authorization, separate recovery
-state, active slot, and monotonic authorization sequence defined by the
+authorization, append-only recovery-authorization and result histories, active
+authorization reference, and monotonic authorization sequence defined by the
 privileged-service contract. Recovery transitions never alter the attempt's
-install authorization or its canonical request bytes; a new attempt creates a
-new install authorization and starts with no recovery authorization. Its exact
-per-attempt monotonic phases are:
+install authorization, canonical install-request bytes, or any older recovery
+generation; a new attempt creates a new install authorization and starts with
+empty histories. Its exact per-attempt monotonic phases are:
 
 ```text
 BASE_ALLOCATED -> BASE_COPIED -> BASE_METADATA_NORMALIZED ->
@@ -3160,7 +3234,7 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   no-follow opening and token/PID/phase validation of the current owner record,
   rejection of an owner-record FD masquerading as the lock, owner-record
   invariant mutation during a live transaction except the exact heartbeat and
-  install-to-recovery authorization transitions, and strict canonical
+  install-to-next-recovery-generation authorization transitions, and strict canonical
   installer-config tests that mutate each closure/base/installer-transaction
   lock basename, device, inode, or mount ID independently, plus the transaction
   lock owner, group, or mode, and require rejection before any journal, child,
@@ -3172,26 +3246,43 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
 - root installer-transaction-lock tests prove every `Accept=yes` install and
   recovery instance independently opens a distinct file description for the
   one attested mode-`0600` inode, obeys construction-before-transaction lock
-  ordering, and retains exclusivity through terminal response and EOF. One
+  ordering, and transfers exactly one still-locked, non-inheritable handoff FD
+  with every post-acquisition terminal response. Missing, extra, wrong-inode,
+  or inheritable handoffs fail closed without an owner transition. Instrumented
+  service tests forbid `LOCK_UN`; an injected intervening holder must make the
+  manager's nonblocking handoff lock call fail without an owner transition. One
   install instance is paused while holding the root lock immediately before
   journal `O_CREAT|O_EXCL`; a concurrent recovery instance must block or return
   only `INSTALLER_TRANSACTION_BUSY`, never `NO_JOURNAL_NO_MUTATION`. After the
-  first instance continues through journal creation and exits, recovery must
+  first instance continues through journal creation and sends its handoff, the
+  manager must fsync its transition and close the handoff before recovery can
   acquire the lock and observe exactly that journal; a parameterized exit before
   creation must instead produce the fenced no-journal result. A second case
   pauses install before root-lock acquisition, arms recovery, and proves the
   delayed install is rejected by active-authorization revalidation;
-- two-slot authorization tests require byte-exact immutable install bytes and
-  digest across recovery, distinct install/recovery IDs, operations, tokens,
-  and digests, monotonic sequence increments, and `pending_action` having no
-  independent authority. Install requests against the active recovery slot and
-  recovery requests against the active install slot are rejected before
-  journal access. Crash injection covers immediately before/after the atomic
-  fsynced owner-record replacement that creates recovery authorization and
-  switches the active slot, request delivery, terminal-frame receipt, EOF, the
-  atomic consume-and-reactivate-install transition, the terminal consume-and-
-  clear transition, and byte-identical resubmission. Restart must replay only
-  the fsynced active slot;
+- handoff-boundary tests queue duplicate install and recovery instances before
+  response construction, before `sendmsg`, while the ancillary FD is queued
+  before `recvmsg`, after manager receipt, after the service closes its local
+  lock FD, during socket shutdown, before the manager observes EOF, and after
+  EOF. Every duplicate remains blocked while the manager or socket owns the
+  transferred OFD. The manager fsyncs the applicable authorization/result
+  transition before closing it; only then may one queued instance acquire and
+  revalidate the new active reference. EOF ordering alone must change no state;
+- recovery-generation tests require byte-exact immutable install bytes and
+  digest across every cycle, contiguous generations, distinct recovery IDs,
+  fresh tokens and digests, correct previous-entry/result hashes, monotonic
+  authorization-sequence increments, and `pending_action` having no independent
+  authority. Install requests against an active recovery reference and recovery
+  requests against install or the wrong generation are rejected before journal
+  access. The required cycle is generation 1 returning
+  `NO_JOURNAL_NO_MUTATION`, byte-identical install replay, another uncertain
+  transport result after that replay creates the journal, and distinct
+  generation 2 recovering that journal. Crash injection covers immediately
+  before/after each atomic authorization append/reference switch, request
+  delivery, terminal-frame-plus-handoff receipt, result append, install
+  reactivation, terminal clear, handoff close, and byte-identical resubmission.
+  Restart must replay only the fsynced active reference and preserve every older
+  immutable generation/result;
   delayed duplicate install requests serialize to one `O_EXCL` creator and one
   journal reconciliation rather than a second mutation;
 - systemd-unit parsing that permits only fixed-parent `ReadWritePaths`, rejects
