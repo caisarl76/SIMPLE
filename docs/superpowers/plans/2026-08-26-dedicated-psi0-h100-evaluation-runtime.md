@@ -574,6 +574,8 @@ class FakeCliBackend:
     def __init__(self):
         self.mutations: list[str] = []
         self.actions: list[str] = []
+        self.integration_calls: list[tuple[str, str | None]] = []
+        self.integration_profile_approved = True
 
     def local_preflight(self) -> None:
         self.actions.append("local_preflight")
@@ -586,6 +588,16 @@ class FakeCliBackend:
 
     def release_lease(self) -> None:
         self.actions.append("release_lease")
+
+    def run_integration_fixture(
+        self, operation: str, fixture: str | None
+    ) -> dict[str, object]:
+        self.integration_calls.append((operation, fixture))
+        return {"schema_version": 1, "marker": operation}
+
+    def require_integration_profile_binding(self) -> None:
+        if not self.integration_profile_approved:
+            raise RuntimeError("INTEGRATION_PROFILE_BINDING")
 
 
 def make_construction_record(*, phase: str):
@@ -1933,16 +1945,19 @@ git commit -m "build: add static PSI0 runtime helpers"
 # tests/eval_runtime/test_assets.py
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from simple.eval_runtime.assets import (
     AssetRequirement,
     probe_episode_assets,
 )
 from simple.scenes.hssd import HssdSceneManager
-from simple.utils import resolve_data_path
+from simple.utils import resolve_data_path, resolve_res_path
 
 
 def test_data_root_seam_is_offline_and_never_downloads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1959,10 +1974,32 @@ def test_hssd_load_uses_normalized_closure_without_shell_or_tmp_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data = tmp_path / "task-data"
-    scene = data / "scenes/hssd/scene0"
+    configs = yaml.safe_load(
+        Path(resolve_res_path("hssd-scenes/config.yaml")).read_text(encoding="utf-8")
+    )
+    config = next(item for item in configs if item["uid"] == "scene0")
+    scene_name = config["name"]
+    scene = data / config["data_dir"] / scene_name
     scene.mkdir(parents=True)
-    (scene / "scene0.usd").write_text("#usda 1.0\n", encoding="utf-8")
-    (scene / "NORMALIZED.json").write_text('{"schema_version":1}\n', encoding="utf-8")
+    usd = scene / f"{scene_name}.usd"
+    usd.write_text("#usda 1.0\n", encoding="utf-8")
+    usd_sha256 = hashlib.sha256(usd.read_bytes()).hexdigest()
+    (scene / "NORMALIZED.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "scene_uid": "scene0",
+                "scene_name": scene_name,
+                "source_usd_sha256": "a" * 64,
+                "normalized_usd_sha256": usd_sha256,
+                "normalization_policy_version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("SIMPLE_DATA_ROOT", str(data))
     monkeypatch.setenv("SIMPLE_ASSET_OFFLINE", "1")
     monkeypatch.setattr("subprocess.run", lambda *a, **k: pytest.fail("subprocess"))
@@ -1970,6 +2007,7 @@ def test_hssd_load_uses_normalized_closure_without_shell_or_tmp_copy(
     before = set(Path("/tmp").iterdir())
     loaded = HssdSceneManager().load("hssd:scene0")
     assert loaded.uid == "hssd:scene0"
+    assert loaded.name == "107734119_175999932"
     assert set(Path("/tmp").iterdir()) == before
 
 
@@ -1977,7 +2015,11 @@ def test_episode_asset_probe_rejects_missing_or_out_of_root_dependency(tmp_path:
     root = tmp_path / "assets"
     root.mkdir()
     required = (
-        AssetRequirement("scene", "scenes/hssd/scene0/scene0.usd", "a" * 64),
+        AssetRequirement(
+            "scene",
+            "scenes/hssd/107734119_175999932/107734119_175999932.usd",
+            "a" * 64,
+        ),
         AssetRequirement("robot", "robots/g1/g1.usd", "b" * 64),
     )
     with pytest.raises(Exception, match="ASSET_PROBE"):
@@ -2085,17 +2127,40 @@ def _asset_download_allowed(auto_download: bool) -> bool:
     return auto_download and os.environ.get("SIMPLE_ASSET_OFFLINE") != "1"
 ```
 
-Use `_asset_download_allowed` at every download branch in `resolve_data_path` and `src/simple/assets/graspnet.py`. Replace `HssdSceneManager._hack_fix_tmp_paths` with validation of the freeze-produced `NORMALIZED.json`; production loading performs no subprocess, copy, network, or global `/tmp` write:
+Use `_asset_download_allowed` at every download branch in `resolve_data_path` and `src/simple/assets/graspnet.py`. Move `hashlib` and `json` into `src/simple/scenes/hssd.py`'s existing top-level import block. Replace `HssdSceneManager._hack_fix_tmp_paths` with validation of the freeze-produced `NORMALIZED.json`; production loading performs no subprocess, copy, network, or global `/tmp` write:
 
 ```python
 # src/simple/scenes/hssd.py
 # ruff: noqa: F821
-def _require_normalized_scene(self, scene_dir: str, usd_path: str) -> None:
+def _require_normalized_scene(
+    self, *, scene_uid: str, scene_name: str, scene_dir: str, usd_path: str
+) -> None:
     marker = os.path.join(scene_dir, "NORMALIZED.json")
-    if os.environ.get("SIMPLE_ASSET_OFFLINE") == "1" and not os.path.isfile(marker):
-        raise RuntimeError(f"sealed HSSD scene lacks normalization marker: {marker}")
     if not os.path.isfile(usd_path):
         raise FileNotFoundError(usd_path)
+    if os.environ.get("SIMPLE_ASSET_OFFLINE") != "1":
+        return
+    with open(marker, "rb") as stream:
+        marker_bytes = stream.read()
+    payload = json.loads(marker_bytes)
+    keys = {
+        "schema_version",
+        "scene_uid",
+        "scene_name",
+        "source_usd_sha256",
+        "normalized_usd_sha256",
+        "normalization_policy_version",
+    }
+    if type(payload) is not dict or set(payload) != keys:
+        raise RuntimeError("sealed HSSD normalization marker has wrong schema")
+    if payload["schema_version"] != 1 or payload["normalization_policy_version"] != 1:
+        raise RuntimeError("sealed HSSD normalization marker has wrong version")
+    if payload["scene_uid"] != scene_uid or payload["scene_name"] != scene_name:
+        raise RuntimeError("sealed HSSD normalization marker has wrong scene identity")
+    with open(usd_path, "rb") as stream:
+        normalized_sha256 = hashlib.sha256(stream.read()).hexdigest()
+    if payload["normalized_usd_sha256"] != normalized_sha256:
+        raise RuntimeError("sealed HSSD normalization marker hash mismatch")
 
 
 def load(self, scene_uid: str) -> Scene:
@@ -2104,7 +2169,9 @@ def load(self, scene_uid: str) -> Scene:
     scene_name = configs[key]["name"]
     scene_dir = resolve_data_path(f"scenes/hssd/{scene_name}", auto_download=True)
     usd_path = os.path.join(scene_dir, f"{scene_name}.usd")
-    self._require_normalized_scene(scene_dir, usd_path)
+    self._require_normalized_scene(
+        scene_uid=key, scene_name=scene_name, scene_dir=scene_dir, usd_path=usd_path
+    )
     return HssdSuite(configs[key])
 ```
 
@@ -2257,6 +2324,7 @@ import struct
 import pytest
 
 from simple.eval_runtime.installer_client import (
+    HandoffPersistenceUncertain,
     InstallerReply,
     LockIdentity,
     apply_locked_reply,
@@ -2266,14 +2334,40 @@ from .fakes import InstallerHandoffHarness
 
 
 class RecordingHistory:
-    def __init__(self, order: list[str]):
+    def __init__(
+        self,
+        order: list[str],
+        *,
+        fail_at: tuple[str, str] | None = None,
+    ):
         self.order = order
+        self.fail_at = fail_at
+        self.retained: list[int] = []
+
+    def _step(self, name: str) -> None:
+        if self.fail_at == (name, "before"):
+            raise OSError(f"injected:before:{name}")
+        self.order.append(name)
+        if self.fail_at == (name, "after"):
+            raise OSError(f"injected:after:{name}")
 
     def persist_reply(self, reply: InstallerReply) -> None:
-        self.order.append("persist")
+        del reply
+        for name in (
+            "install_authorization",
+            "recovery_authorization",
+            "recovery_result",
+            "owner_record_replace",
+        ):
+            self._step(name)
 
     def fsync_owner_record_and_parent(self) -> None:
-        self.order.append("fsync")
+        self._step("owner_record_fsync")
+        self._step("owner_parent_fsync")
+
+    def retain_uncertain_handoff(self, reply: InstallerReply, error: BaseException) -> None:
+        del error
+        self.retained.append(reply.handoff_fd)
 
 
 def test_manager_fsyncs_transition_before_closing_handoff(
@@ -2289,8 +2383,49 @@ def test_manager_fsyncs_transition_before_closing_handoff(
     monkeypatch.setattr(os, "close", lambda fd: order.append(f"close:{fd}"))
     reply = InstallerReply("PREPARED", {}, "a" * 64, handoff_fd)
     apply_locked_reply(RecordingHistory(order), reply, expected_lock=expected)
-    assert order == ["persist", "fsync", f"close:{handoff_fd}"]
+    assert order == [
+        "install_authorization",
+        "recovery_authorization",
+        "recovery_result",
+        "owner_record_replace",
+        "owner_record_fsync",
+        "owner_parent_fsync",
+        f"close:{handoff_fd}",
+    ]
     real_close(handoff_fd)
+
+
+@pytest.mark.parametrize(
+    "transition",
+    [
+        "install_authorization",
+        "recovery_authorization",
+        "recovery_result",
+        "owner_record_replace",
+        "owner_record_fsync",
+        "owner_parent_fsync",
+    ],
+)
+@pytest.mark.parametrize("edge", ["before", "after"])
+def test_failed_transition_retains_handoff_and_blocks_waiter(
+    transition: str, edge: str, tmp_path
+) -> None:
+    lock = tmp_path / "transaction.lock"
+    lock.touch(mode=0o600)
+    expected = LockIdentity.from_path(lock)
+    handoff_fd = os.open(lock, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    fcntl.flock(handoff_fd, fcntl.LOCK_EX)
+    history = RecordingHistory([], fail_at=(transition, edge))
+    reply = InstallerReply("PREPARED", {}, "a" * 64, handoff_fd)
+    with pytest.raises(HandoffPersistenceUncertain) as captured:
+        apply_locked_reply(history, reply, expected_lock=expected)
+    assert captured.value.handoff_fd == handoff_fd
+    assert history.retained == [handoff_fd]
+    contender = os.open(lock, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    with pytest.raises(BlockingIOError):
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.close(contender)
+    os.close(handoff_fd)
 
 
 @pytest.mark.parametrize(
@@ -2576,6 +2711,12 @@ class DecodedInstallerResponse:
     sha256: str
 
 
+class HandoffPersistenceUncertain(RuntimeError):
+    def __init__(self, handoff_fd: int, cause: BaseException):
+        super().__init__(f"HANDOFF_PERSISTENCE_UNCERTAIN:{type(cause).__name__}")
+        self.handoff_fd = handoff_fd
+
+
 def lock_identity_from_fd(fd: int) -> LockIdentity:
     status = os.fstat(fd)
     mount_id = None
@@ -2698,11 +2839,15 @@ def apply_locked_reply(
     try:
         history.persist_reply(reply)
         history.fsync_owner_record_and_parent()
-    finally:
-        os.close(reply.handoff_fd)
+    except BaseException as error:
+        history.retain_uncertain_handoff(reply, error)
+        raise HandoffPersistenceUncertain(reply.handoff_fd, error) from error
+    os.close(reply.handoff_fd)
 ```
 
 `AuthorizationHistory.append_recovery()` requires generation `last + 1`, a fresh token and authorization ID, `previous_entry_sha256=None` for generation 1 and otherwise the exact canonical digest of the preceding authorization entry, a monotonic authorization sequence, and one active reference. `RecoveryResultHistory.append()` separately requires a contiguous result prefix and `previous_result_sha256=None` for its first result and otherwise the preceding result digest. Authorization objects contain no result field, and result entries never participate in the authorization chain. `NO_JOURNAL_NO_MUTATION` reactivates the unchanged install authorization and byte-identical request; every further uncertainty appends a new recovery generation. Neither history overwrites or reorders an entry, marks an older entry active, or uses `pending_action` as authority.
+
+`apply_locked_reply` closes the handed-off OFD only on the success path after both owner-record and parent-directory fsyncs return. On any transition write, replacement, file fsync, or parent fsync failure, `retain_uncertain_handoff` places the still-open descriptor and the already-held stable construction-lock FD into the manager's `HANDOFF_PERSISTENCE_UNCERTAIN` guard. The manager starts no cleanup that would close either FD, sends no further installer request, and cannot report a terminal clean state. `reconcile_uncertain_handoff` reopens and compares the current owner record plus journal while both locks remain held; it either completes and fsyncs the one exact missing transition and then closes the OFD, or retains both locks and remains provenance-blocked. Tests inject failure before and after every install-authorization, recovery-authorization, recovery-result, owner-record replacement, record-fsync, and parent-fsync boundary, and assert a second open file description cannot acquire the transaction lock until reconciliation succeeds.
 
 - [ ] **Step 5: Implement both native installers**
 
@@ -3800,7 +3945,13 @@ from pathlib import Path
 
 import pytest
 
-from simple.eval_runtime.evidence import EvidenceStore, InfrastructureVerdict
+from simple.eval_runtime.evidence import (
+    EvidenceStore,
+    InfrastructureVerdict,
+    create_run_id_handoff,
+    read_run_id_handoff,
+    remove_run_id_handoff,
+)
 from .fakes import populate_complete_evidence
 
 
@@ -3811,6 +3962,17 @@ def test_run_root_and_every_manager_artifact_are_exclusive(tmp_path: Path) -> No
         EvidenceStore.create(tmp_path, run_id="run-a")
     with pytest.raises(FileExistsError):
         store.write("preflight/profile-hash.json", {"schema_version": 1, "sha256": "b" * 64})
+
+
+def test_existing_run_child_is_never_reused_or_modified(tmp_path: Path) -> None:
+    child = tmp_path / "run-collision"
+    child.mkdir(mode=0o700)
+    sentinel = child / "foreign.txt"
+    sentinel.write_bytes(b"keep")
+    with pytest.raises(FileExistsError):
+        EvidenceStore.create(tmp_path, run_id="run-collision")
+    assert sentinel.read_bytes() == b"keep"
+    assert sorted(path.name for path in child.iterdir()) == ["foreign.txt"]
 
 
 def test_pass_requires_all_mandatory_files_and_clean_terminal_state(tmp_path: Path) -> None:
@@ -3833,6 +3995,21 @@ def test_manifest_redacts_raw_tokens_and_payloads(tmp_path: Path) -> None:
     assert "secret" not in encoded
     assert '"request_payload"' not in encoded
     assert "lease_token_sha256" in encoded
+
+
+def test_run_id_handoff_is_exclusive_mode_0600_and_validated(tmp_path: Path) -> None:
+    handoff = tmp_path / "evaluation-run-id"
+    identity = create_run_id_handoff(handoff, "eval-a")
+    assert identity.mode == 0o600
+    assert read_run_id_handoff(handoff) == "eval-a"
+    with pytest.raises(FileExistsError):
+        create_run_id_handoff(handoff, "eval-b")
+    handoff.chmod(0o644)
+    with pytest.raises(Exception, match="RUN_ID_HANDOFF_MODE"):
+        read_run_id_handoff(handoff)
+    handoff.chmod(0o600)
+    remove_run_id_handoff(handoff, expected_run_id="eval-a")
+    assert not handoff.exists()
 ```
 
 - [ ] **Step 2: Write failing persist-before-action and cleanup tests**
@@ -3926,6 +4103,8 @@ def test_terminal_restoration_logs_and_manifest_run_even_after_deadline() -> Non
 # tests/eval_runtime/test_cli.py
 from __future__ import annotations
 
+from pathlib import Path
+
 from typer.testing import CliRunner
 
 from simple.eval_runtime.cli import app
@@ -3955,13 +4134,15 @@ def test_status_is_read_only() -> None:
     assert backend.mutations == []
 
 
-def test_create_preflight_only_releases_lease_without_container() -> None:
+def test_create_preflight_only_releases_lease_without_container(tmp_path: Path) -> None:
     backend = FakeCliBackend()
+    output_parent = tmp_path / "workloads"
+    output_parent.mkdir(mode=0o700)
     result = runner.invoke(
         app,
         [
             "create", "--preflight-only", "--run-id", "gate4-a",
-            "--output-root", "/tmp/gate4-a",
+            "--output-root", str(output_parent),
         ],
         obj=backend,
     )
@@ -3994,7 +4175,117 @@ Expected: evidence, manager, and CLI imports fail.
 
 - [ ] **Step 5: Implement the exact evidence tree and verdict reducer**
 
-`EvidenceStore.create` resolves the configured root, rejects symlinked/equal/outside paths, exclusively creates `<run-id>`, and writes only via `atomic_write_new_json` or append-only fsynced JSONL. Define `mandatory_evidence_paths(episodes: tuple[int, ...]) -> tuple[str, ...]` as the complete path list in the approved design, including distinct `probe_loader`, `probe_cuda`, `episode_2`, and `episode_3` runner children and all final cleanup records. `manifest.json` hashes every allowlisted artifact and command result; `run-manifest.md` is rendered solely from that JSON. Raw token, SSH material, secrets, environment secrets, complete image/action payloads, and mutable intake paths are rejected by the evidence serializer.
+`EvidenceStore.create(output_parent, run_id=...)` requires an existing, attested, nonsymlink directory equal to the configured workload-parent root. It opens that parent with `O_DIRECTORY|O_NOFOLLOW`, validates device/inode/owner/mode, and atomically creates only `<output_parent>/<run-id>` with `mkdirat`; the child must be absent. An existing child—empty or nonempty—fails before any read, write, lease, helper, or cleanup action and is never renamed, deleted, adopted, or inspected beyond its no-follow type/identity. The store writes only beneath the newly created child via `atomic_write_new_json` or append-only fsynced JSONL. Define `mandatory_evidence_paths(episodes: tuple[int, ...]) -> tuple[str, ...]` as the complete path list in the approved design, including distinct `probe_loader`, `probe_cuda`, `episode_2`, and `episode_3` runner children and all final cleanup records. `manifest.json` hashes every allowlisted artifact and command result; `run-manifest.md` is rendered solely from that JSON. Raw token, SSH material, secrets, environment secrets, complete image/action payloads, and mutable intake paths are rejected by the evidence serializer.
+
+The same module implements `create_run_id_handoff`, `read_run_id_handoff`, and `remove_run_id_handoff` for operator shell-step continuity. Creation uses `O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW`, mode `0600`, one validated run ID plus newline, file fsync, and parent fsync. Reading uses `O_RDONLY|O_CLOEXEC|O_NOFOLLOW` and requires a regular single-link file owned by the current UID, exact mode `0600`, bounded size, one newline, and a valid identifier. Removal reopens and revalidates the current path, requires the expected run ID and the same path/FD device and inode, unlinks by parent FD only after the final acceptance verifier succeeds, and fsyncs the parent. No helper accepts a symlink, changed inode, extra line, invalid UTF-8, wrong owner/mode, or preexisting destination.
+
+```python
+# src/simple/eval_runtime/evidence.py (run-ID handoff helpers)
+# ruff: noqa: F821
+@dataclass(frozen=True, slots=True)
+class RunIdHandoffIdentity:
+    device: int
+    inode: int
+    mode: int
+
+
+def _handoff_parent(path: Path) -> tuple[Path, int]:
+    parent = path.parent.resolve(strict=True)
+    if parent != path.parent.absolute() or path.name in {"", ".", ".."}:
+        raise RuntimeBlocked("RUN_ID_HANDOFF_PARENT", str(path))
+    parent_fd = os.open(
+        parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    return parent, parent_fd
+
+
+def _validate_handoff_fd(fd: int) -> RunIdHandoffIdentity:
+    info = os.fstat(fd)
+    mode = stat.S_IMODE(info.st_mode)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise RuntimeBlocked("RUN_ID_HANDOFF_TYPE", "regular single-link file required")
+    if info.st_uid != os.getuid():
+        raise RuntimeBlocked("RUN_ID_HANDOFF_OWNER", str(info.st_uid))
+    if mode != 0o600:
+        raise RuntimeBlocked("RUN_ID_HANDOFF_MODE", oct(mode))
+    return RunIdHandoffIdentity(info.st_dev, info.st_ino, mode)
+
+
+def create_run_id_handoff(path: Path, run_id: str) -> RunIdHandoffIdentity:
+    value = validate_identifier(run_id, field="run_id")
+    _, parent_fd = _handoff_parent(path)
+    fd = -1
+    try:
+        fd = os.open(
+            path.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        encoded = (value + "\n").encode("ascii")
+        if os.write(fd, encoded) != len(encoded):
+            raise OSError("short run-ID handoff write")
+        os.fsync(fd)
+        identity = _validate_handoff_fd(fd)
+        os.fsync(parent_fd)
+        return identity
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def _read_run_id_handoff(path: Path) -> tuple[str, RunIdHandoffIdentity, int]:
+    _, parent_fd = _handoff_parent(path)
+    try:
+        fd = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except Exception:
+        os.close(parent_fd)
+        raise
+    try:
+        identity = _validate_handoff_fd(fd)
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (identity.device, identity.inode):
+            raise RuntimeBlocked("RUN_ID_HANDOFF_REPLACED", str(path))
+        encoded = os.read(fd, 130)
+        if len(encoded) > 129 or not encoded.endswith(b"\n") or encoded.count(b"\n") != 1:
+            raise RuntimeBlocked("RUN_ID_HANDOFF_CONTENT", str(path))
+        value = validate_identifier(encoded[:-1].decode("ascii"), field="run_id")
+        return value, identity, parent_fd
+    except Exception:
+        os.close(parent_fd)
+        raise
+    finally:
+        os.close(fd)
+
+
+def read_run_id_handoff(path: Path) -> str:
+    value, _, parent_fd = _read_run_id_handoff(path)
+    os.close(parent_fd)
+    return value
+
+
+def remove_run_id_handoff(path: Path, *, expected_run_id: str) -> None:
+    value, identity, parent_fd = _read_run_id_handoff(path)
+    try:
+        if value != expected_run_id:
+            raise RuntimeBlocked("RUN_ID_HANDOFF_VALUE", value)
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (identity.device, identity.inode):
+            raise RuntimeBlocked("RUN_ID_HANDOFF_REPLACED", str(path))
+        os.unlink(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+```
 
 `InfrastructureVerdict.evaluate` implements every PASS predicate in the approved design. Task verdicts are separate: a normal episode returning false leaves `infrastructure_valid=true` but overall verdict `FAIL`. Any missing evidence, unknown liveness, timeout, collision, GPU foreign process, hash mismatch, nonterminal runner/helper, live owned process/socket/port/container, or cleanup error makes infrastructure `FAIL`; it never upgrades an earlier failed run.
 
@@ -4067,7 +4358,7 @@ Persist/fsync each transition before the next external action. Register cleanup 
 
 - [ ] **Step 7: Implement the CLI and script entrypoints**
 
-`cli.py` defines a Typer `app` with exact commands `freeze-provenance`, `create`, `status`, `evaluate`, and `stop`; only `stop` accepts `--recover-stale RUN_ID`. `create --preflight-only` is the Gate-4 form: it requires a nonexistent run output, executes the exact local and leased preflight used by normal `create`, including `prepare_output` and the distinct loader/CUDA probes, then releases the lease after proving no helper/container/workload exists. It never calls Docker create and records a terminal preflight-only manifest. Normal `create` has no changed behavior. `evaluate` requires a nonexistent `--output-root`, exact `--episodes 2,3`, optional unbound loopback `--local-port` default 22085, and existing approved profile/container. All subprocesses receive argv arrays and monotonic deadlines through injectable runners; no `shell=True`, `os.system`, glob kill, force option, or prior-output mutation exists.
+`cli.py` defines a Typer `app` with exact commands `freeze-provenance`, `create`, `status`, `evaluate`, and `stop`; only `stop` accepts `--recover-stale RUN_ID`. Every mutating command interprets `--output-root` as the existing attested workload-parent directory and combines it with the separately validated `--run-id`; it never accepts a full child path in `--output-root`. `create --preflight-only` is the Gate-4 form: it requires `<output-root>/<run-id>` to be absent, exclusively creates that child, executes the exact local and leased preflight used by normal `create`, including `prepare_output` and the distinct loader/CUDA probes, then releases the lease after proving no helper/container/workload exists. It never calls Docker create and records a terminal preflight-only manifest. Normal `create` has no changed behavior. `evaluate` likewise requires an existing approved parent plus an absent run-ID child, exact `--episodes 2,3`, optional unbound loopback `--local-port` default 22085, and existing approved profile/container. All subprocesses receive argv arrays and monotonic deadlines through injectable runners; no `shell=True`, `os.system`, glob kill, force option, or prior-output mutation exists.
 
 `freeze-provenance --phase` accepts exactly `pc2`, `h100`, or `verify`; all three require the same existing run ID and immutable output root. `status` accepts optional `--run-id` plus `--verify-evidence` and remains read-only. `evaluate --stop-after` is absent by default and accepts only `warmup`; it is recorded as Gate-7 infrastructure evidence and exits through the full cleanup path before any runner episode operation. None of these options adds a sixth lifecycle command.
 
@@ -4110,11 +4401,13 @@ git commit -m "feat: orchestrate dedicated PSI0 evaluation evidence"
 ### Task 12: Complete adversarial crash, race, boundary, and failure-phase coverage
 
 **Files:**
+- Modify: `src/simple/eval_runtime/cli.py`
 - Create: `tests/eval_runtime/adversarial_adapters.py`
 - Create: `tests/eval_runtime/test_crash_matrix.py`
 - Create: `tests/eval_runtime/test_concurrency_matrix.py`
 - Create: `tests/eval_runtime/test_failure_phases.py`
 - Create: `tests/eval_runtime/test_security_boundaries.py`
+- Create: `tests/eval_runtime/test_integration_cli_auth.py`
 - Create: `tests/integration/eval_runtime/conftest.py`
 - Create: `tests/integration/eval_runtime/test_local_publication.py`
 - Create: `tests/integration/eval_runtime/test_runner_model_free.py`
@@ -4430,14 +4723,250 @@ Implement the native `--test-root` drivers after the RED result. These options a
 
 Rerun the same command. Expected GREEN: every parameterized case passes against real disk/process boundaries; every helper report is unique and nonempty; no network, Docker, SSH, GPU, simulator, or policy model starts.
 
-- [ ] **Step 6: Add the four explicitly gated integration drivers**
+- [ ] **Step 6: Write RED tests for authenticated integration-only CLI forms**
+
+```python
+# tests/eval_runtime/test_integration_cli_auth.py
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from simple.eval_runtime.cli import app
+from .fakes import FakeCliBackend
+
+runner = CliRunner()
+
+
+def _start_ticks(pid: int) -> int:
+    tail = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1]
+    return int(tail.split()[19])
+
+
+def _create_marker(
+    path: Path,
+    *,
+    operation: str,
+    fixture: str | None,
+    token: str,
+    report: Path,
+) -> int:
+    fd = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    identity = os.fstat(fd)
+    payload = {
+        "schema_version": 1,
+        "operation": operation,
+        "fixture": fixture,
+        "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+        "creator_pid": os.getpid(),
+        "creator_start_ticks": _start_ticks(os.getpid()),
+        "marker_device": identity.st_dev,
+        "marker_inode": identity.st_ino,
+        "marker_mode": stat.S_IMODE(identity.st_mode),
+        "report_path": str(report),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    os.write(fd, encoded + b"\n")
+    os.fsync(fd)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return fd
+
+
+def _authenticated_options(
+    *, marker: Path, marker_fd: int, token: str, report: Path
+) -> list[str]:
+    return [
+        "--integration-marker-path",
+        str(marker),
+        "--integration-marker-fd",
+        str(marker_fd),
+        "--integration-token",
+        token,
+        "--integration-report",
+        str(report),
+    ]
+
+
+def test_integration_form_is_rejected_without_enablement_and_marker(tmp_path: Path) -> None:
+    backend = FakeCliBackend()
+    result = runner.invoke(
+        app,
+        ["freeze-provenance", "--phase", "pc2-crash-fixtures"],
+        obj=backend,
+    )
+    assert result.exit_code != 0
+    assert backend.integration_calls == []
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "operation", "fixture"),
+    [
+        (["freeze-provenance", "--phase", "pc2-crash-fixtures"], "local-publication", None),
+        (["status", "--model-free-runner-probe"], "runner-model-free", None),
+        (["stop", "--owned-stale-fixture", "freeze"], "owned-stale", "freeze"),
+        (["stop", "--remote-fault-fixture", "ssh-sever"], "remote-fault", "ssh-sever"),
+    ],
+)
+def test_authenticated_integration_form_is_single_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    operation: str,
+    fixture: str | None,
+) -> None:
+    monkeypatch.setenv("SIMPLE_EVAL_INTEGRATION", "1")
+    monkeypatch.setenv("SIMPLE_EVAL_RUNTIME_UNIT_TEST", "1")
+    marker = tmp_path / f"{operation}.marker"
+    report = tmp_path / f"{operation}.report.json"
+    token = "ab" * 32
+    marker_fd = _create_marker(
+        marker,
+        operation=operation,
+        fixture=fixture,
+        token=token,
+        report=report,
+    )
+    backend = FakeCliBackend()
+    options = _authenticated_options(
+        marker=marker, marker_fd=marker_fd, token=token, report=report
+    )
+    try:
+        accepted = runner.invoke(app, [*argv, *options], obj=backend)
+        assert accepted.exit_code == 0
+        assert backend.integration_calls == [(operation, fixture)]
+        assert json.loads(report.read_text(encoding="utf-8"))["marker"] == operation
+        assert marker.with_suffix(".marker.consumed").is_file()
+        replay = runner.invoke(app, [*argv, *options], obj=backend)
+        assert replay.exit_code != 0
+        assert backend.integration_calls == [(operation, fixture)]
+    finally:
+        os.close(marker_fd)
+
+
+def test_wrong_token_or_replaced_marker_fails_before_fixture(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SIMPLE_EVAL_INTEGRATION", "1")
+    monkeypatch.setenv("SIMPLE_EVAL_RUNTIME_UNIT_TEST", "1")
+    marker = tmp_path / "owned-stale.marker"
+    report = tmp_path / "owned-stale.report.json"
+    marker_fd = _create_marker(
+        marker,
+        operation="owned-stale",
+        fixture="freeze",
+        token="ab" * 32,
+        report=report,
+    )
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(marker.read_bytes())
+    os.replace(replacement, marker)
+    backend = FakeCliBackend()
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "stop",
+                "--owned-stale-fixture",
+                "freeze",
+                *_authenticated_options(
+                    marker=marker,
+                    marker_fd=marker_fd,
+                    token="cd" * 32,
+                    report=report,
+                ),
+            ],
+            obj=backend,
+        )
+        assert result.exit_code != 0
+        assert backend.integration_calls == []
+        assert not report.exists()
+    finally:
+        os.close(marker_fd)
+
+
+def test_profile_binding_failure_precedes_consumption(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("SIMPLE_EVAL_INTEGRATION", "1")
+    monkeypatch.setenv("SIMPLE_EVAL_RUNTIME_UNIT_TEST", "1")
+    marker = tmp_path / "runner-model-free.marker"
+    report = tmp_path / "runner-model-free.report.json"
+    token = "ab" * 32
+    marker_fd = _create_marker(
+        marker,
+        operation="runner-model-free",
+        fixture=None,
+        token=token,
+        report=report,
+    )
+    backend = FakeCliBackend()
+    backend.integration_profile_approved = False
+    try:
+        result = runner.invoke(
+            app,
+            [
+                "status",
+                "--model-free-runner-probe",
+                *_authenticated_options(
+                    marker=marker,
+                    marker_fd=marker_fd,
+                    token=token,
+                    report=report,
+                ),
+            ],
+            obj=backend,
+        )
+        assert result.exit_code != 0
+        assert backend.integration_calls == []
+        assert not marker.with_suffix(".marker.consumed").exists()
+        assert not report.exists()
+    finally:
+        os.close(marker_fd)
+```
+
+Run:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \
+  -p no:cacheprovider tests/eval_runtime/test_integration_cli_auth.py
+```
+
+Expected RED: all four integration-only argument forms are rejected because their authenticated parser/dispatcher does not exist; the ordinary five-operation CLI remains unchanged.
+
+Implement hidden integration options in `src/simple/eval_runtime/cli.py` only after RED. They are indivisible: the exact fixture argument, marker path, inherited marker FD, 64-hex token, and report path must all be present. Validation requires `SIMPLE_EVAL_INTEGRATION=1`, an already approved profile whose `simple_source_commit == HEAD^`, a mode-`0600` regular marker created with `O_EXCL`, exact path/FD device and inode equality, exact marker owner and creator PID/start ticks (the CLI's live parent), token digest, operation/fixture/report equality, and an absent report and `.consumed` sibling. Production obtains and verifies that binding through the same strict profile loader used by normal commands. Only in `SIMPLE_EVAL_RUNTIME_UNIT_TEST=1` may an in-process `CliRunner` use its injected backend's `require_integration_profile_binding()` result and permit creator identity to equal the current process instead of its parent; the unit-only branch is itself rejected unless both conditions hold. Profile validation precedes marker consumption. The CLI creates `.consumed` with parent-FD-relative `O_CREAT|O_EXCL|O_NOFOLLOW`, fsyncs it and the parent before invoking the fixture, writes the report exclusively afterward, and never removes either artifact. Invalid, stale, replaced, replayed, partial, profile-mismatched, or ordinary production invocations perform zero fixture/backend actions. Task 12 therefore explicitly modifies `cli.py`; Task 11's normal public contracts do not recognize these forms.
+
+Rerun:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q \
+  -p no:cacheprovider tests/eval_runtime/test_integration_cli_auth.py
+```
+
+Expected GREEN: all four authenticated forms dispatch exactly once, every replay/replacement/token mismatch is rejected before backend action, and the normal five-operation CLI surface remains unchanged.
+
+- [ ] **Step 7: Add the four explicitly gated integration drivers**
 
 ```python
 # tests/integration/eval_runtime/conftest.py
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -4465,27 +4994,99 @@ class GateResult:
     stderr: str
 
 
+def _start_ticks(pid: int) -> int:
+    tail = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(")", 1)[1]
+    return int(tail.split()[19])
+
+
+def _create_gate_marker(
+    path: Path,
+    *,
+    operation: str,
+    fixture: str | None,
+    token: str,
+    report: Path,
+) -> int:
+    fd = os.open(
+        path,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    identity = os.fstat(fd)
+    payload = {
+        "schema_version": 1,
+        "operation": operation,
+        "fixture": fixture,
+        "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+        "creator_pid": os.getpid(),
+        "creator_start_ticks": _start_ticks(os.getpid()),
+        "marker_device": identity.st_dev,
+        "marker_inode": identity.st_ino,
+        "marker_mode": stat.S_IMODE(identity.st_mode),
+        "report_path": str(report),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    os.write(fd, encoded + b"\n")
+    os.fsync(fd)
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return fd
+
+
 @pytest.fixture
 def gate_runner(tmp_path: Path):
-    def run(*argv: str, marker: str, timeout: float = 300.0) -> GateResult:
+    def run(
+        *argv: str,
+        marker: str,
+        fixture: str | None = None,
+        timeout: float = 300.0,
+    ) -> GateResult:
         if os.environ.get("SIMPLE_EVAL_INTEGRATION") != "1":
             pytest.fail(
                 "SIMPLE_EVAL_INTEGRATION=1 is mandatory for an integration gate",
                 pytrace=False,
             )
-        report = tmp_path / f"{marker}.json"
-        completed = subprocess.run(
-            [*argv, "--integration-report", str(report)],
-            check=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
+        marker_path = tmp_path / f"{marker}.marker"
+        report = tmp_path / f"{marker}.report.json"
+        token = secrets.token_hex(32)
+        marker_fd = _create_gate_marker(
+            marker_path,
+            operation=marker,
+            fixture=fixture,
+            token=token,
+            report=report,
         )
+        try:
+            completed = subprocess.run(
+                [
+                    *argv,
+                    "--integration-marker-path",
+                    str(marker_path),
+                    "--integration-marker-fd",
+                    str(marker_fd),
+                    "--integration-token",
+                    token,
+                    "--integration-report",
+                    str(report),
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                pass_fds=(marker_fd,),
+            )
+        finally:
+            os.close(marker_fd)
         assert completed.returncode == 0, completed.stderr
         payload = json.loads(report.read_text(encoding="utf-8"))
         assert payload["schema_version"] == 1
         assert payload["marker"] == marker
+        assert marker_path.with_suffix(".marker.consumed").is_file()
         return GateResult(payload, completed.stdout, completed.stderr)
 
     return run
@@ -4558,7 +5159,7 @@ pytestmark = [pytest.mark.integration_owned_stale]
 def test_two_recoverers_have_one_winner_and_no_foreign_signal(fixture: str, gate_runner) -> None:
     result = gate_runner(
         ".venv/bin/psi0-eval-runtime", "stop", "--owned-stale-fixture", fixture,
-        marker=f"owned-stale-{fixture}", timeout=600.0,
+        marker="owned-stale", fixture=fixture, timeout=600.0,
     )
     assert result.report["recovery_winners"] == 1
     assert result.report["loser_signals"] == []
@@ -4578,7 +5179,7 @@ pytestmark = [pytest.mark.integration_remote_fault]
 def test_remote_fault_is_reconciled_by_identity(fault: str, gate_runner) -> None:
     result = gate_runner(
         ".venv/bin/psi0-eval-runtime", "stop", "--remote-fault-fixture", fault,
-        marker=f"remote-fault-{fault}", timeout=900.0,
+        marker="remote-fault", fixture=fault, timeout=900.0,
     )
     assert result.report["detached_helper_terminal"] is True
     assert result.report["owned_children_alive"] == []
@@ -4586,9 +5187,9 @@ def test_remote_fault_is_reconciled_by_identity(fault: str, gate_runner) -> None
     assert result.report["container_final"] == "exited"
 ```
 
-The three fixture-only CLI options are compiled into the source but accepted only when `SIMPLE_EVAL_INTEGRATION=1`, the approved profile is active, and the exact pytest-owned run marker exists. They create only the named inert/model-free owned fixtures, write their immutable gate report, and are rejected by ordinary production invocations. Unit CLI tests cover that rejection. Every staged integration command explicitly exports `SIMPLE_EVAL_INTEGRATION=1`; the integration conftest converts both a missing enablement variable and any unexpected pytest skip into a failing session.
+The four integration-only argument forms are compiled into the existing commands but are hidden from normal help and accepted only when `SIMPLE_EVAL_INTEGRATION=1`, the approved profile is active, and the inherited O_EXCL pytest marker passes token, inode, creator, operation, fixture, single-use, and report-path validation. They create only the named inert/model-free owned fixtures, write their immutable gate report, and are rejected by ordinary production invocations. The explicit CLI RED/GREEN tests above cover missing, malformed, replaced, and replayed authorization. Every staged integration command explicitly exports `SIMPLE_EVAL_INTEGRATION=1`; the integration conftest converts both a missing enablement variable and any unexpected pytest skip into a failing session.
 
-- [ ] **Step 7: Run the complete unit/native suite and commit**
+- [ ] **Step 8: Run the complete unit/native suite and commit**
 
 Run:
 
@@ -5026,6 +5627,7 @@ Expected: source/checkpoint/PC2 manifests and root identities still equal the pr
 **Files:**
 - Generated immutable run: `/mnt/data/jihun/psi0-simple-eval-workloads/<evaluation-run-id>/`
 - Remote transient run: `/mnt/data01/jhkim/psi0-simple-eval-workloads/runs/<evaluation-run-id>/`
+- Generated operator handoff: `/tmp/psi0-eval-evaluation-run-id-<uid>`
 - No tracked changes
 
 - [ ] **Step 1: Recheck selected GPUs and stopped ownership immediately before the run**
@@ -5047,7 +5649,21 @@ Expected: PC2 GPU 1 and H100 GPU 7 match approved UUIDs and have no foreign comp
 Run:
 
 ```bash
+evaluation_run_id_file="/tmp/psi0-eval-evaluation-run-id-$(id -u)"
+test ! -e "$evaluation_run_id_file"
 evaluation_run_id="eval-$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=12 HEAD)-$(openssl rand -hex 4)"
+.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import create_run_id_handoff
+create_run_id_handoff(Path(sys.argv[1]), sys.argv[2])
+' "$evaluation_run_id_file" "$evaluation_run_id"
+evaluation_run_id="$(.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import read_run_id_handoff
+print(read_run_id_handoff(Path(sys.argv[1])))
+' "$evaluation_run_id_file")"
 .venv/bin/psi0-eval-runtime evaluate \
   --run-id "$evaluation_run_id" \
   --output-root /mnt/data/jihun/psi0-simple-eval-workloads \
@@ -5062,6 +5678,13 @@ Expected: one exclusive lease; protected preflight; container/server/tracer/tunn
 Run:
 
 ```bash
+evaluation_run_id_file="/tmp/psi0-eval-evaluation-run-id-$(id -u)"
+evaluation_run_id="$(.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import read_run_id_handoff
+print(read_run_id_handoff(Path(sys.argv[1])))
+' "$evaluation_run_id_file")"
 .venv/bin/psi0-eval-runtime status \
   --run-id "$evaluation_run_id" \
   --verify-evidence
@@ -5070,6 +5693,21 @@ Run:
 Expected for each episode: distinct nonce and evidence file; `ENV_TYPE=sim`, `INTERFACE=lo`, `DOMAIN_ID=0`; closure/base/sidecar/UID/GID/network/relay/socket identities equal the profile and runner response; event order is `runtime_contract(validated)` → exact acknowledgement → `worker_init(creating_env)` → ready/start/steps/end/closing/done; no gap, malformed frame, or early EOF; WBC evidence predates `gym.make`.
 
 - [ ] **Step 4: Validate runner, relay, network, and GPU ownership between episodes**
+
+Reload the exact run identity rather than relying on shell state, then run the same immutable verifier:
+
+```bash
+evaluation_run_id_file="/tmp/psi0-eval-evaluation-run-id-$(id -u)"
+evaluation_run_id="$(.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import read_run_id_handoff
+print(read_run_id_handoff(Path(sys.argv[1])))
+' "$evaluation_run_id_file")"
+.venv/bin/psi0-eval-runtime status \
+  --run-id "$evaluation_run_id" \
+  --verify-evidence
+```
 
 The verifier must report for episode 2 before episode 3 starts:
 
@@ -5088,6 +5726,21 @@ Episode 3 has an independent record with a different nonce, child directory, Uni
 
 - [ ] **Step 5: Validate raw and checked head-stereo artifacts**
 
+Reload the exact run identity and rerun the artifact-bearing evidence verifier:
+
+```bash
+evaluation_run_id_file="/tmp/psi0-eval-evaluation-run-id-$(id -u)"
+evaluation_run_id="$(.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import read_run_id_handoff
+print(read_run_id_handoff(Path(sys.argv[1])))
+' "$evaluation_run_id_file")"
+.venv/bin/psi0-eval-runtime status \
+  --run-id "$evaluation_run_id" \
+  --verify-evidence
+```
+
 For every allowlisted camera in each episode require both:
 
 ```text
@@ -5102,6 +5755,16 @@ The artifact verifier checks absent-before creation, retained nonempty raw, atom
 Run read-only:
 
 ```bash
+evaluation_run_id_file="/tmp/psi0-eval-evaluation-run-id-$(id -u)"
+evaluation_run_id="$(.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import read_run_id_handoff
+print(read_run_id_handoff(Path(sys.argv[1])))
+' "$evaluation_run_id_file")"
+.venv/bin/psi0-eval-runtime status \
+  --run-id "$evaluation_run_id" \
+  --verify-evidence
 ssh h100 docker inspect jihun_psi0_simple_eval_gpu7 --format '{{.State.Status}}'
 ssh h100 docker port jihun_psi0_simple_eval_gpu7
 pgrep -af 'psi0-eval|eval_decoupled_wbc|ssh -N -L 127.0.0.1:22085' || true
@@ -5110,6 +5773,8 @@ git status --short
 ```
 
 Expected: Docker state `exited`; no published port; no owned manager/helper/tunnel/runner/relay/evaluator/WBC process or listener; both selected GPUs have no owned process; protected pre/post manifests match; all mandatory evidence exists. `manifest.json` is the source of truth and `run-manifest.md` renders the same verdict. Task failure may make overall evaluation FAIL while infrastructure remains valid; only full infrastructure plus two task successes yields PASS. Git status remains only `?? outputs/`.
+
+Keep the validated mode-`0600` handoff file through Task 18. It is removed only after the final source/profile and Gate 9 acceptance checks succeed.
 
 ### Task 18: Final source/profile audit and handoff
 
@@ -5150,7 +5815,22 @@ Expected: every test/check passes; all five native binaries remain static; no ru
 
 - [ ] **Step 3: Compare final evidence to the acceptance boundary**
 
-Use `psi0-eval-runtime status --run-id "$evaluation_run_id" --verify-evidence` on the Gate 9 directory and require every PASS predicate in the design's Verdict Rules. Record separately:
+Reload and validate the persisted run identity, use it on the Gate 9 directory, and remove the handoff only after the verifier succeeds:
+
+```bash
+evaluation_run_id_file="/tmp/psi0-eval-evaluation-run-id-$(id -u)"
+evaluation_run_id="$(.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import read_run_id_handoff
+print(read_run_id_handoff(Path(sys.argv[1])))
+' "$evaluation_run_id_file")"
+.venv/bin/psi0-eval-runtime status \
+  --run-id "$evaluation_run_id" \
+  --verify-evidence
+```
+
+Require every PASS predicate in the design's Verdict Rules. Record separately:
 
 - infrastructure verdict;
 - episode 2 SIMPLE task verdict;
@@ -5159,6 +5839,25 @@ Use `psi0-eval-runtime status --run-id "$evaluation_run_id" --verify-evidence` o
 - profile approval commit `P` and source commit `I`;
 - immutable local and remote evidence paths;
 - explicit `UNCERTIFIED` status for the PC2 real-time bridge.
+
+Only after those values are durably recorded and explicitly accepted, remove the handoff with its expected-value and inode checks:
+
+```bash
+evaluation_run_id_file="/tmp/psi0-eval-evaluation-run-id-$(id -u)"
+evaluation_run_id="$(.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import read_run_id_handoff
+print(read_run_id_handoff(Path(sys.argv[1])))
+' "$evaluation_run_id_file")"
+.venv/bin/python -c '
+import sys
+from pathlib import Path
+from simple.eval_runtime.evidence import remove_run_id_handoff
+remove_run_id_handoff(Path(sys.argv[1]), expected_run_id=sys.argv[2])
+' "$evaluation_run_id_file" "$evaluation_run_id"
+test ! -e "$evaluation_run_id_file"
+```
 
 No result from this plan authorizes real robot control. Bridge certification remains separate and still requires corrected 32-D same-episode provenance, attested `/contract` and `/act-rtc-v1`, and 100 warmed requests with zero failures and p99 at most 0.10 seconds for `d=6`.
 
