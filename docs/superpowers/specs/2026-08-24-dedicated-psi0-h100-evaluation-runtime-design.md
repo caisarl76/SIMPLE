@@ -718,6 +718,12 @@ absent target. Its strict response contains operation,
 token hashes, final tree/component hashes, completion hash, receipt hash, root
 identity, and terminal installer phase. Both messages reject additional keys,
 coercion, oversize frames, missing/extra FDs, and peer mismatch.
+The sole pre-`PREPARED` recovery response has terminal installer phase
+`ABORTED_BEFORE_PREPARED`, requires all final tree/component, completion,
+receipt, and root-identity fields to be null, and authorizes only a new
+manager-side attempt. Install and at/post-`PREPARED` recovery responses require
+those fields to be non-null and mutually consistent; response normalization
+cannot convert one branch into the other.
 
 The service no-follow validates all roots, but only its trusted parent may
 publish. It calls exactly
@@ -776,9 +782,43 @@ fsyncs the `PREPARED` journal record that first binds `final_tree_sha256`, and
 only then may append `RENAME_PENDING` or publish. Every subsequent base-Python
 journal record, derived final basename, completion, receipt, terminal response,
 and recovery decision must carry and match that bound digest; the intake-keyed
-journal filename never changes. Recovery locates it only by intake ID plus the
-prior operation-token hash and rejects a missing, earlier-than-`PREPARED`, or
-conflicting final digest.
+journal filename never changes.
+
+Base-Python recovery locates the prior journal only by intake ID plus operation-
+token hash and branches on its last durable phase:
+
+- **Before `PREPARED`:** every record must retain
+  `final_tree_sha256=null`, and neither a published final tree nor external
+  completion/receipt may exist. The staging tree may contain partial or
+  final-looking child output, including a staging-local completion file, but it
+  is never adopted without the durable `PREPARED` binding. After proving the
+  prior service child/cgroup absent, the recovery
+  transaction no-follow revalidates the exact token-owned staging basename,
+  device, inode, mount ID, owner-token hash, intake ID, and journal chain. It
+  fsyncs `STAGING_REMOVE_PENDING`, removes only that exact staging tree, fsyncs
+  its parent, and appends `ABORTED_BEFORE_PREPARED`. It never derives a final
+  basename or adopts bytes whose digest was not durably bound. The manager then
+  fsyncs the old attempt's `attempt_status="aborted-before-prepared"`, increments
+  the construction-attempt number, chooses a fresh operation token, sets
+  `attempt_status="active"`, creates a new intake-keyed journal, and restarts
+  from `BASE_ALLOCATED`; monotonicity is enforced independently within each
+  attempt. Recovery of a durable `STAGING_REMOVE_PENDING` record accepts only
+  the same revalidated
+  staging entry or its absence with the recorded parent unchanged; it completes
+  or confirms removal, proves the published final and external completion/
+  receipt paths absent, and appends the same terminal abort record. Any other
+  postcondition blocks.
+- **At or after `PREPARED`:** `final_tree_sha256` must be non-null and equal the
+  digest first bound by the validated `PREPARED` record. Every later pending,
+  result, rename, completion, receipt, response, and recovery record must carry
+  that exact digest. A null, changed, missing, or multiply bound digest is
+  `PROVENANCE_BLOCKED` and is never guessed or repaired.
+
+A non-null digest before `PREPARED`, a final path or receipt in the pre-
+`PREPARED` branch, a live/unknown old child, identity drift, or any extra
+staging entry is contradictory state and blocks automatic recovery. Both the
+abort branch and the publication branch use the same stable lock, current owner
+record, recovery-token, and one-response privileged-service protocol.
 
 Journal records have exact sequence numbers and phases and are hash-chained to
 the request, owner/recovery tokens, source/destination identities, rename
@@ -972,8 +1012,13 @@ phases:
 
 The intake identity is path-independent and known before staging allocation.
 The owner/heartbeat/claim schema and locking rules are identical to closure
-construction, with intake ID replacing closure ID. Its exact monotonic phases
-are:
+construction, with intake ID replacing closure ID and an exact positive
+`construction_attempt` field starting at 1 plus `attempt_status` exactly
+`"active"`, `"aborted-before-prepared"`, or `"complete"`. A pre-`PREPARED`
+abort durably records the aborted status before incrementing the attempt,
+installing a fresh operation token, and returning the status to `"active"` at
+`BASE_ALLOCATED`; the ordered `(construction_attempt, phase)` pair never moves
+backward. Its exact per-attempt monotonic phases are:
 
 ```text
 BASE_ALLOCATED -> BASE_COPIED -> BASE_METADATA_NORMALIZED ->
@@ -2990,8 +3035,15 @@ Tests use fake monotonic clocks and a scripted command runner. They cover:
   intermediate protocol frame; base-Python tests require the exact intake-ID/
   operation-token journal path to exist before its first privileged mutation,
   `final_tree_sha256=null` initially, its first non-null binding only in the
-  validated `PREPARED` record, no final-digest-keyed pre-mutation journal, and
-  deterministic recovery through that unchanged intake-keyed path;
+  validated `PREPARED` record, and no final-digest-keyed pre-mutation journal;
+  crash injection covers every mutation-child phase including immediately
+  before returning `PREPARED`, plus before/after `STAGING_REMOVE_PENDING`, the
+  exact removal, parent fsync, and `ABORTED_BEFORE_PREPARED`; pre-`PREPARED`
+  recovery must idempotently terminalize the old attempt, remove only the
+  revalidated token-owned staging tree, leave no published final/external
+  completion/receipt, then restart with a fresh attempt number and operation
+  token, while at/post-`PREPARED` recovery requires the one bound non-null
+  digest in every subsequent record;
 - protected base-Python publication and recovery through every named phase,
   exact completion/root/receipt identities before closure-ID computation,
   venv interpreter-link resolution beneath the inherited base root FD, and
