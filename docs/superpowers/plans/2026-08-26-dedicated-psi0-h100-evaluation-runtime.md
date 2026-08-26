@@ -284,7 +284,12 @@ from __future__ import annotations
 import json
 import os
 import socket
+import array
+import fcntl
+import hashlib
+import struct
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -376,6 +381,199 @@ class RecoveryHarness:
 
     def reject_recovery_against(self, reference: str) -> str:
         return "AUTHORIZATION_KIND" if reference.startswith("install:") else "accepted"
+
+
+class ForkedInstallerService:
+    def __init__(self, root: Path, pid: int):
+        self.root = root
+        self.pid = pid
+        self.socket_path = root / "installer.sock"
+
+    @classmethod
+    def start(
+        cls,
+        root: Path,
+        *,
+        transaction_lock: Path,
+        script: tuple[str, ...] | None = None,
+    ) -> "ForkedInstallerService":
+        root.mkdir(mode=0o700)
+        transaction_lock.touch(mode=0o600)
+        request_log = root / "requests.jsonl"
+        response_log = root / "responses.jsonl"
+        request_log.touch(mode=0o600)
+        response_log.touch(mode=0o600)
+        ready_read, ready_write = os.pipe2(os.O_CLOEXEC)
+        pid = os.fork()
+        if pid == 0:
+            os.close(ready_read)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(root / "installer.sock")
+            listener.listen(4)
+            os.write(ready_write, b"1")
+            os.close(ready_write)
+            install_count = 0
+            journal_created = False
+            script_index = 0
+            try:
+                while True:
+                    connection, _ = listener.accept()
+                    with connection:
+                        body = cls._receive_request(connection)
+                        if body == b"__stop__":
+                            break
+                        request = json.loads(body)
+                        if script is not None:
+                            response_status = script[
+                                min(script_index, len(script) - 1)
+                            ]
+                            script_index += 1
+                        elif request["operation"] == "install_base_python":
+                            install_count += 1
+                            response_status = (
+                                "TRANSPORT_DROPPED"
+                                if install_count == 1
+                                else "TRANSPORT_DROPPED_AFTER_JOURNAL"
+                            )
+                        elif request["operation"] == "recover_base_python":
+                            generation = request["recovery_generation"]
+                            response_status = (
+                                "NO_JOURNAL_NO_MUTATION"
+                                if generation == 1 and not journal_created
+                                else "RECOVERED"
+                            )
+                        else:
+                            raise RuntimeError("INSTALLER_TEST_OPERATION")
+                        cls._append_jsonl(
+                            request_log,
+                            {"body_hex": body.hex()},
+                        )
+                        cls._append_jsonl(
+                            response_log,
+                            {"status": response_status},
+                        )
+                        if response_status == "TRANSPORT_DROPPED":
+                            continue
+                        if response_status == "TRANSPORT_DROPPED_AFTER_JOURNAL":
+                            journal = root / "service-journal.json"
+                            journal.write_bytes(b'{"phase":"PREPARED"}\n')
+                            with journal.open("rb") as stream:
+                                os.fsync(stream.fileno())
+                            cls._fsync_dir(root)
+                            journal_created = True
+                            continue
+                        try:
+                            cls._send_response(
+                                connection,
+                                transaction_lock=transaction_lock,
+                                request=body,
+                                status=response_status,
+                            )
+                        except BrokenPipeError:
+                            continue
+            finally:
+                listener.close()
+                os._exit(0)
+        os.close(ready_write)
+        if os.read(ready_read, 1) != b"1":
+            raise RuntimeError("INSTALLER_TEST_SERVICE_START")
+        os.close(ready_read)
+        return cls(root, pid)
+
+    @staticmethod
+    def _receive_request(connection: socket.socket) -> bytes:
+        header = ForkedInstallerService._receive_exact(connection, 4)
+        length = struct.unpack("!I", header)[0]
+        if length <= 0 or length > 1_048_576:
+            raise RuntimeError("INSTALLER_TEST_REQUEST_LENGTH")
+        return ForkedInstallerService._receive_exact(connection, length)
+
+    @staticmethod
+    def _receive_exact(connection: socket.socket, count: int) -> bytes:
+        value = bytearray()
+        while len(value) < count:
+            chunk = connection.recv(count - len(value))
+            if not chunk:
+                raise RuntimeError("INSTALLER_TEST_REQUEST_EOF")
+            value.extend(chunk)
+        return bytes(value)
+
+    @staticmethod
+    def _send_response(
+        connection: socket.socket,
+        *,
+        transaction_lock: Path,
+        request: bytes,
+        status: str,
+    ) -> None:
+        request_id = hashlib.sha256(request).hexdigest()
+        payload = json.dumps(
+            {
+                "schema_version": 1,
+                "request_id": request_id,
+                "status": status,
+                "payload": {},
+                "error": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        lock_fd = os.open(
+            transaction_lock,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        rights = array.array("i", [lock_fd])
+        connection.sendmsg(
+            [struct.pack("!I", len(payload)), payload],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+        )
+        os.close(lock_fd)
+
+    @staticmethod
+    def _append_jsonl(path: Path, value: dict[str, str]) -> None:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        ForkedInstallerService._fsync_dir(path.parent)
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def wait(self, *, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pid, status = os.waitpid(self.pid, os.WNOHANG)
+            if pid == self.pid:
+                if os.waitstatus_to_exitcode(status) != 0:
+                    raise RuntimeError("INSTALLER_TEST_SERVICE_EXIT")
+                return
+            time.sleep(0.01)
+        raise TimeoutError("INSTALLER_TEST_SERVICE_WAIT")
+
+    def stop(self) -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.connect(self.socket_path)
+            connection.sendall(struct.pack("!I", 8) + b"__stop__")
+
+    def request_bytes(self) -> list[bytes]:
+        return [
+            bytes.fromhex(json.loads(line)["body_hex"])
+            for line in (self.root / "requests.jsonl").read_text().splitlines()
+        ]
+
+    def responses(self) -> list[str]:
+        return [
+            json.loads(line)["status"]
+            for line in (self.root / "responses.jsonl").read_text().splitlines()
+        ]
 
 
 class FakeRemoteTransport:
@@ -577,6 +775,9 @@ class FakeCliBackend:
         self.actions: list[str] = []
         self.integration_calls: list[tuple[str, str | None]] = []
         self.integration_profile_approved = True
+        self.retirement_state = "failed"
+        self.retirement_calls: list[tuple[str, Path]] = []
+        self.signals: list[int] = []
 
     def local_preflight(self) -> None:
         self.actions.append("local_preflight")
@@ -599,6 +800,37 @@ class FakeCliBackend:
     def require_integration_profile_binding(self) -> None:
         if not self.integration_profile_approved:
             raise RuntimeError("INTEGRATION_PROFILE_BINDING")
+
+    def recover_owned_run(self, run_id: str, run_root: Path) -> None:
+        from simple.eval_runtime.evidence import EvidenceStore
+
+        self.retirement_calls.append((run_id, run_root))
+        store = EvidenceStore.open_existing(run_root)
+        if self.retirement_state == "foreign":
+            raise RuntimeError("FOREIGN_BLOCKED")
+        if self.retirement_state == "nonterminal":
+            return
+        if self.retirement_state == "unknown":
+            finalize_failed_evidence(
+                store,
+                run_id=run_id,
+                unknown_remote_state=True,
+            )
+            return
+        if self.retirement_state == "pass":
+            populate_complete_evidence(store, episodes=(2, 3))
+            store.finalize_terminal_manifest(
+                run_id=run_id,
+                episodes=(2, 3),
+                infrastructure_verdict="PASS",
+                overall_verdict="PASS",
+                task_results={"episode_2": True, "episode_3": True},
+                owned_processes_alive=[],
+                unknown_remote_state=False,
+                unresolved_errors=[],
+            )
+            return
+        finalize_failed_evidence(store, run_id=run_id)
 
 
 def make_construction_record(*, phase: str):
@@ -752,6 +984,36 @@ def populate_complete_evidence(store: Any, *, episodes: tuple[int, ...]) -> None
 
     for relative in mandatory_evidence_paths(episodes):
         store.write(relative, {"schema_version": 1, "status": "ok"})
+
+
+def finalize_failed_evidence(
+    store: Any,
+    *,
+    run_id: str,
+    unknown_remote_state: bool = False,
+) -> Any:
+    manifest_path = store.root / "manifest.json"
+    if manifest_path.exists():
+        return store.verify_terminal_manifest(expected_run_id=run_id)
+    for relative in (
+        "cleanup/actions.json",
+        "cleanup/processes-final.json",
+        "cleanup/ports-final.json",
+        "cleanup/container-final.json",
+        "cleanup/remote-helpers-final.json",
+    ):
+        if not (store.root / relative).exists():
+            store.write(relative, {"schema_version": 1, "status": "clean"})
+    return store.finalize_terminal_manifest(
+        run_id=run_id,
+        episodes=(),
+        infrastructure_verdict="FAIL",
+        overall_verdict="FAIL",
+        task_results={},
+        owned_processes_alive=[],
+        unknown_remote_state=unknown_remote_state,
+        unresolved_errors=["INTERRUPTED_RETRY"],
+    )
 ```
 
 The production classes above must expose the exact `from_dict` constructors shown; `LeaseStore.install_expired_test_record` is enabled only when `SIMPLE_EVAL_RUNTIME_UNIT_TEST=1` and otherwise raises `RuntimeBlocked("TEST_API_DISABLED", ...)`. Task-specific tests may extend these fakes locally, but may not reference an undefined helper. The native tests, FD/filesystem tests, and integration gates—not these state-only fakes—own kernel-boundary proof.
@@ -2604,11 +2866,11 @@ import os
 
 import pytest
 
-from simple.eval_runtime.installer_client import InstallerReply
 from simple.eval_runtime.installer_manager import (
     DiskAuthorizationStore,
-    InstallerManagerOwnership,
+    InstallerOrchestrator,
 )
+from .fakes import ForkedInstallerService
 
 INSTALL_BYTES = b'{"operation":"install_base_python","schema_version":1}\n'
 CRASH_BOUNDARIES = (
@@ -2623,62 +2885,67 @@ CRASH_BOUNDARIES = (
     "before_resubmission", "after_resubmission",
 )
 LIVE_PERSISTENCE_BOUNDARIES = (
-    "before_authorization_append", "after_authorization_append",
-    "before_active_reference_switch", "after_active_reference_switch",
     "before_result_append", "after_result_append",
     "before_owner_record_replace", "after_owner_record_replace",
     "before_owner_record_fsync", "after_owner_record_fsync",
     "before_owner_parent_fsync", "after_owner_parent_fsync",
 )
 
-
-def _locked(path) -> int:
-    path.touch(exist_ok=True, mode=0o600)
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    return fd
-
-
 @pytest.mark.parametrize("boundary", CRASH_BOUNDARIES)
-def test_fork_exit_restart_replays_only_fsynced_active_reference(
+def test_fork_exit_restart_uses_real_wire_order_and_byte_exact_replay(
     boundary: str, tmp_path
 ) -> None:
     root = tmp_path / "manager-state"
     construction = tmp_path / "construction.lock"
     transaction = tmp_path / "transaction.lock"
-    store = DiskAuthorizationStore.bootstrap(
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        transaction_lock=transaction,
+    )
+    DiskAuthorizationStore.bootstrap(
         root,
         install_request=INSTALL_BYTES,
         construction_lock=construction,
         transaction_lock=transaction,
     )
+    first = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(Exception, match="INSTALLER_TRANSPORT_UNCERTAIN"):
+        first.begin_install()
+    first.close_after_uncertain_transport()
+
     pid = os.fork()
     if pid == 0:
-        construction_fd = _locked(construction)
-        handoff_fd = _locked(transaction)
-        manager = InstallerManagerOwnership.open(
-            store=store,
-            construction_lock_fd=construction_fd,
-        )
-        manager.resume_uncertain_install(
-            InstallerReply("RECOVERED", {}, "a" * 64, handoff_fd),
+        manager = InstallerOrchestrator.restart(root, service.socket_path)
+        manager.drive_to_terminal(
             fault_hook=lambda name: os._exit(86) if name == boundary else None,
         )
         os._exit(0)
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 86
 
-    restarted = InstallerManagerOwnership.restart(root)
+    restarted = InstallerOrchestrator.restart(root, service.socket_path)
+    restarted.drive_to_terminal()
     snapshot = restarted.store.validated_snapshot()
     assert snapshot.install_request_bytes == INSTALL_BYTES
     assert snapshot.authorization_chain_valid is True
     assert snapshot.result_chain_valid is True
     assert snapshot.temporary_entries == ()
-    decision = restarted.recovery_decision()
-    assert decision.request_bytes == INSTALL_BYTES
-    assert decision.active_reference == snapshot.active_reference
-    restarted.reconcile_after_restart()
-    assert restarted.store.validated_snapshot().terminal is True
+    assert snapshot.terminal is True
+    service.stop()
+    service.wait(timeout=5.0)
+    requests = service.request_bytes()
+    installs = [
+        body for body in requests
+        if body == INSTALL_BYTES
+    ]
+    assert installs == [INSTALL_BYTES, INSTALL_BYTES]
+    responses = service.responses()
+    assert responses[0] == "TRANSPORT_DROPPED"
+    assert "NO_JOURNAL_NO_MUTATION" in responses
+    assert "TRANSPORT_DROPPED_AFTER_JOURNAL" in responses
+    assert responses[-1] == "RECOVERED"
+    assert snapshot.replayed_install_sha256 == snapshot.install_request_sha256
+    assert snapshot.terminal_response_status == "RECOVERED"
 
 
 @pytest.mark.parametrize("boundary", LIVE_PERSISTENCE_BOUNDARIES)
@@ -2688,21 +2955,20 @@ def test_live_persistence_failure_retains_both_locks_until_reconciled(
     root = tmp_path / "manager-state"
     construction = tmp_path / "construction.lock"
     transaction = tmp_path / "transaction.lock"
-    store = DiskAuthorizationStore.bootstrap(
+    DiskAuthorizationStore.bootstrap(
         root,
         install_request=INSTALL_BYTES,
         construction_lock=construction,
         transaction_lock=transaction,
     )
-    construction_fd = _locked(construction)
-    handoff_fd = _locked(transaction)
-    manager = InstallerManagerOwnership.open(
-        store=store,
-        construction_lock_fd=construction_fd,
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        transaction_lock=transaction,
+        script=("RECOVERED",),
     )
+    manager = InstallerOrchestrator.restart(root, service.socket_path)
     with pytest.raises(Exception, match="HANDOFF_PERSISTENCE_UNCERTAIN"):
-        manager.resume_uncertain_install(
-            InstallerReply("RECOVERED", {}, "a" * 64, handoff_fd),
+        manager.drive_to_terminal(
             fault_hook=lambda name: (_ for _ in ()).throw(OSError(name))
             if name == boundary
             else None,
@@ -2714,9 +2980,11 @@ def test_live_persistence_failure_retains_both_locks_until_reconciled(
     fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
     os.close(contender)
     assert manager.store.validated_snapshot().terminal is True
+    service.stop()
+    service.wait(timeout=5.0)
 ```
 
-`InstallerHandoffHarness` covers only response ordering, while the receiver tests use a real Unix `socketpair`, `fork`, `sendmsg/recvmsg`, `SCM_RIGHTS`, `MSG_CMSG_CLOEXEC`, and `flock`. The new restart file uses the production disk store and manager owner, real `fork/_exit`, real lock release on process death, and a fresh production reopen. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
+`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child, reads the production length-prefixed request frame, appends the exact received bytes and response status to fsynced files, and sends terminal frames plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, fsyncs a journal and drops the byte-identical second install response, then returns the same `RECOVERED` result for generation 2 replays. A broken response socket never advances authorization state; request generation and the fsynced service journal determine the response. The explicit stop frame is sent only after the manager verifies terminal state. `InstallerOrchestrator` uses the production session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after actual request delivery and actual terminal-frame-plus-handoff receipt. A fresh orchestrator reopens only the fsynced prefix, performs any required wire operation, and cannot mark terminal without a newly received, validated, durably persisted terminal response. The assertion proves the two actual install frames are byte-identical. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
 
 - [ ] **Step 2: Write failing systemd/config exactness tests**
 
@@ -2842,6 +3110,10 @@ class HandoffPersistenceUncertain(RuntimeError):
         self.handoff_fd = handoff_fd
 
 
+class TransportUncertain(RuntimeError):
+    pass
+
+
 def lock_identity_from_fd(fd: int) -> LockIdentity:
     status = os.fstat(fd)
     mount_id = None
@@ -2900,7 +3172,7 @@ def _recv_exact(channel: socket.socket, count: int) -> bytes:
     while len(value) < count:
         chunk = channel.recv(count - len(value))
         if not chunk:
-            raise RuntimeError("HANDOFF_FRAME_EOF")
+            raise TransportUncertain("HANDOFF_FRAME_EOF")
         value.extend(chunk)
     return bytes(value)
 
@@ -2932,6 +3204,8 @@ def recv_installer_reply(
             socket.CMSG_SPACE(array.array("i", [0]).itemsize),
             socket.MSG_CMSG_CLOEXEC | socket.MSG_WAITALL,
         )
+        if not header and not ancillary:
+            raise TransportUncertain("HANDOFF_FRAME_EOF")
         if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
             close_all_rights_fds(ancillary)
             raise RuntimeError("HANDOFF_ANCILLARY_TRUNCATED")
@@ -2957,6 +3231,36 @@ def recv_installer_reply(
         raise
 
 
+class UnixInstallerSession:
+    def __init__(
+        self,
+        socket_path: os.PathLike[str],
+        *,
+        expected_lock: LockIdentity,
+    ) -> None:
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._socket.connect(os.fspath(socket_path))
+        self._expected_lock = expected_lock
+        self._request_id: str | None = None
+
+    def send_request(self, request_bytes: bytes) -> None:
+        self._request_id = hashlib.sha256(request_bytes).hexdigest()
+        frame = struct.pack("!I", len(request_bytes)) + request_bytes
+        self._socket.sendall(frame)
+
+    def receive_reply(self) -> InstallerReply:
+        if self._request_id is None:
+            raise RuntimeError("INSTALLER_REQUEST_NOT_SENT")
+        return recv_installer_reply(
+            self._socket.fileno(),
+            request_id=self._request_id,
+            expected_lock=self._expected_lock,
+        )
+
+    def close(self) -> None:
+        self._socket.close()
+
+
 def apply_locked_reply(
     history: Any, reply: InstallerReply, *, expected_lock: LockIdentity
 ) -> None:
@@ -2975,6 +3279,14 @@ Add the concrete manager owner; `apply_locked_reply` becomes its small success-p
 ```python
 # src/simple/eval_runtime/installer_manager.py
 # ruff: noqa: F821
+@dataclass(frozen=True, slots=True)
+class WireDecision:
+    request_bytes: bytes
+    authorization_kind: str
+    recovery_generation: int | None
+    is_resubmission: bool
+
+
 @dataclass(slots=True)
 class RetainedHandoff:
     reply: InstallerReply
@@ -3009,8 +3321,9 @@ class InstallerManagerOwnership:
         construction_lock_fd = store.open_and_lock_construction()
         return cls(store=store, construction_lock_fd=construction_lock_fd)
 
-    def resume_uncertain_install(
+    def persist_received_reply(
         self,
+        decision: WireDecision,
         reply: InstallerReply,
         *,
         fault_hook: Callable[[str], None] | None = None,
@@ -3019,8 +3332,12 @@ class InstallerManagerOwnership:
             raise RuntimeError("HANDOFF_OWNER_STATE")
         self.store.validate_locked_handoff(reply.handoff_fd)
         try:
-            self.store.commit_recovery_cycle(reply, fault_hook=fault_hook)
-            self.store.fsync_owner_and_parent()
+            self.store.commit_received_result(
+                decision,
+                reply,
+                fault_hook=fault_hook,
+            )
+            self.store.fsync_owner_and_parent(fault_hook=fault_hook)
             if fault_hook is not None:
                 fault_hook("before_handoff_close")
         except BaseException as error:
@@ -3029,7 +3346,6 @@ class InstallerManagerOwnership:
         os.close(reply.handoff_fd)
         if fault_hook is not None:
             fault_hook("after_handoff_close")
-        self._close_construction_lock()
 
     def reconcile_locked_handoff(self) -> None:
         retained = self._retained
@@ -3043,23 +3359,141 @@ class InstallerManagerOwnership:
         self._retained = None
         self._close_construction_lock()
 
-    def recovery_decision(self) -> RecoveryDecision:
-        return self.store.recovery_decision()
-
-    def reconcile_after_restart(self) -> None:
+    def close_without_handoff(self) -> None:
         if self._retained is not None or self._closed:
-            raise RuntimeError("RESTART_RECONCILE_STATE")
-        self.store.reconcile_fsynced_prefix_after_restart()
-        self.store.fsync_owner_and_parent()
+            raise RuntimeError("HANDOFF_OWNER_STATE")
+        self._close_construction_lock()
+
+    def close_terminal_construction_lock(self) -> None:
+        if self._retained is not None or self._closed:
+            raise RuntimeError("HANDOFF_OWNER_STATE")
+        if not self.store.validated_snapshot().terminal:
+            raise RuntimeError("INSTALLER_NOT_TERMINAL")
         self._close_construction_lock()
 
     def _close_construction_lock(self) -> None:
         if not self._closed:
             os.close(self._construction_lock_fd)
             self._closed = True
+
+
+class InstallerOrchestrator:
+    def __init__(
+        self,
+        *,
+        ownership: InstallerManagerOwnership,
+        socket_path: Path,
+    ) -> None:
+        self.ownership = ownership
+        self.store = ownership.store
+        self.socket_path = socket_path
+
+    @classmethod
+    def restart(cls, root: Path, socket_path: Path) -> "InstallerOrchestrator":
+        return cls(
+            ownership=InstallerManagerOwnership.restart(root),
+            socket_path=socket_path,
+        )
+
+    def begin_install(self) -> None:
+        decision = self.store.prepare_initial_install_delivery()
+        try:
+            self._exchange(decision, fault_hook=None)
+        except TransportUncertain as error:
+            self.store.record_transport_uncertain(decision)
+            self.store.fsync_owner_and_parent()
+            raise RuntimeError("INSTALLER_TRANSPORT_UNCERTAIN") from error
+
+    def close_after_uncertain_transport(self) -> None:
+        if not self.store.validated_snapshot().transport_uncertain:
+            raise RuntimeError("INSTALLER_NOT_UNCERTAIN")
+        self.ownership.close_without_handoff()
+
+    def reconcile_locked_handoff(self) -> None:
+        self.ownership.reconcile_locked_handoff()
+
+    def drive_to_terminal(
+        self,
+        *,
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        while not self.store.validated_snapshot().terminal:
+            if self._complete_pending_local_transition(fault_hook=fault_hook):
+                continue
+            decision = self.store.prepare_next_wire_request(fault_hook=fault_hook)
+            if decision.is_resubmission and fault_hook is not None:
+                fault_hook("before_resubmission")
+            try:
+                reply = self._exchange(decision, fault_hook=fault_hook)
+            except TransportUncertain:
+                self.store.record_transport_uncertain(decision)
+                self.store.fsync_owner_and_parent()
+                continue
+            if decision.is_resubmission and fault_hook is not None:
+                fault_hook("after_resubmission")
+            self.ownership.persist_received_reply(
+                decision,
+                reply,
+                fault_hook=fault_hook,
+            )
+            if reply.status not in {"NO_JOURNAL_NO_MUTATION", "RECOVERED"}:
+                raise RuntimeError("INSTALLER_RESPONSE_STATUS")
+        self.ownership.close_terminal_construction_lock()
+
+    def _complete_pending_local_transition(
+        self,
+        *,
+        fault_hook: Callable[[str], None] | None,
+    ) -> bool:
+        pending = self.store.pending_local_transition()
+        if pending == "REACTIVATE_INSTALL":
+            if fault_hook is not None:
+                fault_hook("before_install_reactivation")
+            self.store.reactivate_byte_identical_install()
+            self.store.fsync_owner_and_parent()
+            if fault_hook is not None:
+                fault_hook("after_install_reactivation")
+            return True
+        if pending == "CLEAR_TERMINAL_RECOVERY":
+            if fault_hook is not None:
+                fault_hook("before_terminal_clear")
+            self.store.mark_terminal_from_fsynced_received_reply()
+            self.store.fsync_owner_and_parent()
+            if fault_hook is not None:
+                fault_hook("after_terminal_clear")
+            return True
+        if pending is not None:
+            raise RuntimeError("INSTALLER_PENDING_LOCAL_TRANSITION")
+        return False
+
+    def _exchange(
+        self,
+        decision: WireDecision,
+        *,
+        fault_hook: Callable[[str], None] | None,
+    ) -> InstallerReply:
+        session = UnixInstallerSession(
+            self.socket_path,
+            expected_lock=self.store.transaction_lock_identity,
+        )
+        try:
+            if fault_hook is not None:
+                fault_hook("before_request_delivery")
+            session.send_request(decision.request_bytes)
+            if fault_hook is not None:
+                fault_hook("after_request_delivery")
+                fault_hook("before_terminal_handoff_receipt")
+            reply = session.receive_reply()
+            if fault_hook is not None:
+                fault_hook("after_terminal_handoff_receipt")
+            return reply
+        except (TransportUncertain, BrokenPipeError, ConnectionResetError) as error:
+            raise TransportUncertain from error
+        finally:
+            session.close()
 ```
 
-`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. Its root manifest pins the construction- and transaction-lock device/inode/mount identities and original install digest. `commit_recovery_cycle` exposes all non-close fault-hook boundaries only as an injected callable argument—normal production passes `None`—while `InstallerManagerOwnership` owns the two handoff-close boundaries; together they implement the approved generation-1/replay/generation-2 sequence. `validated_snapshot`, `recovery_decision`, `reconcile_exact_reply`, and `reconcile_fsynced_prefix_after_restart` reopen all files with `openat2`/no-follow semantics, reject any invalid suffix or temporary entry, verify both independent hash chains and the active-reference digest, and never infer state from an un-fsynced pending file. Live reconciliation closes neither FD on any error. Restart reconciliation first acquires the pinned construction lock, uses only the fsynced prefix, appends the required next recovery authorization/result, and reaches terminal state before releasing it.
+`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. Its root manifest pins the construction- and transaction-lock device/inode/mount identities and original install digest. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks. `persist_received_reply` places result-append and handoff-close hooks around the received reply's actual durable transition. Reactivation, terminal-clear, and resubmission hooks surround those real orchestration operations, never a synthetic reply. `validated_snapshot`, `recovery_decision`, `reconcile_exact_reply`, and restart methods reopen all files with `openat2`/no-follow semantics, reject any invalid suffix or temporary entry, verify both independent hash chains and the active-reference digest, and never infer state from an un-fsynced pending file. Live reconciliation closes neither FD on any error. Restart acquires the pinned construction lock and uses only the fsynced prefix, but it can reach terminal only by driving the next required wire request through a newly opened production session and persisting the newly received response.
 
 `AuthorizationHistory.append_recovery()` requires generation `last + 1`, a fresh token and authorization ID, `previous_entry_sha256=None` for generation 1 and otherwise the exact canonical digest of the preceding authorization entry, a monotonic authorization sequence, and one active reference. `RecoveryResultHistory.append()` separately requires a contiguous result prefix and `previous_result_sha256=None` for its first result and otherwise the preceding result digest. Authorization objects contain no result field, and result entries never participate in the authorization chain. `NO_JOURNAL_NO_MUTATION` reactivates the unchanged install authorization and byte-identical request; every further uncertainty appends a new recovery generation. Neither history overwrites or reorders an entry, marks an older entry active, or uses `pending_action` as authority.
 
@@ -3859,6 +4293,8 @@ def test_managed_contract_requires_one_worker() -> None:
 # tests/eval_runtime/test_evaluator_python_lifecycle.py
 from __future__ import annotations
 
+from collections import defaultdict
+
 import pytest
 
 from simple.cli.eval_decoupled_wbc import _execute_managed_worker_lifecycle
@@ -3871,9 +4307,12 @@ FAILURES = (
 
 
 class SimulatorFreeWorkerOps:
-    def __init__(self, fail_at: str):
+    def __init__(self, fail_at: str | None):
         self.fail_at = fail_at
         self.calls: list[str] = []
+        self.events: list[tuple[str, object]] = []
+        self.persisted: dict[str, bool] | None = None
+        self.terminal: tuple[tuple[str, ...], dict[str, bool]] | None = None
 
     def call(self, phase: str):
         self.calls.append(phase)
@@ -3888,8 +4327,14 @@ class SimulatorFreeWorkerOps:
         del env
         return self.call("agent_make")
 
-    def make_recorder(self, env):
-        del env
+    def episodes(self):
+        return ("episode_2", "episode_3")
+
+    def new_stats(self):
+        return defaultdict(bool)
+
+    def make_recorder(self, env, episode):
+        del env, episode
         return self.call("recorder_make")
 
     def reset(self, recorder):
@@ -3912,8 +4357,31 @@ class SimulatorFreeWorkerOps:
         del recorder, frame
         self.call("video_write")
 
-    def persist_result(self):
+    def run_policy_episode(self, agent, recorder, observation, episode):
+        del episode
+        self.request_policy(agent, observation)
+        frame = self.render(recorder)
+        self.write_video(recorder, frame)
+
+    def episode_success(self, env, episode):
+        del env
+        return episode == "episode_2"
+
+    def report_episode_start(self, episode):
+        self.events.append(("episode_start", episode))
+
+    def report_episode_end(self, episode, success):
+        self.events.append(("episode_end", (episode, success)))
+
+    def persist_result(self, stats):
         self.call("result_persistence")
+        self.persisted = dict(stats)
+
+    def report_worker_closing(self, stats):
+        self.events.append(("worker_status", ("closing", dict(stats))))
+
+    def report_worker_done(self, stats):
+        self.events.append(("worker_done", dict(stats)))
 
     def release_recorder(self, recorder):
         del recorder
@@ -3927,9 +4395,30 @@ class SimulatorFreeWorkerOps:
         del env
         self.call("environment_close")
 
-    def persist_terminal(self, errors):
-        del errors
+    def persist_terminal(self, errors, stats):
         self.call("terminal_persistence")
+        self.terminal = (tuple(phase for phase, _ in errors), dict(stats))
+
+
+def test_python_worker_success_returns_exact_statistics_and_events() -> None:
+    ops = SimulatorFreeWorkerOps(None)
+    result = _execute_managed_worker_lifecycle(ops)
+    assert isinstance(result, defaultdict)
+    assert dict(result) == {"episode_2": True, "episode_3": False}
+    assert ops.persisted == dict(result)
+    assert ops.events == [
+        ("episode_start", "episode_2"),
+        ("episode_end", ("episode_2", True)),
+        ("episode_start", "episode_3"),
+        ("episode_end", ("episode_3", False)),
+        ("worker_status", ("closing", dict(result))),
+        ("worker_done", dict(result)),
+    ]
+    assert ops.terminal == ((), dict(result))
+    assert ops.calls.count("video_release") == 2
+    assert ops.calls[-3:] == [
+        "agent_close", "environment_close", "terminal_persistence",
+    ]
 
 
 @pytest.mark.parametrize("failure", FAILURES)
@@ -3937,14 +4426,6 @@ def test_python_worker_failure_attempts_every_owned_cleanup(failure: str) -> Non
     ops = SimulatorFreeWorkerOps(failure)
     with pytest.raises(Exception, match="EVALUATOR_WORKER_FAILED"):
         _execute_managed_worker_lifecycle(ops)
-    expected_cleanup = [
-        *( [] if failure in {"gym_make", "agent_make", "recorder_make"}
-            else ["video_release"] ),
-        *( [] if failure in {"gym_make", "agent_make"}
-            else ["agent_close"] ),
-        *( [] if failure == "gym_make" else ["environment_close"] ),
-        "terminal_persistence",
-    ]
     actual_cleanup = [
         name for name in ops.calls
         if name in {
@@ -3952,7 +4433,23 @@ def test_python_worker_failure_attempts_every_owned_cleanup(failure: str) -> Non
             "terminal_persistence",
         }
     ]
-    assert actual_cleanup == expected_cleanup
+    expected_tail = []
+    if failure not in {"gym_make", "agent_make"}:
+        expected_tail.append("agent_close")
+    if failure != "gym_make":
+        expected_tail.append("environment_close")
+    expected_tail.append("terminal_persistence")
+    assert actual_cleanup[-len(expected_tail):] == expected_tail
+    if failure in {"gym_make", "agent_make", "recorder_make"}:
+        expected_releases = 0
+    elif failure in {
+        "reset", "stabilization", "policy_request", "render",
+        "video_write", "video_release",
+    }:
+        expected_releases = 1
+    else:
+        expected_releases = 2
+    assert actual_cleanup.count("video_release") == expected_releases
 ```
 
 - [ ] **Step 3: Run RED**
@@ -4037,25 +4534,41 @@ Extract the Python-owned resource lifecycle and make `_run_eval_worker` execute 
 def _execute_managed_worker_lifecycle(ops):
     env = None
     agent = None
-    recorder = None
+    stats = ops.new_stats()
     errors: list[tuple[str, BaseException]] = []
-    result = None
     try:
         env = ops.make_env()
         agent = ops.make_agent(env)
-        recorder = ops.make_recorder(env)
-        observation = ops.reset(recorder)
-        ops.stabilize(env, observation)
-        ops.request_policy(agent, observation)
-        frame = ops.render(env)
-        ops.write_video(recorder, frame)
-        ops.persist_result()
-        result = observation
+        for episode in ops.episodes():
+            recorder = None
+            episode_errors: list[tuple[str, BaseException]] = []
+            ops.report_episode_start(episode)
+            try:
+                recorder = ops.make_recorder(env, episode)
+                observation = ops.reset(recorder)
+                ops.stabilize(env, observation)
+                ops.run_policy_episode(agent, recorder, observation, episode)
+                success = ops.episode_success(env, episode)
+                stats[episode] = success
+                ops.report_episode_end(episode, success)
+            except BaseException as error:
+                episode_errors.append(("episode_body", error))
+            finally:
+                if recorder is not None:
+                    try:
+                        ops.release_recorder(recorder)
+                    except BaseException as error:
+                        episode_errors.append(("video_release", error))
+            if episode_errors:
+                errors.extend(episode_errors)
+                break
+        if not errors:
+            ops.persist_result(stats)
+            ops.report_worker_closing(stats)
     except BaseException as error:
         errors.append(("body", error))
     finally:
         cleanup = (
-            ("video_release", None if recorder is None else lambda: ops.release_recorder(recorder)),
             ("agent_close", None if agent is None else lambda: ops.close_agent(agent)),
             ("environment_close", None if env is None else lambda: ops.close_env(env)),
         )
@@ -4066,17 +4579,22 @@ def _execute_managed_worker_lifecycle(ops):
                 action()
             except BaseException as error:
                 errors.append((phase, error))
+        if not errors:
+            try:
+                ops.report_worker_done(stats)
+            except BaseException as error:
+                errors.append(("worker_done_event", error))
         try:
-            ops.persist_terminal(tuple(errors))
+            ops.persist_terminal(tuple(errors), stats)
         except BaseException as error:
             errors.append(("terminal_persistence", error))
     if errors:
         summary = ",".join(phase for phase, _ in errors)
         raise RuntimeError(f"EVALUATOR_WORKER_FAILED:{summary}") from errors[0][1]
-    return result
+    return stats
 ```
 
-The production `_ManagedWorkerOps.from_worker_arguments` constructor stores arguments only and acquires no resource. Its `make_env()` is the sole call site for the real `gym.make`; it also owns the real agent, per-episode `VideoRecorder`, stabilization/policy/render/write loop, result writer, and event writer already used by `_run_eval_worker`. Thus the tested lifecycle, rather than a second direct construction path, owns every Python resource. No simulator-free branch exists outside dependency injection. Recorder release precedes agent close, environment close, and terminal result/event persistence. Each failure is accumulated, every later cleanup is still attempted, and the first error remains the exception cause. Worker entry catches the combined error only after terminal persistence, writes its existing error payload, and closes the event pipe. The Rust runner remains responsible only for evaluator/relay process, cgroup, namespace, FD, and socket cleanup.
+The production `_ManagedWorkerOps.from_worker_arguments` constructor stores arguments only and acquires no resource. Its `make_env()` is the sole call site for the real `gym.make`; `episodes()` yields the existing assigned episode objects in their existing order; `new_stats()` returns `defaultdict(bool)` exactly as the current worker does. Move the current reset, per-episode agent reset, stabilization loop, gait setup, `while not episode_over` policy loop, step events, `_success` read, stats-line append, and episode-end metrics byte-for-byte into the corresponding adapter methods. `run_policy_episode` must retain the complete loop rather than executing one synthetic step. `persist_result(stats)` writes the existing `dict(stats)` payload; `_execute_managed_worker_lifecycle` returns the original `defaultdict` object that `run_eval` consumes, and `_run_eval_worker` immediately returns the `result` shown above without converting it to an observation or another type. Per-episode `VideoRecorder` creation/release remains inside the loop, while the outer lifecycle owns agent close, environment close, worker events, terminal persistence, and the exact statistics return. Thus the tested lifecycle, rather than a second direct construction path, owns every Python resource and the complete existing episode behavior. No simulator-free branch exists outside dependency injection. Each failure is accumulated, every later cleanup is still attempted, and the first error remains the exception cause. Worker entry catches the combined error only after terminal persistence and closes the event pipe. The Rust runner remains responsible only for evaluator/relay process, cgroup, namespace, FD, and socket cleanup.
 
 If WBC config, network namespace, root/identity FD, policy socket/relay, record creation, event write, or acknowledgement validation fails, write a rejected record when possible, emit `runtime_contract(rejected)`, raise into the existing worker-error path, emit no `creating_env`, and call `gym.make` zero times. Every `report()` first performs the safety pipe write and only then invokes the TUI callback.
 
@@ -4319,7 +4837,6 @@ git commit -m "fix: preserve run-scoped SIMPLE evaluation videos"
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -4332,7 +4849,7 @@ from simple.eval_runtime.evidence import (
     read_run_id_handoff,
     remove_run_id_handoff,
 )
-from .fakes import populate_complete_evidence
+from .fakes import finalize_failed_evidence, populate_complete_evidence
 
 
 def test_run_root_and_every_manager_artifact_are_exclusive(tmp_path: Path) -> None:
@@ -4402,30 +4919,12 @@ def test_interrupted_gate9_run_is_terminalized_preserved_and_retired(
     handoff = tmp_path / "evaluation-run-id"
     create_run_id_handoff(handoff, "eval-old")
 
-    def recover_owned(run_id: str, run_root: Path) -> dict[str, object]:
+    def recover_owned(run_id: str, run_root: Path) -> None:
         assert run_id == "eval-old"
-        manifest = {
-            "schema_version": 1,
-            "run_id": run_id,
-            "lifecycle": "TERMINAL",
-            "infrastructure_verdict": "FAIL",
-            "overall_verdict": "FAIL",
-            "owned_processes_alive": [],
-            "unknown_remote_state": False,
-        }
-        target = run_root / "manifest.json"
-        fd = target.open("x", encoding="utf-8")
-        with fd:
-            json.dump(manifest, fd, sort_keys=True, separators=(",", ":"))
-            fd.write("\n")
-            fd.flush()
-            os.fsync(fd.fileno())
-        parent_fd = os.open(run_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-        return manifest
+        finalize_failed_evidence(
+            EvidenceStore.open_existing(run_root),
+            run_id=run_id,
+        )
 
     reconciler = Gate9HandoffReconciler(
         output_parent=output_parent,
@@ -4439,6 +4938,8 @@ def test_interrupted_gate9_run_is_terminalized_preserved_and_retired(
     assert not handoff.exists()
     assert (store.root / "partial-evidence.json").read_text()
     assert (store.root / "operator-handoff-retired.json").is_file()
+    verified = store.verify_terminal_manifest(expected_run_id="eval-old")
+    assert "partial-evidence.json" in verified.artifact_paths
     create_run_id_handoff(handoff, "eval-new")
     assert read_run_id_handoff(handoff) == "eval-new"
 
@@ -4451,25 +4952,13 @@ def test_gate9_interrupt_before_run_root_creates_failed_evidence_root(
     handoff = tmp_path / "evaluation-run-id"
     create_run_id_handoff(handoff, "eval-prestart")
 
-    def recover_owned(run_id: str, run_root: Path) -> dict[str, object]:
+    def recover_owned(run_id: str, run_root: Path) -> None:
         assert run_id == "eval-prestart"
         assert run_root.is_dir()
-        manifest = {
-            "schema_version": 1, "run_id": run_id, "lifecycle": "TERMINAL",
-            "infrastructure_verdict": "FAIL", "overall_verdict": "FAIL",
-            "owned_processes_alive": [], "unknown_remote_state": False,
-        }
-        with (run_root / "manifest.json").open("x", encoding="utf-8") as stream:
-            json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        parent_fd = os.open(run_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-        return manifest
+        finalize_failed_evidence(
+            EvidenceStore.open_existing(run_root),
+            run_id=run_id,
+        )
 
     receipt = Gate9HandoffReconciler(
         output_parent, recover_owned_run=recover_owned
@@ -4493,26 +4982,11 @@ def test_gate9_retirement_is_restartable_at_every_write_boundary(
     handoff = tmp_path / "evaluation-run-id"
     create_run_id_handoff(handoff, "eval-old")
 
-    def recover_owned(run_id: str, run_root: Path) -> dict[str, object]:
-        manifest_path = run_root / "manifest.json"
-        if manifest_path.exists():
-            return json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest = {
-            "schema_version": 1, "run_id": run_id, "lifecycle": "TERMINAL",
-            "infrastructure_verdict": "FAIL", "overall_verdict": "FAIL",
-            "owned_processes_alive": [], "unknown_remote_state": False,
-        }
-        with manifest_path.open("x", encoding="utf-8") as stream:
-            json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        parent_fd = os.open(run_root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
-        return manifest
+    def recover_owned(run_id: str, run_root: Path) -> None:
+        finalize_failed_evidence(
+            EvidenceStore.open_existing(run_root),
+            run_id=run_id,
+        )
 
     reconciler = Gate9HandoffReconciler(output_parent, recover_owned_run=recover_owned)
     with pytest.raises(OSError, match=boundary):
@@ -4532,6 +5006,75 @@ def test_gate9_retirement_is_restartable_at_every_write_boundary(
     assert (store.root / "operator-handoff-retired.json").is_file()
 
 
+def test_gate9_rejects_tampered_artifact_from_full_manifest(tmp_path: Path) -> None:
+    output_parent = tmp_path / "workloads"
+    output_parent.mkdir(mode=0o700)
+    store = EvidenceStore.create(output_parent, run_id="eval-old")
+    store.write("partial-evidence.json", {"schema_version": 1, "keep": True})
+    handoff = tmp_path / "evaluation-run-id"
+    original = create_run_id_handoff(handoff, "eval-old")
+
+    def recover_then_tamper(run_id: str, run_root: Path) -> None:
+        finalize_failed_evidence(
+            EvidenceStore.open_existing(run_root),
+            run_id=run_id,
+        )
+        (run_root / "partial-evidence.json").write_bytes(b"tampered\n")
+
+    reconciler = Gate9HandoffReconciler(
+        output_parent,
+        recover_owned_run=recover_then_tamper,
+    )
+    with pytest.raises(Exception, match="MANIFEST_ARTIFACT_HASH"):
+        reconciler.reconcile_and_retire(handoff, reason="interrupted-retry")
+    current = handoff.stat()
+    assert (current.st_dev, current.st_ino) == (original.device, original.inode)
+    assert not (store.root / "operator-handoff-retired.json").exists()
+
+
+def test_full_manifest_rejects_tampered_command_record(tmp_path: Path) -> None:
+    store = EvidenceStore.create(tmp_path, run_id="eval-old")
+    store.record_command(
+        argv=["status"],
+        secret_positions=set(),
+        result={"returncode": 0},
+    )
+    finalize_failed_evidence(store, run_id="eval-old")
+    with (store.root / "commands.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write('{"sequence":999}\n')
+    with pytest.raises(Exception, match="MANIFEST_ARTIFACT_HASH|MANIFEST_COMMAND_INDEX"):
+        store.verify_terminal_manifest(expected_run_id="eval-old")
+
+
+def test_gate9_rejects_old_seven_key_toy_manifest(tmp_path: Path) -> None:
+    output_parent = tmp_path / "workloads"
+    output_parent.mkdir(mode=0o700)
+    store = EvidenceStore.create(output_parent, run_id="eval-old")
+    toy = {
+        "schema_version": 1,
+        "run_id": "eval-old",
+        "lifecycle": "TERMINAL",
+        "infrastructure_verdict": "FAIL",
+        "overall_verdict": "FAIL",
+        "owned_processes_alive": [],
+        "unknown_remote_state": False,
+    }
+    (store.root / "manifest.json").write_text(
+        json.dumps(toy, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    handoff = tmp_path / "evaluation-run-id"
+    create_run_id_handoff(handoff, "eval-old")
+    reconciler = Gate9HandoffReconciler(
+        output_parent,
+        recover_owned_run=lambda run_id, run_root: None,
+    )
+    with pytest.raises(Exception, match="MANIFEST_SCHEMA"):
+        reconciler.reconcile_and_retire(handoff, reason="interrupted-retry")
+    assert read_run_id_handoff(handoff) == "eval-old"
+    assert not (store.root / "operator-handoff-retired.json").exists()
+
+
 @pytest.mark.parametrize("failure", ["foreign", "unknown", "nonterminal", "pass"])
 def test_gate9_reconciliation_failure_retains_exact_handoff(
     tmp_path: Path, failure: str
@@ -4542,19 +5085,34 @@ def test_gate9_reconciliation_failure_retains_exact_handoff(
     handoff = tmp_path / "evaluation-run-id"
     original = create_run_id_handoff(handoff, "eval-old")
 
-    def reject(run_id: str, run_root: Path) -> dict[str, object]:
-        del run_id, run_root
-        if failure in {"foreign", "unknown"}:
-            raise RuntimeError(failure.upper())
-        return {
-            "schema_version": 1,
-            "run_id": "eval-old",
-            "lifecycle": "RUNNING" if failure == "nonterminal" else "TERMINAL",
-            "infrastructure_verdict": "PASS" if failure == "pass" else "FAIL",
-            "overall_verdict": "PASS" if failure == "pass" else "FAIL",
-            "owned_processes_alive": [],
-            "unknown_remote_state": False,
-        }
+    def reject(run_id: str, run_root: Path) -> None:
+        current_store = EvidenceStore.open_existing(run_root)
+        if failure == "foreign":
+            raise RuntimeError("FOREIGN")
+        if failure == "nonterminal":
+            current_store.write(
+                "cleanup/actions.json",
+                {"schema_version": 1, "status": "running"},
+            )
+            return
+        if failure == "unknown":
+            finalize_failed_evidence(
+                current_store,
+                run_id=run_id,
+                unknown_remote_state=True,
+            )
+            return
+        populate_complete_evidence(current_store, episodes=(2, 3))
+        current_store.finalize_terminal_manifest(
+            run_id=run_id,
+            episodes=(2, 3),
+            infrastructure_verdict="PASS",
+            overall_verdict="PASS",
+            task_results={"episode_2": True, "episode_3": True},
+            owned_processes_alive=[],
+            unknown_remote_state=False,
+            unresolved_errors=[],
+        )
 
     reconciler = Gate9HandoffReconciler(output_parent, recover_owned_run=reject)
     with pytest.raises(Exception):
@@ -4658,9 +5216,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from simple.eval_runtime.cli import app
+from simple.eval_runtime.evidence import (
+    EvidenceStore,
+    create_run_id_handoff,
+    read_run_id_handoff,
+)
 from .fakes import FakeCliBackend
 
 runner = CliRunner()
@@ -4711,6 +5275,90 @@ def test_stale_recovery_requires_explicit_run_id_and_has_no_force_flag() -> None
     assert missing.exit_code != 0
     unsafe = runner.invoke(app, ["stop", "--recover-stale", "../run"])
     assert unsafe.exit_code != 0
+
+
+def _retirement_groups(
+    output_parent: Path,
+    handoff: Path,
+) -> dict[str, list[str]]:
+    return {
+        "recover": ["--recover-stale", "eval-old"],
+        "output": ["--output-root", str(output_parent)],
+        "handoff": ["--run-id-handoff", str(handoff)],
+        "enable": ["--retire-terminal-handoff"],
+        "reason": ["--retire-reason", "interrupted-retry"],
+    }
+
+
+def _flatten(groups: dict[str, list[str]]) -> list[str]:
+    return [word for group in groups.values() for word in group]
+
+
+def _make_retirement_fixture(tmp_path: Path):
+    output_parent = tmp_path / "workloads"
+    output_parent.mkdir(mode=0o700)
+    store = EvidenceStore.create(output_parent, run_id="eval-old")
+    store.write("partial-evidence.json", {"schema_version": 1})
+    handoff = tmp_path / "evaluation-run-id"
+    create_run_id_handoff(handoff, "eval-old")
+    return output_parent, handoff
+
+
+def test_complete_retirement_options_use_canonical_reconciler(tmp_path: Path) -> None:
+    output_parent, handoff = _make_retirement_fixture(tmp_path)
+    backend = FakeCliBackend()
+    result = runner.invoke(
+        app,
+        ["stop", *_flatten(_retirement_groups(output_parent, handoff))],
+        obj=backend,
+    )
+    assert result.exit_code == 0, result.stdout
+    assert backend.retirement_calls == [
+        ("eval-old", output_parent / "eval-old")
+    ]
+    assert not handoff.exists()
+    assert (
+        output_parent / "eval-old" / "operator-handoff-retired.json"
+    ).is_file()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["recover", "output", "handoff", "enable", "reason"],
+)
+def test_every_partial_retirement_option_set_fails_before_recovery(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    output_parent, handoff = _make_retirement_fixture(tmp_path)
+    groups = _retirement_groups(output_parent, handoff)
+    groups.pop(missing)
+    backend = FakeCliBackend()
+    result = runner.invoke(app, ["stop", *_flatten(groups)], obj=backend)
+    assert result.exit_code != 0
+    assert backend.retirement_calls == []
+    assert read_run_id_handoff(handoff) == "eval-old"
+
+
+@pytest.mark.parametrize("state", ["pass", "foreign", "unknown", "nonterminal"])
+def test_retirement_rejects_unacceptable_state_without_signal_or_unlink(
+    tmp_path: Path,
+    state: str,
+) -> None:
+    output_parent, handoff = _make_retirement_fixture(tmp_path)
+    backend = FakeCliBackend()
+    backend.retirement_state = state
+    result = runner.invoke(
+        app,
+        ["stop", *_flatten(_retirement_groups(output_parent, handoff))],
+        obj=backend,
+    )
+    assert result.exit_code != 0
+    assert backend.signals == []
+    assert read_run_id_handoff(handoff) == "eval-old"
+    assert not (
+        output_parent / "eval-old" / "operator-handoff-retired.json"
+    ).exists()
 ```
 
 - [ ] **Step 4: Run RED**
@@ -4728,9 +5376,134 @@ Expected: evidence, manager, and CLI imports fail.
 
 - [ ] **Step 5: Implement the exact evidence tree and verdict reducer**
 
-`EvidenceStore.create(output_parent, run_id=...)` requires an existing, attested, nonsymlink directory equal to the configured workload-parent root. It opens that parent with `O_DIRECTORY|O_NOFOLLOW`, validates device/inode/owner/mode, and atomically creates only `<output_parent>/<run-id>` with `mkdirat`; the child must be absent. An existing child—empty or nonempty—fails before any read, write, lease, helper, or cleanup action and is never renamed, deleted, adopted, or inspected beyond its no-follow type/identity. The store writes only beneath the newly created child via `atomic_write_new_json` or append-only fsynced JSONL. Define `mandatory_evidence_paths(episodes: tuple[int, ...]) -> tuple[str, ...]` as the complete path list in the approved design, including distinct `probe_loader`, `probe_cuda`, `episode_2`, and `episode_3` runner children and all final cleanup records. `manifest.json` hashes every allowlisted artifact and command result; `run-manifest.md` is rendered solely from that JSON. Raw token, SSH material, secrets, environment secrets, complete image/action payloads, and mutable intake paths are rejected by the evidence serializer.
+`EvidenceStore.create(output_parent, run_id=...)` requires an existing, attested, nonsymlink directory equal to the configured workload-parent root. It opens that parent with `O_DIRECTORY|O_NOFOLLOW`, validates device/inode/owner/mode, and atomically creates only `<output_parent>/<run-id>` with `mkdirat`; the child must be absent. An existing child—empty or nonempty—fails before any read, write, lease, helper, or cleanup action and is never renamed, deleted, adopted, or inspected beyond its no-follow type/identity. The store writes only beneath the newly created child via `atomic_write_new_json` or append-only fsynced JSONL. Define `mandatory_evidence_paths(episodes: tuple[int, ...]) -> tuple[str, ...]` as the complete payload path list in the approved design, including distinct `probe_loader`, `probe_cuda`, `episode_2`, and `episode_3` runner children and all final cleanup records, but excluding the three late derived paths in `LATE_UNINDEXED_PATHS`. `manifest.json` hashes every allowlisted artifact and every canonical command record; `run-manifest.md` is rendered solely from that JSON. Raw token, SSH material, secrets, environment secrets, complete image/action payloads, and mutable intake paths are rejected by the evidence serializer.
 
-The same module imports `hashlib`, `json`, `os`, `stat`, `dataclass`, `Path`, and `Callable`, then implements `create_run_id_handoff`, `read_run_id_handoff`, `remove_run_id_handoff`, and `Gate9HandoffReconciler`. Creation uses `O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW`, mode `0600`, one validated run ID plus newline, file fsync, and parent fsync. Reading uses `O_RDONLY|O_CLOEXEC|O_NOFOLLOW` and requires a regular single-link file owned by the current UID, exact mode `0600`, bounded size, one newline, and a valid identifier. Removal reopens and revalidates the current path, requires the expected run ID plus the originally captured path/FD identity, unlinks by parent FD only after acceptance or authenticated failed-run reconciliation, and fsyncs the parent. The reconciler opens the attested output parent and exact existing run root without following links. If interruption occurred after handoff creation but before the run root, `EvidenceStore.open_or_create_reconciliation` alone may exclusively create that exact child and fsync an immutable `prestart-interruption.json` binding the handoff identity; no ordinary existing run is adopted by that path. It then invokes normal owned stale cleanup, requires a byte-identical terminal FAIL manifest with no live owned process or unknown state, writes or exactly verifies one immutable retirement receipt, preserves every prior artifact, and retires only the captured handoff inode. A PASS, foreign/unknown ownership, incomplete cleanup, changed inode, mismatched run ID, or missing/nonterminal manifest retains the handoff and forbids a fresh Gate 9 run.
+Use one full final-manifest schema for normal acceptance, failed-run preservation, status verification, and Gate 9 retirement:
+
+```python
+# src/simple/eval_runtime/evidence.py (canonical final-manifest contract)
+# ruff: noqa: F821
+FINAL_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version", "run_id", "lifecycle", "episodes",
+        "infrastructure_verdict", "overall_verdict", "task_results",
+        "profile_sha256", "artifact_index", "command_index",
+        "state_transitions", "cleanup_summary", "unresolved_errors",
+        "owned_processes_alive", "unknown_remote_state",
+    }
+)
+ARTIFACT_ENTRY_KEYS = frozenset({"path", "sha256", "byte_count", "kind"})
+COMMAND_ENTRY_KEYS = frozenset({"sequence", "record_sha256"})
+LATE_UNINDEXED_PATHS = frozenset(
+    {"manifest.json", "run-manifest.md", "operator-handoff-retired.json"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedTerminalManifest:
+    run_id: str
+    lifecycle: str
+    infrastructure_verdict: str
+    overall_verdict: str
+    owned_processes_alive: tuple[int, ...]
+    unknown_remote_state: bool
+    artifact_paths: tuple[str, ...]
+    manifest_bytes: bytes
+    manifest_sha256: str
+
+
+def _verify_terminal_manifest(
+    store: EvidenceStore,
+    *,
+    expected_run_id: str,
+) -> VerifiedTerminalManifest:
+    manifest_bytes = store.read_bytes_nofollow("manifest.json")
+    manifest = decode_canonical_json(manifest_bytes)
+    if type(manifest) is not dict or set(manifest) != FINAL_MANIFEST_KEYS:
+        raise RuntimeBlocked("MANIFEST_SCHEMA", expected_run_id)
+    if (
+        manifest["schema_version"] != 1
+        or manifest["run_id"] != expected_run_id
+        or manifest["lifecycle"] != "TERMINAL"
+    ):
+        raise RuntimeBlocked("MANIFEST_IDENTITY", expected_run_id)
+    if (
+        type(manifest["episodes"]) is not list
+        or any(type(value) is not int for value in manifest["episodes"])
+        or manifest["infrastructure_verdict"] not in {"PASS", "FAIL"}
+        or manifest["overall_verdict"] not in {"PASS", "FAIL"}
+        or type(manifest["task_results"]) is not dict
+        or type(manifest["profile_sha256"]) is not str
+        or type(manifest["state_transitions"]) is not list
+        or type(manifest["cleanup_summary"]) is not dict
+        or type(manifest["unresolved_errors"]) is not list
+        or type(manifest["owned_processes_alive"]) is not list
+        or any(type(value) is not int for value in manifest["owned_processes_alive"])
+        or type(manifest["unknown_remote_state"]) is not bool
+    ):
+        raise RuntimeBlocked("MANIFEST_TYPE", expected_run_id)
+    entries = manifest["artifact_index"]
+    if type(entries) is not list:
+        raise RuntimeBlocked("MANIFEST_ARTIFACT_SCHEMA", expected_run_id)
+    indexed_paths: list[str] = []
+    for entry in entries:
+        if type(entry) is not dict or set(entry) != ARTIFACT_ENTRY_KEYS:
+            raise RuntimeBlocked("MANIFEST_ARTIFACT_SCHEMA", expected_run_id)
+        relative = validate_contained_relative_path(entry["path"])
+        payload = store.read_bytes_nofollow(relative)
+        if (
+            len(payload) != entry["byte_count"]
+            or hashlib.sha256(payload).hexdigest() != entry["sha256"]
+        ):
+            raise RuntimeBlocked("MANIFEST_ARTIFACT_HASH", relative)
+        indexed_paths.append(relative)
+    if indexed_paths != sorted(set(indexed_paths)):
+        raise RuntimeBlocked("MANIFEST_ARTIFACT_ORDER", expected_run_id)
+    actual_paths = store.list_regular_payload_paths(
+        excluding=LATE_UNINDEXED_PATHS
+    )
+    if tuple(indexed_paths) != actual_paths:
+        raise RuntimeBlocked("MANIFEST_ARTIFACT_COVERAGE", expected_run_id)
+    command_records = store.read_canonical_command_records()
+    expected_commands = [
+        {
+            "sequence": index,
+            "record_sha256": hashlib.sha256(record).hexdigest(),
+        }
+        for index, record in enumerate(command_records, start=1)
+    ]
+    if manifest["command_index"] != expected_commands or any(
+        type(item) is not dict or set(item) != COMMAND_ENTRY_KEYS
+        for item in manifest["command_index"]
+    ):
+        raise RuntimeBlocked("MANIFEST_COMMAND_INDEX", expected_run_id)
+    required_cleanup = {
+        "cleanup/actions.json", "cleanup/processes-final.json",
+        "cleanup/ports-final.json", "cleanup/container-final.json",
+        "cleanup/remote-helpers-final.json",
+    }
+    if not required_cleanup.issubset(indexed_paths):
+        raise RuntimeBlocked("MANIFEST_CLEANUP_COVERAGE", expected_run_id)
+    if manifest["infrastructure_verdict"] == "PASS" and not set(
+        mandatory_evidence_paths(tuple(manifest["episodes"]))
+    ).issubset(indexed_paths):
+        raise RuntimeBlocked("MANIFEST_PASS_COVERAGE", expected_run_id)
+    return VerifiedTerminalManifest(
+        run_id=manifest["run_id"],
+        lifecycle=manifest["lifecycle"],
+        infrastructure_verdict=manifest["infrastructure_verdict"],
+        overall_verdict=manifest["overall_verdict"],
+        owned_processes_alive=tuple(manifest["owned_processes_alive"]),
+        unknown_remote_state=manifest["unknown_remote_state"],
+        artifact_paths=tuple(indexed_paths),
+        manifest_bytes=manifest_bytes,
+        manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
+```
+
+`EvidenceStore.finalize_terminal_manifest(...)` first freezes the command and state-transition streams, no-follow enumerates every current allowlisted regular payload, computes the sorted `artifact_index` and independent `command_index`, validates exact types, writes `manifest.json` with `O_EXCL` plus file/parent fsync, then immediately calls `_verify_terminal_manifest`. `EvidenceStore.verify_terminal_manifest` is the public bound form of that same verifier; no caller re-parses selected keys. A FAIL manifest may contain the fsynced operation prefix rather than every PASS-only artifact, but it must index every existing artifact and command and contain all five terminal cleanup records. PASS additionally requires every `mandatory_evidence_paths(episodes)` entry. Any changed, absent, extra, unindexed, duplicate, out-of-order, or path-escaping artifact/command makes verification fail. The Markdown rendering and Gate 9 retirement receipt are deliberately late derived files and are the only unindexed exceptions.
+
+The same module imports `hashlib`, `json`, `os`, `stat`, `dataclass`, `Path`, and `Callable`, then implements `create_run_id_handoff`, `read_run_id_handoff`, `remove_run_id_handoff`, and `Gate9HandoffReconciler`. Creation uses `O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW`, mode `0600`, one validated run ID plus newline, file fsync, and parent fsync. Reading uses `O_RDONLY|O_CLOEXEC|O_NOFOLLOW` and requires a regular single-link file owned by the current UID, exact mode `0600`, bounded size, one newline, and a valid identifier. Removal reopens and revalidates the current path, requires the expected run ID plus the originally captured path/FD identity, unlinks by parent FD only after acceptance or authenticated failed-run reconciliation, and fsyncs the parent. The reconciler opens the attested output parent and exact existing run root without following links. If interruption occurred after handoff creation but before the run root, `EvidenceStore.open_or_create_reconciliation` alone may exclusively create that exact child and fsync an immutable `prestart-interruption.json` binding the handoff identity; no ordinary existing run is adopted by that path. It then invokes normal owned stale cleanup and calls the same `verify_terminal_manifest` used by final acceptance. Only a fully indexed canonical terminal infrastructure-FAIL manifest with zero live owned processes and known-clean remote state can authorize the immutable retirement receipt and exact handoff unlink. A toy subset, changed artifact, missing command digest, PASS, foreign/unknown ownership, incomplete cleanup, changed inode, mismatched run ID, or missing/nonterminal manifest retains the handoff and forbids a fresh Gate 9 run.
 
 ```python
 # src/simple/eval_runtime/evidence.py (run-ID handoff helpers)
@@ -4861,7 +5634,7 @@ class Gate9HandoffReconciler:
         self,
         output_parent: Path,
         *,
-        recover_owned_run: Callable[[str, Path], dict[str, object]],
+        recover_owned_run: Callable[[str, Path], None],
     ) -> None:
         self.output_parent = EvidenceStore.validate_existing_parent(output_parent)
         self.recover_owned_run = recover_owned_run
@@ -4882,35 +5655,24 @@ class Gate9HandoffReconciler:
             run_id=run_id,
             handoff_identity=handoff_identity,
         )
-        manifest = self.recover_owned_run(run_id, store.root)
+        self.recover_owned_run(run_id, store.root)
         if fault_hook is not None:
             fault_hook("after_terminalize")
-        required = {
-            "schema_version", "run_id", "lifecycle", "infrastructure_verdict",
-            "overall_verdict", "owned_processes_alive", "unknown_remote_state",
-        }
-        if type(manifest) is not dict or set(manifest) != required:
-            raise RuntimeBlocked("RUN_ID_RETIRE_MANIFEST_SCHEMA", run_id)
+        verified = store.verify_terminal_manifest(expected_run_id=run_id)
         if (
-            manifest["schema_version"] != 1
-            or manifest["run_id"] != run_id
-            or manifest["lifecycle"] != "TERMINAL"
-            or manifest["overall_verdict"] == "PASS"
-            or manifest["owned_processes_alive"] != []
-            or manifest["unknown_remote_state"] is not False
+            verified.lifecycle != "TERMINAL"
+            or verified.infrastructure_verdict != "FAIL"
+            or verified.overall_verdict == "PASS"
+            or verified.owned_processes_alive != ()
+            or verified.unknown_remote_state is not False
         ):
             raise RuntimeBlocked("RUN_ID_RETIRE_NOT_FAILED_TERMINAL", run_id)
-        manifest_path = store.root / "manifest.json"
-        manifest_bytes = manifest_path.read_bytes()
-        parsed = json.loads(manifest_bytes)
-        if parsed != manifest:
-            raise RuntimeBlocked("RUN_ID_RETIRE_MANIFEST_BYTES", run_id)
         receipt_payload = {
             "schema_version": 1,
             "run_id": run_id,
             "reason": reason,
-            "verdict": manifest["overall_verdict"],
-            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "verdict": verified.overall_verdict,
+            "manifest_sha256": verified.manifest_sha256,
             "handoff_device": handoff_identity.device,
             "handoff_inode": handoff_identity.inode,
             "handoff_mode": handoff_identity.mode,
@@ -4930,7 +5692,7 @@ class Gate9HandoffReconciler:
         )
         return Gate9RetirementReceipt(
             run_id=run_id,
-            verdict=str(manifest["overall_verdict"]),
+            verdict=verified.overall_verdict,
             manifest_sha256=str(receipt_payload["manifest_sha256"]),
             handoff_device=handoff_identity.device,
             handoff_inode=handoff_identity.inode,
@@ -5008,9 +5770,57 @@ Persist/fsync each transition before the next external action. Register cleanup 
 
 - [ ] **Step 7: Implement the CLI and script entrypoints**
 
-`cli.py` defines a Typer `app` with exact commands `freeze-provenance`, `create`, `status`, `evaluate`, and `stop`; only `stop` accepts `--recover-stale RUN_ID`. Its Gate 9 reconciliation form additionally requires the indivisible set `--output-root PARENT --run-id-handoff FILE --retire-terminal-handoff --retire-reason interrupted-retry`; partial combinations fail before cleanup. It invokes `Gate9HandoffReconciler` with the normal identity-checked owned cleanup backend and never accepts a PASS or foreign/unknown run. Every mutating command interprets `--output-root` as the existing attested workload-parent directory and combines it with the separately validated `--run-id`; it never accepts a full child path in `--output-root`. `create --preflight-only` is the Gate-4 form: it requires `<output-root>/<run-id>` to be absent, exclusively creates that child, executes the exact local and leased preflight used by normal `create`, including `prepare_output` and the distinct loader/CUDA probes, then releases the lease after proving no helper/container/workload exists. It never calls Docker create and records a terminal preflight-only manifest. Normal `create` has no changed behavior. `evaluate` likewise requires an existing approved parent plus an absent run-ID child, exact `--episodes 2,3`, optional unbound loopback `--local-port` default 22085, and existing approved profile/container. All subprocesses receive argv arrays and monotonic deadlines through injectable runners; no `shell=True`, `os.system`, glob kill, force option, or prior-output mutation exists.
+`cli.py` defines a Typer `app` with exact commands `freeze-provenance`, `create`, `status`, `evaluate`, and `stop`; only `stop` accepts `--recover-stale RUN_ID`. Its Gate 9 reconciliation form additionally requires the indivisible set `--output-root PARENT --run-id-handoff FILE --retire-terminal-handoff --retire-reason interrupted-retry`. Parse those five option groups into one `RetirementOptions` value before obtaining a backend or performing cleanup; zero groups means ordinary stop, all five means retirement, and every other subset is rejected. The complete form invokes `Gate9HandoffReconciler` with the normal identity-checked owned cleanup backend. The reconciler accepts only the canonical full-manifest verifier result; PASS, foreign, unknown, and nonterminal states retain the handoff and issue no signal. Every mutating command interprets `--output-root` as the existing attested workload-parent directory and combines it with the separately validated `--run-id`; it never accepts a full child path in `--output-root`. `create --preflight-only` is the Gate-4 form: it requires `<output-root>/<run-id>` to be absent, exclusively creates that child, executes the exact local and leased preflight used by normal `create`, including `prepare_output` and the distinct loader/CUDA probes, then releases the lease after proving no helper/container/workload exists. It never calls Docker create and records a terminal preflight-only manifest. Normal `create` has no changed behavior. `evaluate` likewise requires an existing approved parent plus an absent run-ID child, exact `--episodes 2,3`, optional unbound loopback `--local-port` default 22085, and existing approved profile/container. All subprocesses receive argv arrays and monotonic deadlines through injectable runners; no `shell=True`, `os.system`, glob kill, force option, or prior-output mutation exists.
 
 `freeze-provenance --phase` accepts exactly `pc2`, `h100`, or `verify`; all three require the same existing run ID and immutable output root. `status` accepts optional `--run-id` plus `--verify-evidence` and remains read-only. `evaluate --stop-after` is absent by default and accepts only `warmup`; it is recorded as Gate-7 infrastructure evidence and exits through the full cleanup path before any runner episode operation. None of these options adds a sixth lifecycle command.
+
+```python
+# src/simple/eval_runtime/cli.py (indivisible Gate 9 parser)
+# ruff: noqa: F821
+@dataclass(frozen=True, slots=True)
+class RetirementOptions:
+    run_id: str
+    output_parent: Path
+    handoff: Path
+    reason: str
+
+    @classmethod
+    def from_cli(
+        cls,
+        *,
+        recover_stale: str | None,
+        output_root: Path | None,
+        run_id_handoff: Path | None,
+        retire_terminal_handoff: bool,
+        retire_reason: str | None,
+    ) -> "RetirementOptions | None":
+        present = (
+            recover_stale is not None,
+            output_root is not None,
+            run_id_handoff is not None,
+            retire_terminal_handoff,
+            retire_reason is not None,
+        )
+        if not any(present):
+            return None
+        if not all(present):
+            raise RuntimeBlocked("RETIREMENT_OPTIONS_PARTIAL", repr(present))
+        if retire_reason != "interrupted-retry":
+            raise RuntimeBlocked("RETIREMENT_REASON", str(retire_reason))
+        return cls(
+            run_id=validate_identifier(recover_stale, field="run_id"),
+            output_parent=EvidenceStore.validate_existing_parent(output_root),
+            handoff=run_id_handoff,
+            reason=retire_reason,
+        )
+
+
+def execute_retirement(options: RetirementOptions, backend) -> None:
+    Gate9HandoffReconciler(
+        options.output_parent,
+        recover_owned_run=backend.recover_owned_run,
+    ).reconcile_and_retire(options.handoff, reason=options.reason)
+```
 
 ```python
 # scripts/psi0_eval_runtime.py
