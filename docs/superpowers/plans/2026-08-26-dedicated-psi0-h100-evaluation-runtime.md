@@ -295,7 +295,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -405,47 +405,57 @@ def fixture_publication_authorization(
         if previous_transition is not None
         else None if previous is None else previous["owner_transition"]
     )
-    sequence = (
-        1
-        if prior_transition is None
-        else prior_transition["to_authorization_sequence"] + 1
-    )
     if previous_owner_record is None:
-        previous_owner_record = (
-            encode_authorization_owner_record(
-                active_authorization_id=None,
-                active_authorization_sha256=None,
-                authorization_sequence=0,
-                pending_action="prepare_install_authorization",
-            )
-            if previous is None
-            else fixture_owner_record_for_authorization(previous)
+        if previous is not None:
+            raise RuntimeError("INSTALLER_TEST_PREVIOUS_OWNER_REQUIRED")
+        previous_owner_record = encode_authorization_owner_record(
+            _fixture_unactivated_owner_mapping(request)
         )
-    target_projection = encode_authorization_owner_projection(
-        active_authorization_id=request["payload"]["authorization_id"],
-        authorization_sequence=sequence,
-        pending_action=request["operation"],
+    previous_owner = json.loads(previous_owner_record)
+    sequence = previous_owner["authorization_sequence"] + 1
+    provisional_authorization = {
+        "authorization_id": request["payload"]["authorization_id"],
+        "authorization_sequence": sequence,
+        "authorization_sha256": None,
+        "previous_authorization_sha256": (
+            None if previous is None else previous["authorization_sha256"]
+        ),
+        "owner_transition": None,
+    }
+    provisional_owner = _fixture_owner_mapping_for_authorization(
+        provisional_authorization,
+        request=request,
+        previous_owner_record=previous_owner_record,
     )
+    target_projection = encode_authorization_owner_projection(
+        provisional_owner, creates_authorization=True
+    )
+    previous_active = previous_owner["active_service_authorization"]
+    if previous_active is None:
+        previous_active_authorization = None
+    elif previous_active["kind"] == "install":
+        previous_active_authorization = previous_owner[
+            "install_authorization"
+        ]
+    else:
+        previous_active_authorization = next(
+            entry
+            for entry in previous_owner["recovery_authorizations"]
+            if entry["authorization_sequence"]
+            == previous_owner["authorization_sequence"]
+        )
     transition = encode_owner_transition(
         authorization_id=request["payload"]["authorization_id"],
         authorization_sequence=sequence,
         from_authorization_id=(
-            None
-            if prior_transition is None
-            else prior_transition["to_authorization_id"]
+            None if previous_active_authorization is None
+            else previous_active_authorization["authorization_id"]
         ),
-        from_authorization_sequence=(
-            0
-            if prior_transition is None
-            else prior_transition["to_authorization_sequence"]
-        ),
+        from_authorization_sequence=previous_owner["authorization_sequence"],
         from_owner_record_sha256=hashlib.sha256(
             previous_owner_record
         ).hexdigest(),
-        from_pending_action=(
-            "prepare_install_authorization"
-            if previous is None else prior_transition["to_pending_action"]
-        ),
+        from_pending_action=previous_owner["pending_action"],
         previous_transition=prior_transition,
         reason="activate_authorization",
         to_owner_record_projection_sha256=hashlib.sha256(
@@ -459,51 +469,192 @@ def fixture_publication_authorization(
         previous_authorization=previous,
         owner_transition=transition,
     )
-    target_owner_record = encode_authorization_owner_record(
-        active_authorization_id=authorization["authorization_id"],
-        active_authorization_sha256=authorization["authorization_sha256"],
-        authorization_sequence=sequence,
-        pending_action=request["operation"],
+    target_owner_record = fixture_owner_record_for_authorization(
+        authorization,
+        request=request,
+        previous_owner_record=previous_owner_record,
     )
     validate_owner_transition_against_records(
         transition,
         from_owner_record=previous_owner_record,
         to_owner_record=target_owner_record,
+        expected_authorization=authorization,
+        creates_authorization=True,
     )
     return authorization
 
 
+def _fixture_unactivated_owner_mapping(
+    request: dict[str, object],
+) -> dict[str, object]:
+    payload = request["payload"]
+    base_python = request["operation"].endswith("base_python")
+    return {
+        "schema_version": 1,
+        "construction_kind": "base_python" if base_python else "closure",
+        "closure_id": None if base_python else payload["destination_id"],
+        "descriptor_sha256": (
+            None if base_python else payload["descriptor_or_intake_sha256"]
+        ),
+        "base_python_intake_sha256": (
+            payload["descriptor_or_intake_sha256"] if base_python else None
+        ),
+        "run_id": "fixture-install-run",
+        "owner_token_sha256": payload["owner_token_sha256"],
+        "operation_token_sha256": payload["operation_token_sha256"],
+        "host_name": "fixture-host",
+        "boot_id": "fixture-boot-id",
+        "owner_pid": os.getpid(),
+        "owner_start_ticks": 1,
+        "state": "CONSTRUCTING",
+        "phase": "BASE_COPIED" if base_python else "PAYLOAD_READY",
+        "staging_path": "/fixture/staging",
+        "final_path": None,
+        "construction_attempt": (
+            payload["construction_attempt"] if base_python else None
+        ),
+        "attempt_status": "active" if base_python else None,
+        "cleanup_required": True,
+        "pending_action": "prepare_install_authorization",
+        "pending_local_transition": None,
+        "heartbeat_monotonic_ns": 1,
+        "heartbeat_wall_ns": 1,
+        "last_error": None,
+        "install_authorization": None,
+        "recovery_authorizations": [],
+        "recovery_results": [],
+        "active_service_authorization": None,
+        "active_authorization_sha256": None,
+        "authorization_sequence": 0,
+        "transport_uncertain": False,
+        "response_uncertain": False,
+        "last_preacquisition_status": None,
+        "locked_response_records": [],
+        "publication_mirrors": [],
+        "protected_journal_validated": False,
+        "protected_receipt_validated": False,
+        "published_root_validated": False,
+        "component_hashes": {},
+        "final_tree_sha256": None,
+        "receipt_sha256": None,
+        "terminal_response_status": None,
+    }
+
+
+def fixture_unactivated_owner_record(request: dict[str, object]) -> bytes:
+    from simple.eval_runtime.installer_client import (
+        encode_authorization_owner_record,
+    )
+
+    return encode_authorization_owner_record(
+        _fixture_unactivated_owner_mapping(request)
+    )
+
+
+def _fixture_owner_mapping_for_authorization(
+    authorization: dict[str, object],
+    *,
+    request: dict[str, object],
+    previous_owner_record: bytes,
+) -> dict[str, object]:
+    owner = json.loads(previous_owner_record)
+    payload = request["payload"]
+    recovery_generation = payload["recovery_generation"]
+    if recovery_generation is None:
+        owner["install_authorization"] = authorization
+        owner["recovery_authorizations"] = []
+        owner["recovery_results"] = []
+        active_kind = "install"
+        generation = 0
+    else:
+        owner["recovery_authorizations"] = [
+            *owner["recovery_authorizations"], authorization,
+        ]
+        active_kind = "recovery"
+        generation = recovery_generation
+    owner.update(
+        {
+            "active_service_authorization": {
+                "kind": active_kind,
+                "generation": generation,
+            },
+            "active_authorization_sha256": authorization[
+                "authorization_sha256"
+            ],
+            "authorization_sequence": authorization[
+                "authorization_sequence"
+            ],
+            "cleanup_required": True,
+            "pending_action": request["operation"],
+            "pending_local_transition": None,
+            "operation_token_sha256": payload["operation_token_sha256"],
+            "owner_token_sha256": payload["owner_token_sha256"],
+            "state": "INSTALLING",
+        }
+    )
+    return owner
+
+
 def fixture_owner_record_for_authorization(
     authorization: dict[str, object],
+    *,
+    request: dict[str, object],
+    previous_owner_record: bytes,
 ) -> bytes:
     from simple.eval_runtime.installer_client import (
         encode_authorization_owner_record,
     )
 
     return encode_authorization_owner_record(
-        active_authorization_id=authorization["authorization_id"],
-        active_authorization_sha256=authorization["authorization_sha256"],
-        authorization_sequence=authorization["authorization_sequence"],
-        pending_action=authorization["owner_transition"]["to_pending_action"],
+        _fixture_owner_mapping_for_authorization(
+            authorization,
+            request=request,
+            previous_owner_record=previous_owner_record,
+        )
     )
 
 
 def fixture_owner_record_for_reactivation(
     install_authorization: dict[str, object],
     transition: dict[str, object],
+    *,
+    previous_owner_record: bytes,
 ) -> bytes:
     from simple.eval_runtime.installer_client import (
         encode_authorization_owner_record,
     )
 
-    return encode_authorization_owner_record(
-        active_authorization_id=install_authorization["authorization_id"],
-        active_authorization_sha256=install_authorization[
-            "authorization_sha256"
-        ],
-        authorization_sequence=transition["to_authorization_sequence"],
-        pending_action=transition["to_pending_action"],
+    owner = json.loads(previous_owner_record)
+    recovery = owner["recovery_authorizations"][-1]
+    generation = owner["active_service_authorization"]["generation"]
+    owner["recovery_results"] = [
+        *owner["recovery_results"],
+        {
+            "recovery_generation": generation,
+            "authorization_sha256": recovery["authorization_sha256"],
+            "request_sha256": "a" * 64,
+            "terminal_response_sha256": "b" * 64,
+            "terminal_phase": "NO_JOURNAL_NO_MUTATION",
+            "transaction_lock_identity_sha256": "c" * 64,
+            "previous_result_sha256": None,
+        },
+    ]
+    owner.update(
+        {
+            "active_service_authorization": {
+                "kind": "install",
+                "generation": 0,
+            },
+            "active_authorization_sha256": install_authorization[
+                "authorization_sha256"
+            ],
+            "authorization_sequence": transition[
+                "to_authorization_sequence"
+            ],
+            "pending_action": transition["to_pending_action"],
+        }
     )
+    return encode_authorization_owner_record(owner)
 
 
 def fixture_install_reactivation_transition(
@@ -511,6 +662,7 @@ def fixture_install_reactivation_transition(
     *,
     previous_authorization: dict[str, object],
     previous_transition: dict[str, object],
+    previous_owner_record: bytes,
 ) -> dict[str, object]:
     from simple.eval_runtime.installer_client import (
         encode_authorization_owner_projection,
@@ -518,26 +670,29 @@ def fixture_install_reactivation_transition(
         validate_owner_transition_against_records,
     )
 
-    previous_owner_record = fixture_owner_record_for_authorization(
-        previous_authorization
+    previous_owner = json.loads(previous_owner_record)
+    sequence = previous_owner["authorization_sequence"] + 1
+    provisional_transition = {
+        "to_authorization_sequence": sequence,
+        "to_pending_action": "install_base_python",
+    }
+    provisional_owner = fixture_owner_record_for_reactivation(
+        install_authorization,
+        provisional_transition,
+        previous_owner_record=previous_owner_record,
     )
-    sequence = previous_transition["to_authorization_sequence"] + 1
     target_projection = encode_authorization_owner_projection(
-        active_authorization_id=install_authorization["authorization_id"],
-        authorization_sequence=sequence,
-        pending_action="install_base_python",
+        json.loads(provisional_owner), creates_authorization=False
     )
     transition = encode_owner_transition(
         authorization_id=install_authorization["authorization_id"],
         authorization_sequence=sequence,
-        from_authorization_id=previous_transition["to_authorization_id"],
-        from_authorization_sequence=previous_transition[
-            "to_authorization_sequence"
-        ],
+        from_authorization_id=previous_authorization["authorization_id"],
+        from_authorization_sequence=previous_owner["authorization_sequence"],
         from_owner_record_sha256=hashlib.sha256(
             previous_owner_record
         ).hexdigest(),
-        from_pending_action=previous_transition["to_pending_action"],
+        from_pending_action=previous_owner["pending_action"],
         previous_transition=previous_transition,
         reason="no_journal_install_reactivation",
         to_owner_record_projection_sha256=hashlib.sha256(
@@ -549,8 +704,12 @@ def fixture_install_reactivation_transition(
         transition,
         from_owner_record=previous_owner_record,
         to_owner_record=fixture_owner_record_for_reactivation(
-            install_authorization, transition
+            install_authorization,
+            transition,
+            previous_owner_record=previous_owner_record,
         ),
+        expected_authorization=install_authorization,
+        creates_authorization=False,
     )
     return transition
 
@@ -580,6 +739,7 @@ class ForkedInstallerService:
         resume_recovery_requests: tuple[dict[str, object], ...] = (),
         resume_recovery_authorizations: tuple[dict[str, object], ...] = (),
         resume_owner_transition_history: tuple[dict[str, object], ...] = (),
+        resume_owner_record: bytes | None = None,
     ) -> "ForkedInstallerService":
         root.mkdir(mode=0o700)
         transaction_lock.touch(mode=0o600)
@@ -616,6 +776,44 @@ class ForkedInstallerService:
                         for authorization in recovery_authorizations
                     ),
                 ]
+            owner_record = resume_owner_record
+            if owner_record is None and install_authorization is not None:
+                if install_request is None:
+                    raise RuntimeError("INSTALLER_TEST_RESUME_INSTALL_REQUEST")
+                owner_record = fixture_unactivated_owner_record(install_request)
+                owner_record = fixture_owner_record_for_authorization(
+                    install_authorization,
+                    request=install_request,
+                    previous_owner_record=owner_record,
+                )
+                recovery_by_transition = {
+                    authorization["owner_transition"]["transition_sha256"]: (
+                        request, authorization
+                    )
+                    for request, authorization in zip(
+                        recovery_requests,
+                        recovery_authorizations,
+                        strict=True,
+                    )
+                }
+                for transition in owner_transition_history[1:]:
+                    if transition["reason"] == "no_journal_install_reactivation":
+                        owner_record = fixture_owner_record_for_reactivation(
+                            install_authorization,
+                            transition,
+                            previous_owner_record=owner_record,
+                        )
+                    else:
+                        recovery_request, recovery_authorization = (
+                            recovery_by_transition[
+                                transition["transition_sha256"]
+                            ]
+                        )
+                        owner_record = fixture_owner_record_for_authorization(
+                            recovery_authorization,
+                            request=recovery_request,
+                            previous_owner_record=owner_record,
+                        )
             script_index = 0
             try:
                 while True:
@@ -672,6 +870,16 @@ class ForkedInstallerService:
                                                 request, previous=None
                                             )
                                         )
+                                        unactivated = (
+                                            fixture_unactivated_owner_record(request)
+                                        )
+                                        owner_record = (
+                                            fixture_owner_record_for_authorization(
+                                                install_authorization,
+                                                request=request,
+                                                previous_owner_record=unactivated,
+                                            )
+                                        )
                                         owner_transition_history = [
                                             install_authorization[
                                                 "owner_transition"
@@ -717,6 +925,18 @@ class ForkedInstallerService:
                                     actor_authorization = (
                                         bound_install_authorization
                                     )
+                                    if owner_record is None:
+                                        unactivated = (
+                                            fixture_unactivated_owner_record(request)
+                                        )
+                                        owner_record = (
+                                            fixture_owner_record_for_authorization(
+                                                actor_authorization,
+                                                request=request,
+                                                previous_owner_record=unactivated,
+                                            )
+                                        )
+                                    actor_owner_record = owner_record
                                 else:
                                     known_ids = [
                                         item["request_id"]
@@ -726,6 +946,7 @@ class ForkedInstallerService:
                                         actor_authorization = recovery_authorizations[
                                             known_ids.index(request["request_id"])
                                         ]
+                                        actor_owner_record = owner_record
                                     else:
                                         previous_authorization = (
                                             recovery_authorizations[-1]
@@ -737,27 +958,26 @@ class ForkedInstallerService:
                                             if owner_transition_history
                                             else None
                                         )
-                                        previous_owner_record = (
-                                            fixture_owner_record_for_reactivation(
-                                                bound_install_authorization,
-                                                previous_transition,
+                                        if owner_record is None:
+                                            raise RuntimeError(
+                                                "INSTALLER_TEST_OWNER_RECORD_MISSING"
                                             )
-                                            if previous_transition is not None
-                                            and previous_transition["reason"]
-                                            == "no_journal_install_reactivation"
-                                            else fixture_owner_record_for_authorization(
-                                                previous_authorization
-                                            )
-                                        )
                                         actor_authorization = (
                                             fixture_publication_authorization(
-                                            request,
-                                            previous=previous_authorization,
-                                            previous_transition=previous_transition,
-                                            previous_owner_record=(
-                                                previous_owner_record
-                                            ),
+                                                request,
+                                                previous=previous_authorization,
+                                                previous_transition=(
+                                                    previous_transition
+                                                ),
+                                                previous_owner_record=owner_record,
+                                            )
                                         )
+                                        actor_owner_record = (
+                                            fixture_owner_record_for_authorization(
+                                                actor_authorization,
+                                                request=request,
+                                                previous_owner_record=owner_record,
+                                            )
                                         )
                                 publication = cls._send_response(
                                     connection,
@@ -806,6 +1026,7 @@ class ForkedInstallerService:
                                                 "owner_transition"
                                             ]
                                         )
+                                        owner_record = actor_owner_record
                                     journal_created = True
                                 elif response_status in {
                                     "NO_JOURNAL_NO_MUTATION",
@@ -826,10 +1047,11 @@ class ForkedInstallerService:
                                                 "owner_transition"
                                             ]
                                         )
+                                        owner_record = actor_owner_record
                                         if response_status == (
                                             "NO_JOURNAL_NO_MUTATION"
                                         ):
-                                            owner_transition_history.append(
+                                            reactivation = (
                                                 fixture_install_reactivation_transition(
                                                     bound_install_authorization,
                                                     previous_authorization=(
@@ -838,6 +1060,17 @@ class ForkedInstallerService:
                                                     previous_transition=(
                                                         owner_transition_history[-1]
                                                     ),
+                                                    previous_owner_record=owner_record,
+                                                )
+                                            )
+                                            owner_transition_history.append(
+                                                reactivation
+                                            )
+                                            owner_record = (
+                                                fixture_owner_record_for_reactivation(
+                                                    bound_install_authorization,
+                                                    reactivation,
+                                                    previous_owner_record=owner_record,
                                                 )
                                             )
                                     if response_status == "ABORTED_BEFORE_PREPARED":
@@ -849,6 +1082,7 @@ class ForkedInstallerService:
                                         recovery_requests = []
                                         recovery_authorizations = []
                                         owner_transition_history = []
+                                        owner_record = None
                             finally:
                                 os.close(construction_fd)
                         except BrokenPipeError:
@@ -1288,6 +1522,11 @@ class ForkedInstallerService:
             protected, published_parent, staging_parent, receipts, journals,
         ):
             directory.mkdir(mode=0o700, exist_ok=True)
+        receipt_parent_identity = (
+            ForkedInstallerService._ensure_fixture_installer_config(
+                control_parent, receipts=receipts
+            )
+        )
         component_hashes = {
             name: hashlib.sha256(f"fixture:{name}\n".encode()).hexdigest()
             for name in component_names
@@ -1311,6 +1550,7 @@ class ForkedInstallerService:
         )
         publication: dict[str, object] = {
             "journal_path": os.fspath(journal_path),
+            "receipt_parent_identity": receipt_parent_identity,
             "source_parent_identity": source_parent_identity,
             "staging_identity": staging_identity,
         }
@@ -1431,6 +1671,14 @@ class ForkedInstallerService:
             os.fsync(stream.fileno())
         ForkedInstallerService._fsync_dir(receipts)
         receipt_sha256 = hashlib.sha256(receipt_document).hexdigest()
+        ForkedInstallerService._validate_existing_receipt(
+            receipts,
+            receipt_path.name,
+            expected_bytes=receipt_document,
+            expected_parent_identity=receipt_parent_identity,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+        )
         publication["receipt_sha256"] = receipt_sha256
         return {
             **publication,
@@ -1538,6 +1786,12 @@ class ForkedInstallerService:
                 }
             )
         receipt_path = receipts / f"{final_tree_sha256}.json"
+        receipt_contract = ForkedInstallerService._configured_receipt_contract(
+            control_parent
+        )
+        expected_receipt_parent_identity = receipt_contract[
+            "receipt_parent_identity"
+        ]
         receipt_sha256 = next(
             (
                 record["receipt_sha256"]
@@ -1546,6 +1800,20 @@ class ForkedInstallerService:
             ),
             None,
         )
+        receipt_document = encode_publication_receipt(
+            install_request=install_request, publication=publication
+        )
+        if receipt_sha256 is not None:
+            if receipt_sha256 != hashlib.sha256(receipt_document).hexdigest():
+                raise RuntimeError("INSTALLER_TEST_RECOVERY_RECEIPT_DIGEST")
+            ForkedInstallerService._validate_existing_receipt(
+                receipts,
+                receipt_path.name,
+                expected_bytes=receipt_document,
+                expected_parent_identity=expected_receipt_parent_identity,
+                expected_uid=receipt_contract["input_uid"],
+                expected_gid=receipt_contract["input_gid"],
+            )
         current = prefix
         actor_already_started = any(
             record["actor_request_id"] == recovery_request["request_id"]
@@ -1626,16 +1894,16 @@ class ForkedInstallerService:
             candidate = current
             install_count = 4
         if install_count < 5:
-            receipt_document = encode_publication_receipt(
-                install_request=install_request, publication=publication
-            )
             try:
                 ForkedInstallerService._validate_existing_receipt(
                     receipts,
                     receipt_path.name,
                     expected_bytes=receipt_document,
-                    expected_uid=os.getuid(),
-                    expected_gid=os.getgid(),
+                    expected_parent_identity=(
+                        expected_receipt_parent_identity
+                    ),
+                    expected_uid=receipt_contract["input_uid"],
+                    expected_gid=receipt_contract["input_gid"],
                 )
             except FileNotFoundError:
                 fd = os.open(
@@ -1674,10 +1942,21 @@ class ForkedInstallerService:
             )
         if receipt_sha256 is None:
             raise RuntimeError("INSTALLER_TEST_RECOVERY_RECEIPT_MISSING")
+        final_receipt_identity = (
+            ForkedInstallerService._validate_existing_receipt(
+                receipts,
+                receipt_path.name,
+                expected_bytes=receipt_document,
+                expected_parent_identity=expected_receipt_parent_identity,
+                expected_uid=receipt_contract["input_uid"],
+                expected_gid=receipt_contract["input_gid"],
+            )
+        )
         publication.update(
             {
                 "published_path": os.fspath(published),
-                "receipt_inode": receipt_path.stat().st_ino,
+                "receipt_inode": final_receipt_identity["inode"],
+                "receipt_parent_identity": expected_receipt_parent_identity,
                 "receipt_path": os.fspath(receipt_path),
                 "receipt_sha256": receipt_sha256,
             }
@@ -1808,11 +2087,26 @@ class ForkedInstallerService:
                     published_parent,
                     staged.name,
                     expected_identity=publication["staging_identity"],
+                    fault_hook=lambda name: os._exit(87)
+                    if os.environ.get(
+                        "SIMPLE_FIXTURE_CRASH_AFTER_PUBLICATION_PHASE"
+                    ) == name
+                    else None,
                 )
             elif staged.is_symlink():
                 raise RuntimeError("INSTALLER_TEST_ABORT_STAGING_SYMLINK")
             elif not staging_removal_already_pending:
                 raise RuntimeError("INSTALLER_TEST_ABORT_STAGING_MISSING")
+            else:
+                ForkedInstallerService._fsync_absent_staging_parent(
+                    published_parent,
+                    expected_identity=publication["source_parent_identity"],
+                    fault_hook=lambda name: os._exit(87)
+                    if os.environ.get(
+                        "SIMPLE_FIXTURE_CRASH_AFTER_PUBLICATION_PHASE"
+                    ) == name
+                    else None,
+                )
             if os.environ.get(
                 "SIMPLE_FIXTURE_CRASH_AFTER_PUBLICATION_PHASE"
             ) == "STAGING_REMOVED":
@@ -1856,6 +2150,7 @@ class ForkedInstallerService:
         basename: str,
         *,
         expected_identity: dict[str, int],
+        fault_hook: Callable[[str], None] | None = None,
     ) -> None:
         if basename in {"", ".", ".."} or "/" in basename:
             raise RuntimeError("INSTALLER_TEST_ABORT_STAGING_BASENAME")
@@ -1889,10 +2184,45 @@ class ForkedInstallerService:
             os.close(root_fd)
             root_fd = -1
             os.rmdir(basename, dir_fd=parent_fd)
+            if fault_hook is not None:
+                fault_hook("after_exact_staging_rmdir")
+                fault_hook("before_staging_parent_fsync")
             os.fsync(parent_fd)
+            if fault_hook is not None:
+                fault_hook("after_staging_parent_fsync")
         finally:
             if root_fd >= 0:
                 os.close(root_fd)
+            os.close(parent_fd)
+
+    @staticmethod
+    def _fsync_absent_staging_parent(
+        parent: Path,
+        *,
+        expected_identity: dict[str, int],
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        parent_fd = os.open(
+            parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+        try:
+            status = os.fstat(parent_fd)
+            actual = {
+                "device": status.st_dev,
+                "gid": status.st_gid,
+                "inode": status.st_ino,
+                "mode": stat.S_IMODE(status.st_mode),
+                "mount_id": ForkedInstallerService._mount_id(parent_fd),
+                "uid": status.st_uid,
+            }
+            if actual != expected_identity or not stat.S_ISDIR(status.st_mode):
+                raise RuntimeError("INSTALLER_TEST_ABORT_PARENT_IDENTITY")
+            if fault_hook is not None:
+                fault_hook("before_staging_parent_fsync")
+            os.fsync(parent_fd)
+            if fault_hook is not None:
+                fault_hook("after_staging_parent_fsync")
+        finally:
             os.close(parent_fd)
 
     @staticmethod
@@ -2154,27 +2484,104 @@ class ForkedInstallerService:
         }
 
     @staticmethod
+    def _ensure_fixture_installer_config(
+        control_parent: Path, *, receipts: Path
+    ) -> dict[str, int]:
+        protected = control_parent / "protected-installer"
+        config = protected / "installer-config.json"
+        identity = ForkedInstallerService._path_identity(receipts)
+        document = json.dumps(
+            {
+                "input_gid": os.getgid(),
+                "input_uid": os.getuid(),
+                "receipt_parent_identity": identity,
+                "schema_version": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        if config.exists():
+            if config.read_bytes() != document:
+                raise RuntimeError("INSTALLER_TEST_CONFIG_DRIFT")
+            return identity
+        fd = os.open(
+            config,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o444,
+        )
+        try:
+            if os.write(fd, document) != len(document):
+                raise RuntimeError("INSTALLER_TEST_CONFIG_SHORT_WRITE")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        ForkedInstallerService._fsync_dir(protected)
+        return identity
+
+    @staticmethod
+    def _configured_receipt_contract(
+        control_parent: Path,
+    ) -> dict[str, object]:
+        config = (
+            control_parent
+            / "protected-installer"
+            / "installer-config.json"
+        )
+        value = json.loads(config.read_bytes())
+        if type(value) is not dict or set(value) != {
+            "input_gid", "input_uid", "receipt_parent_identity",
+            "schema_version",
+        } or value["schema_version"] != 1:
+            raise RuntimeError("INSTALLER_TEST_CONFIG_SCHEMA")
+        return value
+
+    @staticmethod
     def _validate_existing_receipt(
         parent: Path,
         basename: str,
         *,
         expected_bytes: bytes,
+        expected_parent_identity: dict[str, int],
         expected_uid: int,
         expected_gid: int,
     ) -> dict[str, int]:
         if basename in {"", ".", ".."} or "/" in basename:
             raise RuntimeError("INSTALLER_TEST_RECEIPT_BASENAME")
+        if type(expected_parent_identity) is not dict or set(
+            expected_parent_identity
+        ) != {"device", "gid", "inode", "mode", "mount_id", "uid"}:
+            raise RuntimeError("INSTALLER_TEST_RECEIPT_PARENT_IDENTITY")
+        if any(
+            type(expected_parent_identity[key]) is not int
+            for key in expected_parent_identity
+        ):
+            raise RuntimeError("INSTALLER_TEST_RECEIPT_PARENT_IDENTITY")
         parent_fd = os.open(
             parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
         )
         receipt_fd = -1
+        final_fd = -1
         try:
+            parent_status = os.fstat(parent_fd)
+            parent_actual = {
+                "device": parent_status.st_dev,
+                "gid": parent_status.st_gid,
+                "inode": parent_status.st_ino,
+                "mode": stat.S_IMODE(parent_status.st_mode),
+                "mount_id": ForkedInstallerService._mount_id(parent_fd),
+                "uid": parent_status.st_uid,
+            }
+            if (
+                parent_actual != expected_parent_identity
+                or not stat.S_ISDIR(parent_status.st_mode)
+            ):
+                raise RuntimeError("INSTALLER_TEST_RECEIPT_PARENT_IDENTITY")
             receipt_fd = os.open(
                 basename,
                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
                 dir_fd=parent_fd,
             )
-            parent_mount = ForkedInstallerService._mount_id(parent_fd)
+            parent_mount = expected_parent_identity["mount_id"]
             before = os.fstat(receipt_fd)
             if not stat.S_ISREG(before.st_mode):
                 raise RuntimeError("INSTALLER_TEST_RECEIPT_TYPE")
@@ -2209,6 +2616,27 @@ class ForkedInstallerService:
                 for field in stable
             ):
                 raise RuntimeError("INSTALLER_TEST_RECEIPT_DRIFT")
+            final_fd = os.open(
+                basename,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            final_status = os.fstat(final_fd)
+            if any(
+                getattr(before, field) != getattr(final_status, field)
+                for field in stable
+            ) or ForkedInstallerService._mount_id(final_fd) != parent_mount:
+                raise RuntimeError("INSTALLER_TEST_RECEIPT_FINAL_REOPEN")
+            final_bytes = bytearray()
+            while len(final_bytes) <= len(expected_bytes):
+                chunk = os.read(
+                    final_fd, len(expected_bytes) + 1 - len(final_bytes)
+                )
+                if not chunk:
+                    break
+                final_bytes.extend(chunk)
+            if bytes(final_bytes) != expected_bytes:
+                raise RuntimeError("INSTALLER_TEST_RECEIPT_FINAL_REOPEN")
             return {
                 "device": before.st_dev,
                 "gid": before.st_gid,
@@ -2219,6 +2647,8 @@ class ForkedInstallerService:
                 "uid": before.st_uid,
             }
         finally:
+            if final_fd >= 0:
+                os.close(final_fd)
             if receipt_fd >= 0:
                 os.close(receipt_fd)
             os.close(parent_fd)
@@ -4661,6 +5091,7 @@ from .fakes import (
     fixture_owner_record_for_authorization,
     fixture_owner_record_for_reactivation,
     fixture_publication_authorization,
+    fixture_unactivated_owner_record,
 )
 
 INSTALL_REQUEST = {
@@ -4689,6 +5120,12 @@ INSTALL_BYTES = json.dumps(
 INSTALL_AUTHORIZATION = fixture_publication_authorization(
     INSTALL_REQUEST, previous=None
 )
+INSTALL_BEFORE_OWNER_RECORD = fixture_unactivated_owner_record(INSTALL_REQUEST)
+INSTALL_OWNER_RECORD = fixture_owner_record_for_authorization(
+    INSTALL_AUTHORIZATION,
+    request=INSTALL_REQUEST,
+    previous_owner_record=INSTALL_BEFORE_OWNER_RECORD,
+)
 RECOVERY_REQUEST = {
     **INSTALL_REQUEST,
     "operation": "recover_base_python",
@@ -4701,7 +5138,14 @@ RECOVERY_REQUEST = {
     "request_id": "recover-base-python-generation-1",
 }
 RECOVERY_AUTHORIZATION = fixture_publication_authorization(
-    RECOVERY_REQUEST, previous=INSTALL_AUTHORIZATION
+    RECOVERY_REQUEST,
+    previous=INSTALL_AUTHORIZATION,
+    previous_owner_record=INSTALL_OWNER_RECORD,
+)
+RECOVERY_OWNER_RECORD = fixture_owner_record_for_authorization(
+    RECOVERY_AUTHORIZATION,
+    request=RECOVERY_REQUEST,
+    previous_owner_record=INSTALL_OWNER_RECORD,
 )
 INSTALL_OWNER_TRANSITIONS = (INSTALL_AUTHORIZATION["owner_transition"],)
 RECOVERY_OWNER_TRANSITIONS = (
@@ -4786,21 +5230,50 @@ PUBLICATION_VALIDATION_BOUNDARIES = (
     "after_complete_owner_fsync", "after_complete_parent_fsync",
     "before_construction_lock_close", "after_construction_lock_close",
 )
-FRESH_ATTEMPT_DURABLE_BOUNDARIES = {
-    "after_old_attempt_abort_mirror": (
+FRESH_ATTEMPT_STATES = {
+    "abort_received": (
+        1, "BASE_METADATA_NORMALIZED", "active",
+        "MIRROR_ABORTED_ATTEMPT",
+    ),
+    "old_attempt_aborted": (
         1, "BASE_METADATA_NORMALIZED", "aborted-before-prepared",
         "ALLOCATE_FRESH_BASE_ATTEMPT",
     ),
-    "after_fresh_base_allocated": (
+    "fresh_base_allocated": (
         2, "BASE_ALLOCATED", "active", "REBUILD_FRESH_BASE",
     ),
-    "after_fresh_base_copied": (
+    "fresh_base_copied": (
         2, "BASE_COPIED", "active", "ACTIVATE_FRESH_INSTALL",
     ),
-    "after_fresh_install_authorization": (
+    "fresh_install_authorized": (
         2, "BASE_COPIED", "active", None,
     ),
 }
+FRESH_ATTEMPT_TRANSITIONS = (
+    ("old_attempt_abort", "abort_received", "old_attempt_aborted"),
+    ("fresh_base_allocate", "old_attempt_aborted", "fresh_base_allocated"),
+    ("fresh_base_copy", "fresh_base_allocated", "fresh_base_copied"),
+    (
+        "fresh_install_authorize", "fresh_base_copied",
+        "fresh_install_authorized",
+    ),
+)
+FRESH_ATTEMPT_CRASH_BOUNDARIES = {}
+for prefix, before_state, after_state in FRESH_ATTEMPT_TRANSITIONS:
+    FRESH_ATTEMPT_CRASH_BOUNDARIES.update(
+        {
+            f"before_{prefix}": FRESH_ATTEMPT_STATES[before_state],
+            f"before_{prefix}_owner_replace": (
+                FRESH_ATTEMPT_STATES[before_state]
+            ),
+            f"after_{prefix}_owner_replace": FRESH_ATTEMPT_STATES[after_state],
+            f"before_{prefix}_owner_fsync": FRESH_ATTEMPT_STATES[after_state],
+            f"after_{prefix}_owner_fsync": FRESH_ATTEMPT_STATES[after_state],
+            f"before_{prefix}_parent_fsync": FRESH_ATTEMPT_STATES[after_state],
+            f"after_{prefix}_parent_fsync": FRESH_ATTEMPT_STATES[after_state],
+            f"after_{prefix}": FRESH_ATTEMPT_STATES[after_state],
+        }
+    )
 
 
 def _fixture_response_bytes(control_parent: Path, request_id: str) -> bytes:
@@ -4965,7 +5438,9 @@ def test_recovery_appends_history_and_preserves_install_receipt(tmp_path) -> Non
     assert requests[0] == INSTALL_BYTES
     recovery_request = json.loads(requests[1])
     recovery_authorization = fixture_publication_authorization(
-        recovery_request, previous=INSTALL_AUTHORIZATION
+        recovery_request,
+        previous=INSTALL_AUTHORIZATION,
+        previous_owner_record=INSTALL_OWNER_RECORD,
     )
     complete_journal = journal_path.read_bytes()
     records = decode_exact_publication_journal(
@@ -5084,7 +5559,9 @@ def test_service_exit_after_each_durable_phase_leaves_exact_legal_prefix(
     restarted.drive_to_terminal()
     recovery_request = json.loads(recovery_service.request_bytes()[0])
     recovery_authorization = fixture_publication_authorization(
-        recovery_request, previous=INSTALL_AUTHORIZATION
+        recovery_request,
+        previous=INSTALL_AUTHORIZATION,
+        previous_owner_record=INSTALL_OWNER_RECORD,
     )
     complete = journal.read_bytes()
     recovered = decode_exact_publication_journal(
@@ -5165,7 +5642,9 @@ def test_initial_only_recovery_aborts_and_starts_fresh_attempt(tmp_path) -> None
     requests = [json.loads(value) for value in recovery_service.request_bytes()]
     recovery_request, fresh_install_request = requests
     recovery_authorization = fixture_publication_authorization(
-        recovery_request, previous=INSTALL_AUTHORIZATION
+        recovery_request,
+        previous=INSTALL_AUTHORIZATION,
+        previous_owner_record=INSTALL_OWNER_RECORD,
     )
     old_records = decode_exact_publication_journal(
         old_journal.read_bytes(),
@@ -5213,6 +5692,7 @@ def test_initial_only_recovery_aborts_and_starts_fresh_attempt(tmp_path) -> None
     "abort_boundary",
     (
         "RECOVERY_STARTED", "STAGING_REMOVE_PENDING", "STAGING_REMOVED",
+        "after_exact_staging_rmdir", "after_staging_parent_fsync",
         "ABORTED_BEFORE_PREPARED",
     ),
 )
@@ -5241,6 +5721,19 @@ def test_pre_prepared_abort_restarts_at_every_durable_boundary(
     first.close_after_uncertain_transport()
     install_service.wait(timeout=5.0)
 
+    token = INSTALL_REQUEST["payload"]["operation_token_sha256"]
+    published_parent = tmp_path / "protected-installer" / "published"
+    staged = published_parent / f".staging-{token}"
+    nested = staged / "partial" / "deep"
+    nested.mkdir(parents=True)
+    (nested / "payload.bin").write_bytes(b"partial-before-prepared")
+    (staged / "partial-link").symlink_to("partial/deep/payload.bin")
+    sibling = published_parent / "unrelated-sibling"
+    sibling.mkdir()
+    sibling_payload = sibling / "keep.bin"
+    sibling_payload.write_bytes(b"preserve-me")
+    sibling_identity = ForkedInstallerService._path_identity(sibling)
+
     crashing = ForkedInstallerService.start(
         tmp_path / "crashing-recovery",
         construction_lock=construction,
@@ -5258,7 +5751,9 @@ def test_pre_prepared_abort_restarts_at_every_durable_boundary(
     recovery_bytes = crashing.request_bytes()[0]
     recovery_request = json.loads(recovery_bytes)
     recovery_authorization = fixture_publication_authorization(
-        recovery_request, previous=INSTALL_AUTHORIZATION
+        recovery_request,
+        previous=INSTALL_AUTHORIZATION,
+        previous_owner_record=INSTALL_OWNER_RECORD,
     )
     transition_history = (
         INSTALL_AUTHORIZATION["owner_transition"],
@@ -5283,7 +5778,6 @@ def test_pre_prepared_abort_restarts_at_every_durable_boundary(
     assert fresh_request["payload"]["operation_token_sha256"] != (
         INSTALL_REQUEST["payload"]["operation_token_sha256"]
     )
-    token = INSTALL_REQUEST["payload"]["operation_token_sha256"]
     journal = (
         tmp_path / "protected-installer" / "journals" / f"{token}.jsonl"
     )
@@ -5297,14 +5791,17 @@ def test_pre_prepared_abort_restarts_at_every_durable_boundary(
     )
     assert old_records[-1]["phase"] == "ABORTED_BEFORE_PREPARED"
     assert all(record["final_tree_sha256"] is None for record in old_records)
+    assert not staged.exists()
+    assert sibling_payload.read_bytes() == b"preserve-me"
+    assert ForkedInstallerService._path_identity(sibling) == sibling_identity
     replay.stop()
     replay.wait(timeout=5.0)
 
 
 @pytest.mark.parametrize(
-    "crash_boundary", tuple(FRESH_ATTEMPT_DURABLE_BOUNDARIES)
+    "crash_boundary", tuple(FRESH_ATTEMPT_CRASH_BOUNDARIES)
 )
-def test_fresh_attempt_restarts_at_each_separately_fsynced_state(
+def test_fresh_attempt_restarts_at_every_owner_durability_sub_boundary(
     crash_boundary: str, tmp_path
 ) -> None:
     root = tmp_path / "manager-state"
@@ -5349,7 +5846,7 @@ def test_fresh_attempt_restarts_at_each_separately_fsynced_state(
         os._exit(0)
     _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 87
-    expected = FRESH_ATTEMPT_DURABLE_BOUNDARIES[crash_boundary]
+    expected = FRESH_ATTEMPT_CRASH_BOUNDARIES[crash_boundary]
     snapshot = DiskAuthorizationStore.open_readonly(root).validated_snapshot()
     assert (
         snapshot.construction_attempt,
@@ -5359,7 +5856,7 @@ def test_fresh_attempt_restarts_at_each_separately_fsynced_state(
     ) == expected
     if snapshot.construction_attempt == 1:
         assert snapshot.active_authorization_kind is None
-    elif crash_boundary != "after_fresh_install_authorization":
+    elif expected != FRESH_ATTEMPT_STATES["fresh_install_authorized"]:
         assert snapshot.recovery_authorizations == ()
         assert snapshot.recovery_results == ()
         assert snapshot.active_authorization_kind is None
@@ -5429,7 +5926,9 @@ def test_same_recovery_generation_resumes_each_partial_recovery_prefix(
     recovery_bytes = crashing_recovery.request_bytes()[0]
     recovery_request = json.loads(recovery_bytes)
     recovery_authorization = fixture_publication_authorization(
-        recovery_request, previous=INSTALL_AUTHORIZATION
+        recovery_request,
+        previous=INSTALL_AUTHORIZATION,
+        previous_owner_record=INSTALL_OWNER_RECORD,
     )
     token = INSTALL_REQUEST["payload"]["operation_token_sha256"]
     journal = (
@@ -5520,7 +6019,9 @@ def test_recovery_adopts_receipt_fsynced_before_journal_append(tmp_path) -> None
     recovery_bytes = crashing_recovery.request_bytes()[0]
     recovery_request = json.loads(recovery_bytes)
     recovery_authorization = fixture_publication_authorization(
-        recovery_request, previous=INSTALL_AUTHORIZATION
+        recovery_request,
+        previous=INSTALL_AUTHORIZATION,
+        previous_owner_record=INSTALL_OWNER_RECORD,
     )
     transition_history = (
         INSTALL_AUTHORIZATION["owner_transition"],
@@ -5583,12 +6084,12 @@ def test_recovery_adopts_receipt_fsynced_before_journal_append(tmp_path) -> None
         ("mode", "INSTALLER_TEST_RECEIPT_MODE"),
         ("type", "INSTALLER_TEST_RECEIPT_TYPE"),
         ("link", "INSTALLER_TEST_RECEIPT_LINK_COUNT"),
+        ("parent_mount", "INSTALLER_TEST_RECEIPT_PARENT_IDENTITY"),
     ],
 )
 def test_receipt_adoption_rejects_each_identity_mutation(
     mutation: str,
     error_code: str,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     publication = ForkedInstallerService._materialize_protected_publication(
@@ -5598,14 +6099,45 @@ def test_receipt_adoption_rejects_each_identity_mutation(
         component_names=("base_python",),
     )
     receipt = Path(publication["receipt_path"])
-    # The fixture uses the process identity as its configured installer
-    # identity. Changing one expected field is equivalent to independently
-    # presenting a receipt owned by the wrong configured UID or GID without
-    # requiring root privileges in pytest.
-    if mutation == "uid":
-        monkeypatch.setattr(os, "getuid", lambda: receipt.stat().st_uid + 1)
-    elif mutation == "gid":
-        monkeypatch.setattr(os, "getgid", lambda: receipt.stat().st_gid + 1)
+    terminal_response = ForkedInstallerService._encode_response(
+        request=INSTALL_REQUEST,
+        status="INSTALLED",
+        publication=publication,
+        fault=None,
+    )
+    ForkedInstallerService._write_install_publication_journal(
+        publication,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+        terminal_response=terminal_response,
+    )
+    journal = Path(publication["journal_path"])
+    journal_before = journal.read_bytes()
+    complete = decode_exact_publication_journal(
+        journal_before,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+    )
+    assert complete[-1]["phase"] == "RECEIPT_CREATED"
+    receipt_inode = receipt.stat().st_ino
+    if mutation in {"uid", "gid", "parent_mount"}:
+        config = tmp_path / "protected-installer" / "installer-config.json"
+        value = json.loads(config.read_bytes())
+        if mutation == "uid":
+            value["input_uid"] += 1
+        elif mutation == "gid":
+            value["input_gid"] += 1
+        else:
+            value["receipt_parent_identity"]["mount_id"] += 1
+        config.chmod(0o644)
+        config.write_text(
+            json.dumps(value, sort_keys=True, separators=(",", ":")),
+            encoding="ascii",
+        )
+        with config.open("rb") as stream:
+            os.fsync(stream.fileno())
+        config.chmod(0o444)
+        ForkedInstallerService._fsync_dir(config.parent)
     elif mutation == "mode":
         receipt.chmod(0o644)
     elif mutation == "type":
@@ -5626,6 +6158,9 @@ def test_receipt_adoption_rejects_each_identity_mutation(
             recovery_authorization=RECOVERY_AUTHORIZATION,
             owner_transition_history=RECOVERY_OWNER_TRANSITIONS,
         )
+    assert journal.read_bytes() == journal_before
+    if mutation != "type":
+        assert receipt.stat().st_ino == receipt_inode
 
 
 @pytest.mark.parametrize("durable_phase", INSTALL_PUBLICATION_PHASES[1:])
@@ -5907,61 +6442,175 @@ def test_authorization_rejects_valid_lowercase_wrong_digest() -> None:
         )
 
 
-def test_authorization_uses_acyclic_persisted_owner_projection(tmp_path) -> None:
-    before = encode_authorization_owner_record(
-        active_authorization_id=None,
-        active_authorization_sha256=None,
-        authorization_sequence=0,
-        pending_action="prepare_install_authorization",
+def test_store_authorization_binds_actual_full_owner_record(tmp_path) -> None:
+    root = tmp_path / "manager-state"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=tmp_path / "construction.lock",
+        transaction_lock=tmp_path / "transaction.lock",
     )
-    after = fixture_owner_record_for_authorization(INSTALL_AUTHORIZATION)
-    before_path = tmp_path / "owner-before.json"
-    after_path = tmp_path / "owner-after.json"
-    for path, payload in ((before_path, before), (after_path, after)):
-        path.write_bytes(payload)
-        with path.open("rb") as stream:
-            os.fsync(stream.fileno())
-    before = before_path.read_bytes()
-    after = after_path.read_bytes()
-    transition = INSTALL_AUTHORIZATION["owner_transition"]
+    store = DiskAuthorizationStore.open_readonly(root)
+    snapshot = store.validated_snapshot()
+    transition_entry = snapshot.owner_transition_history[0]
+    before = encode_authorization_owner_record(
+        transition_entry.from_owner_record
+    )
+    after = store.read_owner_record_bytes()
+    assert after == encode_authorization_owner_record(
+        transition_entry.to_owner_record
+    )
+    authorization = snapshot.install_authorization
+    transition = authorization["owner_transition"]
+    persisted_owner = json.loads(after)
+    assert persisted_owner["install_authorization"] == authorization
+    assert persisted_owner["active_service_authorization"] == {
+        "kind": "install", "generation": 0,
+    }
+    assert persisted_owner["active_authorization_sha256"] == (
+        authorization["authorization_sha256"]
+    )
     assert "to_owner_record_sha256" not in transition
-    assert INSTALL_AUTHORIZATION["authorization_sha256"].encode() in after
+    assert authorization["authorization_sha256"].encode() in after
     assert hashlib.sha256(after).hexdigest() != transition[
         "to_owner_record_projection_sha256"
     ]
     validate_owner_transition_against_records(
-        transition, from_owner_record=before, to_owner_record=after
+        transition,
+        from_owner_record=before,
+        to_owner_record=after,
+        expected_authorization=authorization,
+        creates_authorization=True,
     )
 
-    changed = json.loads(after)
-    changed["pending_action"] = "forged-pending-action"
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "construction_identity", "run_id", "owner_token", "operation_token",
+        "owner_process", "state", "phase", "staging_path",
+        "construction_attempt", "attempt_status", "cleanup_required",
+        "pending_action", "pending_local_transition", "heartbeat",
+        "last_error", "install_authorization", "recovery_authorizations",
+        "recovery_results", "active_reference",
+        "active_authorization_sha256", "authorization_sequence",
+        "transport_uncertain", "response_uncertain",
+        "last_preacquisition_status", "locked_response_records",
+        "publication_mirrors", "protected_validation",
+        "component_hashes", "final_tree_sha256", "receipt_sha256",
+        "terminal_response_status",
+    ),
+)
+def test_store_owner_transition_rejects_each_security_field_mutation(
+    mutation: str, tmp_path
+) -> None:
+    root = tmp_path / "manager-state"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=tmp_path / "construction.lock",
+        transaction_lock=tmp_path / "transaction.lock",
+    )
+    store = DiskAuthorizationStore.open_readonly(root)
+    snapshot = store.validated_snapshot()
+    transition_entry = snapshot.owner_transition_history[0]
+    before = encode_authorization_owner_record(
+        transition_entry.from_owner_record
+    )
+    changed = json.loads(store.read_owner_record_bytes())
+    if mutation == "construction_identity":
+        changed["base_python_intake_sha256"] = "9" * 64
+    elif mutation == "run_id":
+        changed["run_id"] = "forged-run"
+    elif mutation == "construction_attempt":
+        changed["construction_attempt"] += 1
+    elif mutation == "owner_token":
+        changed["owner_token_sha256"] = "8" * 64
+    elif mutation == "operation_token":
+        changed["operation_token_sha256"] = "7" * 64
+    elif mutation == "owner_process":
+        changed["owner_start_ticks"] += 1
+    elif mutation == "state":
+        changed["state"] = "COMPLETE"
+    elif mutation == "phase":
+        changed["phase"] = "BASE_ALLOCATED"
+    elif mutation == "staging_path":
+        changed["staging_path"] = "/forged/staging"
+    elif mutation == "attempt_status":
+        changed["attempt_status"] = "complete"
+    elif mutation == "cleanup_required":
+        changed["cleanup_required"] = False
+    elif mutation == "pending_action":
+        changed["pending_action"] = "forged-action"
+    elif mutation == "pending_local_transition":
+        changed["pending_local_transition"] = "FORGED_TRANSITION"
+    elif mutation == "heartbeat":
+        changed["heartbeat_monotonic_ns"] += 1
+    elif mutation == "last_error":
+        changed["last_error"] = "forged-error"
+    elif mutation == "install_authorization":
+        changed["install_authorization"] = {
+            **snapshot.install_authorization,
+            "authorization_id": "forged-install",
+        }
+    elif mutation == "recovery_authorizations":
+        changed["recovery_authorizations"] = [snapshot.install_authorization]
+    elif mutation == "recovery_results":
+        changed["recovery_results"] = [{"forged": True}]
+    elif mutation == "active_reference":
+        changed["active_service_authorization"]["generation"] = 99
+    elif mutation == "active_authorization_sha256":
+        changed["active_authorization_sha256"] = "6" * 64
+    elif mutation == "authorization_sequence":
+        changed["authorization_sequence"] += 1
+    elif mutation == "transport_uncertain":
+        changed["transport_uncertain"] = True
+    elif mutation == "response_uncertain":
+        changed["response_uncertain"] = True
+    elif mutation == "last_preacquisition_status":
+        changed["last_preacquisition_status"] = "INSTALLER_TRANSACTION_BUSY"
+    elif mutation == "locked_response_records":
+        changed["locked_response_records"] = [{"forged": True}]
+    elif mutation == "publication_mirrors":
+        changed["publication_mirrors"] = ["BASE_FINAL_RENAMED"]
+    elif mutation == "protected_validation":
+        changed["protected_journal_validated"] = True
+    elif mutation == "component_hashes":
+        changed["component_hashes"] = {"base_python": "5" * 64}
+    elif mutation == "final_tree_sha256":
+        changed["final_tree_sha256"] = "4" * 64
+    elif mutation == "receipt_sha256":
+        changed["receipt_sha256"] = "3" * 64
+    elif mutation == "terminal_response_status":
+        changed["terminal_response_status"] = "INSTALLED"
+    else:
+        raise AssertionError(mutation)
     changed_bytes = json.dumps(
         changed, sort_keys=True, separators=(",", ":")
     ).encode()
-    with pytest.raises(
-        RuntimeError, match="PUBLICATION_OWNER_TRANSITION_TO_PROJECTION"
-    ):
+    with pytest.raises(RuntimeError, match="PUBLICATION_OWNER"):
         validate_owner_transition_against_records(
-            transition,
+            snapshot.install_authorization["owner_transition"],
             from_owner_record=before,
             to_owner_record=changed_bytes,
+            expected_authorization=snapshot.install_authorization,
+            creates_authorization=True,
         )
 
 
 def test_no_journal_generation_and_reactivation_remain_in_full_history() -> None:
-    install_owner_record = fixture_owner_record_for_authorization(
-        INSTALL_AUTHORIZATION
-    )
-    generation_1_owner_record = fixture_owner_record_for_authorization(
-        RECOVERY_AUTHORIZATION
-    )
+    install_owner_record = INSTALL_OWNER_RECORD
+    generation_1_owner_record = RECOVERY_OWNER_RECORD
     reactivation = fixture_install_reactivation_transition(
         INSTALL_AUTHORIZATION,
         previous_authorization=RECOVERY_AUTHORIZATION,
         previous_transition=RECOVERY_AUTHORIZATION["owner_transition"],
+        previous_owner_record=generation_1_owner_record,
     )
     reactivated_owner_record = fixture_owner_record_for_reactivation(
-        INSTALL_AUTHORIZATION, reactivation
+        INSTALL_AUTHORIZATION,
+        reactivation,
+        previous_owner_record=generation_1_owner_record,
     )
     generation_2_request = {
         **RECOVERY_REQUEST,
@@ -5980,7 +6629,9 @@ def test_no_journal_generation_and_reactivation_remain_in_full_history() -> None
         previous_owner_record=reactivated_owner_record,
     )
     generation_2_owner_record = fixture_owner_record_for_authorization(
-        generation_2_authorization
+        generation_2_authorization,
+        request=generation_2_request,
+        previous_owner_record=reactivated_owner_record,
     )
     authorization_history = (
         RECOVERY_AUTHORIZATION, generation_2_authorization,
@@ -6001,16 +6652,22 @@ def test_no_journal_generation_and_reactivation_remain_in_full_history() -> None
         RECOVERY_AUTHORIZATION["owner_transition"],
         from_owner_record=install_owner_record,
         to_owner_record=generation_1_owner_record,
+        expected_authorization=RECOVERY_AUTHORIZATION,
+        creates_authorization=True,
     )
     validate_owner_transition_against_records(
         reactivation,
         from_owner_record=generation_1_owner_record,
         to_owner_record=reactivated_owner_record,
+        expected_authorization=INSTALL_AUTHORIZATION,
+        creates_authorization=False,
     )
     validate_owner_transition_against_records(
         generation_2_authorization["owner_transition"],
         from_owner_record=reactivated_owner_record,
         to_owner_record=generation_2_owner_record,
+        expected_authorization=generation_2_authorization,
+        creates_authorization=True,
     )
     publication = {
         "source_parent_identity": {
@@ -6861,16 +7518,35 @@ OWNER_TRANSITION_KEYS = {
     "to_authorization_id", "to_authorization_sequence",
     "to_owner_record_projection_sha256", "to_pending_action",
 }
-OWNER_AUTHORIZATION_PROJECTION_KEYS = {
-    "active_authorization_id", "authorization_sequence", "pending_action",
-    "schema_version",
+OWNER_RECORD_KEYS = {
+    "schema_version", "construction_kind", "closure_id",
+    "descriptor_sha256", "base_python_intake_sha256", "run_id",
+    "owner_token_sha256", "operation_token_sha256", "host_name",
+    "boot_id", "owner_pid", "owner_start_ticks", "state", "phase",
+    "staging_path", "final_path", "construction_attempt",
+    "attempt_status", "cleanup_required", "pending_action",
+    "pending_local_transition", "heartbeat_monotonic_ns",
+    "heartbeat_wall_ns", "last_error", "install_authorization",
+    "recovery_authorizations", "recovery_results",
+    "active_service_authorization", "active_authorization_sha256",
+    "authorization_sequence", "transport_uncertain",
+    "response_uncertain", "last_preacquisition_status",
+    "locked_response_records", "publication_mirrors",
+    "protected_journal_validated", "protected_receipt_validated",
+    "published_root_validated", "component_hashes",
+    "final_tree_sha256", "receipt_sha256", "terminal_response_status",
 }
-OWNER_AUTHORIZATION_RECORD_KEYS = OWNER_AUTHORIZATION_PROJECTION_KEYS | {
-    "active_authorization_sha256",
+ACTIVE_SERVICE_AUTHORIZATION_KEYS = {
+    "kind", "generation",
 }
 PUBLICATION_AUTHORIZATION_KEYS = {
     "authorization_id", "authorization_sequence", "authorization_sha256",
     "previous_authorization_sha256", "owner_transition",
+}
+RECOVERY_RESULT_KEYS = {
+    "recovery_generation", "authorization_sha256", "request_sha256",
+    "terminal_response_sha256", "terminal_phase",
+    "transaction_lock_identity_sha256", "previous_result_sha256",
 }
 PUBLICATION_JOURNAL_ENTRY_KEYS = PUBLICATION_RECEIPT_KEYS | {
     "sequence", "phase", "previous_entry_sha256", "receipt_sha256",
@@ -6910,74 +7586,251 @@ def _canonical_json(value: Mapping[str, object]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def encode_authorization_owner_projection(
-    *,
-    active_authorization_id: str | None,
-    authorization_sequence: int,
-    pending_action: str,
-) -> bytes:
-    projection = {
-        "active_authorization_id": active_authorization_id,
-        "authorization_sequence": authorization_sequence,
-        "pending_action": pending_action,
-        "schema_version": 1,
-    }
-    return _canonical_json(projection)
-
-
 def encode_authorization_owner_record(
-    *,
-    active_authorization_id: str | None,
-    active_authorization_sha256: str | None,
-    authorization_sequence: int,
-    pending_action: str,
+    owner_record: Mapping[str, object],
 ) -> bytes:
-    if active_authorization_sha256 is not None:
+    encoded = _canonical_json(owner_record)
+    _decode_authorization_owner_record(encoded)
+    return encoded
+
+
+def _owner_authorizations(
+    value: Mapping[str, object],
+) -> list[Mapping[str, object]]:
+    install = value["install_authorization"]
+    recovery = value["recovery_authorizations"]
+    authorizations = [] if install is None else [install]
+    return [*authorizations, *recovery]
+
+
+def _active_owner_authorization(
+    value: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    active = value["active_service_authorization"]
+    if active is None:
+        return None
+    if active["kind"] == "install":
+        matches = [value["install_authorization"]]
+    else:
+        generation = active["generation"]
+        recoveries = value["recovery_authorizations"]
+        matches = (
+            [recoveries[generation - 1]]
+            if 0 < generation <= len(recoveries)
+            else []
+        )
+    if len(matches) != 1:
+        raise RuntimeError("PUBLICATION_OWNER_ACTIVE_AUTHORIZATION_REFERENCE")
+    authorization = matches[0]
+    if authorization is None or (
+        active["kind"] == "recovery"
+        and authorization["authorization_sequence"]
+        != value["authorization_sequence"]
+    ):
+        raise RuntimeError("PUBLICATION_OWNER_ACTIVE_AUTHORIZATION_REFERENCE")
+    return authorization
+
+
+def _validate_owner_record_mapping(
+    value: object, *, allow_pending_authorization: bool = False
+) -> dict[str, object]:
+    if type(value) is not dict or set(value) != OWNER_RECORD_KEYS:
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_SCHEMA")
+    if value["schema_version"] != 1:
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_SCHEMA")
+    for key in ("owner_token_sha256", "operation_token_sha256"):
+        _require_sha256(value[key], code="PUBLICATION_OWNER_RECORD_TOKEN")
+    for key in ("descriptor_sha256", "base_python_intake_sha256"):
+        if value[key] is not None:
+            _require_sha256(value[key], code="PUBLICATION_OWNER_RECORD_IDENTITY")
+    kind = value["construction_kind"]
+    if kind == "base_python":
+        if (
+            value["closure_id"] is not None
+            or value["descriptor_sha256"] is not None
+            or type(value["base_python_intake_sha256"]) is not str
+            or type(value["construction_attempt"]) is not int
+            or value["construction_attempt"] <= 0
+            or value["attempt_status"] not in {
+                "active", "aborted-before-prepared", "complete",
+            }
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_CONSTRUCTION")
+    elif kind == "closure":
+        if (
+            type(value["closure_id"]) is not str
+            or not value["closure_id"]
+            or type(value["descriptor_sha256"]) is not str
+            or value["base_python_intake_sha256"] is not None
+            or value["construction_attempt"] is not None
+            or value["attempt_status"] is not None
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_CONSTRUCTION")
+    else:
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_CONSTRUCTION")
+    for key in ("run_id", "host_name", "boot_id", "state", "phase"):
+        if type(value[key]) is not str or not value[key]:
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_VALUE")
+    for key in ("owner_pid", "owner_start_ticks"):
+        if type(value[key]) is not int or value[key] <= 0:
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_VALUE")
+    for key in ("heartbeat_monotonic_ns", "heartbeat_wall_ns"):
+        if type(value[key]) is not int or value[key] < 0:
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_VALUE")
+    for key in ("staging_path", "final_path", "pending_action"):
+        if value[key] is not None and (
+            type(value[key]) is not str or not value[key]
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_VALUE")
+    if value["pending_local_transition"] is not None and (
+        type(value["pending_local_transition"]) is not str
+        or not value["pending_local_transition"]
+    ):
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_VALUE")
+    for key in (
+        "cleanup_required", "transport_uncertain", "response_uncertain",
+        "protected_journal_validated", "protected_receipt_validated",
+        "published_root_validated",
+    ):
+        if type(value[key]) is not bool:
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_VALUE")
+    for key in (
+        "recovery_authorizations", "recovery_results",
+        "locked_response_records", "publication_mirrors",
+    ):
+        if type(value[key]) is not list:
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_HISTORY")
+    if any(type(entry) is not dict for entry in value["locked_response_records"]):
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_HISTORY")
+    if any(type(entry) is not str or not entry for entry in value["publication_mirrors"]):
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_HISTORY")
+    for result in value["recovery_results"]:
+        if type(result) is not dict or set(result) != RECOVERY_RESULT_KEYS:
+            raise RuntimeError("PUBLICATION_OWNER_RECOVERY_RESULT_SCHEMA")
+        if (
+            type(result["recovery_generation"]) is not int
+            or result["recovery_generation"] <= 0
+            or type(result["terminal_phase"]) is not str
+            or not result["terminal_phase"]
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_RECOVERY_RESULT_VALUE")
+        for key in (
+            "authorization_sha256", "request_sha256",
+            "terminal_response_sha256", "transaction_lock_identity_sha256",
+        ):
+            _require_sha256(
+                result[key], code="PUBLICATION_OWNER_RECOVERY_RESULT_DIGEST"
+            )
+        if result["previous_result_sha256"] is not None:
+            _require_sha256(
+                result["previous_result_sha256"],
+                code="PUBLICATION_OWNER_RECOVERY_RESULT_DIGEST",
+            )
+    if type(value["component_hashes"]) is not dict:
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_COMPONENTS")
+    if any(type(name) is not str or not name for name in value["component_hashes"]):
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_COMPONENTS")
+    for digest in value["component_hashes"].values():
+        _require_sha256(digest, code="PUBLICATION_OWNER_RECORD_COMPONENTS")
+    for key in ("final_tree_sha256", "receipt_sha256"):
+        if value[key] is not None:
+            _require_sha256(value[key], code="PUBLICATION_OWNER_RECORD_DIGEST")
+    if type(value["authorization_sequence"]) is not int or (
+        value["authorization_sequence"] < 0
+    ):
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_AUTHORIZATION_SEQUENCE")
+    for authorization in _owner_authorizations(value):
+        if type(authorization) is not dict or set(authorization) != (
+            PUBLICATION_AUTHORIZATION_KEYS
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_AUTHORIZATION_SCHEMA")
+        if (
+            type(authorization["authorization_id"]) is not str
+            or not authorization["authorization_id"]
+            or type(authorization["authorization_sequence"]) is not int
+            or authorization["authorization_sequence"] <= 0
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_AUTHORIZATION_VALUE")
+        if authorization["authorization_sha256"] is not None:
+            _require_sha256(
+                authorization["authorization_sha256"],
+                code="PUBLICATION_OWNER_RECORD_AUTHORIZATION_DIGEST",
+            )
+        if authorization["previous_authorization_sha256"] is not None:
+            _require_sha256(
+                authorization["previous_authorization_sha256"],
+                code="PUBLICATION_OWNER_RECORD_AUTHORIZATION_DIGEST",
+            )
+        if authorization["owner_transition"] is not None and type(
+            authorization["owner_transition"]
+        ) is not dict:
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_AUTHORIZATION_VALUE")
+    active = value["active_service_authorization"]
+    if active is not None:
+        if type(active) is not dict or set(active) != (
+            ACTIVE_SERVICE_AUTHORIZATION_KEYS
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_ACTIVE_REFERENCE")
+        if (
+            active["kind"] not in {"install", "recovery"}
+            or type(active["generation"]) is not int
+            or active["generation"] < 0
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_ACTIVE_REFERENCE")
+        if (active["kind"] == "install") != (active["generation"] == 0):
+            raise RuntimeError("PUBLICATION_OWNER_ACTIVE_REFERENCE")
+    active_authorization = _active_owner_authorization(value)
+    active_digest = value["active_authorization_sha256"]
+    if active_authorization is None:
+        if active_digest is not None:
+            raise RuntimeError("PUBLICATION_OWNER_ACTIVE_AUTHORIZATION_BINDING")
+    elif allow_pending_authorization:
+        if (
+            active_digest is not None
+            or active_authorization["authorization_sha256"] is not None
+            or active_authorization["owner_transition"] is not None
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_PENDING_AUTHORIZATION")
+    else:
         _require_sha256(
-            active_authorization_sha256,
-            code="PUBLICATION_OWNER_ACTIVE_AUTHORIZATION_DIGEST",
+            active_digest,
+            code="PUBLICATION_OWNER_ACTIVE_AUTHORIZATION_BINDING",
         )
-    projection = json.loads(
-        encode_authorization_owner_projection(
-            active_authorization_id=active_authorization_id,
-            authorization_sequence=authorization_sequence,
-            pending_action=pending_action,
-        )
+        if active_authorization["authorization_sha256"] != active_digest:
+            raise RuntimeError("PUBLICATION_OWNER_ACTIVE_AUTHORIZATION_BINDING")
+    if value["install_authorization"] is None:
+        if (
+            value["recovery_authorizations"]
+            or value["recovery_results"]
+            or active is not None
+            or value["authorization_sequence"] != 0
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_AUTHORIZATION_BOOTSTRAP")
+    elif value["authorization_sequence"] <= 0:
+        raise RuntimeError("PUBLICATION_OWNER_AUTHORIZATION_SEQUENCE")
+    for key in ("last_error", "last_preacquisition_status", "terminal_response_status"):
+        if value[key] is not None and (
+            type(value[key]) is not str or not value[key]
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_RECORD_VALUE")
+    return value
+
+
+def encode_authorization_owner_projection(
+    owner_record: Mapping[str, object], *, creates_authorization: bool
+) -> bytes:
+    value = json.loads(_canonical_json(owner_record))
+    _validate_owner_record_mapping(
+        value, allow_pending_authorization=creates_authorization
     )
-    return _canonical_json(
-        {
-            **projection,
-            "active_authorization_sha256": active_authorization_sha256,
-        }
-    )
+    return _canonical_json(value)
 
 
 def _decode_authorization_owner_record(payload: bytes) -> dict[str, object]:
     value = json.loads(payload)
-    if (
-        type(value) is not dict
-        or set(value) != OWNER_AUTHORIZATION_RECORD_KEYS
-        or _canonical_json(value) != payload
-        or value["schema_version"] != 1
-        or type(value["authorization_sequence"]) is not int
-        or value["authorization_sequence"] < 0
-        or type(value["pending_action"]) is not str
-        or not value["pending_action"]
-    ):
-        raise RuntimeError("PUBLICATION_OWNER_RECORD_SCHEMA")
-    active_id = value["active_authorization_id"]
-    active_digest = value["active_authorization_sha256"]
-    if active_id is None:
-        if active_digest is not None or value["authorization_sequence"] != 0:
-            raise RuntimeError("PUBLICATION_OWNER_RECORD_ACTIVE_REFERENCE")
-    elif type(active_id) is not str or not active_id:
-        raise RuntimeError("PUBLICATION_OWNER_RECORD_ACTIVE_REFERENCE")
-    else:
-        _require_sha256(
-            active_digest,
-            code="PUBLICATION_OWNER_ACTIVE_AUTHORIZATION_DIGEST",
-        )
-    return value
+    if _canonical_json(value) != payload:
+        raise RuntimeError("PUBLICATION_OWNER_RECORD_NONCANONICAL")
+    return _validate_owner_record_mapping(value)
 
 
 def validate_owner_transition_against_records(
@@ -6985,6 +7838,8 @@ def validate_owner_transition_against_records(
     *,
     from_owner_record: bytes,
     to_owner_record: bytes,
+    expected_authorization: Mapping[str, object],
+    creates_authorization: bool,
 ) -> None:
     before = _decode_authorization_owner_record(from_owner_record)
     after = _decode_authorization_owner_record(to_owner_record)
@@ -6992,20 +7847,37 @@ def validate_owner_transition_against_records(
         "from_owner_record_sha256"
     ]:
         raise RuntimeError("PUBLICATION_OWNER_TRANSITION_FROM_RECORD")
-    projection = {
-        key: after[key] for key in OWNER_AUTHORIZATION_PROJECTION_KEYS
-    }
-    if hashlib.sha256(_canonical_json(projection)).hexdigest() != transition[
+    active_authorization = _active_owner_authorization(after)
+    if (
+        active_authorization != expected_authorization
+        or after["active_authorization_sha256"]
+        != expected_authorization["authorization_sha256"]
+    ):
+        raise RuntimeError("PUBLICATION_OWNER_ACTIVE_AUTHORIZATION_BINDING")
+    projected = json.loads(_canonical_json(after))
+    if creates_authorization:
+        projected_active = _active_owner_authorization(projected)
+        if projected_active is None:
+            raise RuntimeError("PUBLICATION_OWNER_PENDING_AUTHORIZATION")
+        projected_active["authorization_sha256"] = None
+        projected_active["owner_transition"] = None
+        projected["active_authorization_sha256"] = None
+    projection = encode_authorization_owner_projection(
+        projected, creates_authorization=creates_authorization
+    )
+    if hashlib.sha256(projection).hexdigest() != transition[
         "to_owner_record_projection_sha256"
     ]:
         raise RuntimeError("PUBLICATION_OWNER_TRANSITION_TO_PROJECTION")
     expected_before = (
-        before["active_authorization_id"],
+        None
+        if _active_owner_authorization(before) is None
+        else _active_owner_authorization(before)["authorization_id"],
         before["authorization_sequence"],
         before["pending_action"],
     )
     expected_after = (
-        after["active_authorization_id"],
+        _active_owner_authorization(after)["authorization_id"],
         after["authorization_sequence"],
         after["pending_action"],
     )
@@ -8718,35 +9590,59 @@ class InstallerOrchestrator:
             return True
         if pending == "MIRROR_ABORTED_ATTEMPT":
             if fault_hook is not None:
-                fault_hook("before_old_attempt_abort_mirror")
-            self.store.mirror_aborted_attempt_before_prepared()
-            self.store.fsync_owner_and_parent()
+                fault_hook("before_old_attempt_abort")
+            self.store.mirror_aborted_attempt_before_prepared(
+                fault_hook=fault_hook,
+                boundary_prefix="old_attempt_abort",
+            )
+            self.store.fsync_owner_and_parent(
+                fault_hook=fault_hook,
+                boundary_prefix="old_attempt_abort",
+            )
             if fault_hook is not None:
-                fault_hook("after_old_attempt_abort_mirror")
+                fault_hook("after_old_attempt_abort")
             return True
         if pending == "ALLOCATE_FRESH_BASE_ATTEMPT":
             if fault_hook is not None:
-                fault_hook("before_fresh_base_allocated")
-            self.store.allocate_fresh_base_attempt()
-            self.store.fsync_owner_and_parent()
+                fault_hook("before_fresh_base_allocate")
+            self.store.allocate_fresh_base_attempt(
+                fault_hook=fault_hook,
+                boundary_prefix="fresh_base_allocate",
+            )
+            self.store.fsync_owner_and_parent(
+                fault_hook=fault_hook,
+                boundary_prefix="fresh_base_allocate",
+            )
             if fault_hook is not None:
-                fault_hook("after_fresh_base_allocated")
+                fault_hook("after_fresh_base_allocate")
             return True
         if pending == "REBUILD_FRESH_BASE":
             if fault_hook is not None:
                 fault_hook("before_fresh_base_copy")
-            self.store.resume_fresh_base_copy_to_base_copied()
-            self.store.fsync_owner_and_parent()
+            self.store.resume_fresh_base_copy_to_base_copied(
+                fault_hook=fault_hook,
+                boundary_prefix="fresh_base_copy",
+            )
+            self.store.fsync_owner_and_parent(
+                fault_hook=fault_hook,
+                boundary_prefix="fresh_base_copy",
+            )
             if fault_hook is not None:
-                fault_hook("after_fresh_base_copied")
+                fault_hook("after_fresh_base_copy")
             return True
         if pending == "ACTIVATE_FRESH_INSTALL":
             if fault_hook is not None:
-                fault_hook("before_fresh_install_authorization")
-            self.store.activate_fresh_install_authorization()
-            self.store.fsync_owner_and_parent()
+                fault_hook("before_fresh_install_authorize")
+            self.store.activate_fresh_install_authorization(
+                fault_hook=fault_hook,
+                boundary_prefix="fresh_install_authorize",
+            )
+            self.store.fsync_owner_and_parent(
+                fault_hook=fault_hook,
+                boundary_prefix="fresh_install_authorize",
+            )
             if fault_hook is not None:
-                fault_hook("after_fresh_install_authorization")
+                fault_hook("after_fresh_install_authorize")
             return True
         if pending == "VALIDATE_PUBLICATION":
             self.store.advance_publication_validation(fault_hook=fault_hook)
@@ -8785,9 +9681,15 @@ class InstallerOrchestrator:
             session.close()
 ```
 
-`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, an independent append-only owner-transition JSONL, append-only locked-response uncertainty records, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. Authorization construction is explicitly acyclic. The transition intent hashes the exact prior canonical owner-record bytes plus an exact target projection containing only schema version, active authorization ID, monotonic authorization sequence, and pending action; the projection deliberately excludes every authorization/transition digest. The authorization digest then binds that transition intent. Only afterward may the target owner record be encoded with the new authorization digest. The append-only transition evidence stores the exact canonical before/after owner objects beside the intent, and `validate_owner_transition_against_records` must recompute the prior full-record digest, target projection digest, active IDs/sequences/actions, authorization digest, and transition chain from those persisted bytes. A target full-owner digest is never an authorization input. The durable store, installer service, and tests all call the same owner projection, authorization, and transition encoders and validators; fixtures may not invent owner hashes. Their decoders recompute each lowercase digest from the exact canonical body and then validate the authorization and transition chains independently; a merely well-formed 64-hex digest is never accepted. Its root manifest pins the construction- and transaction-lock device/inode/mount identities, the configured protected journal/receipt/publication roots, and the original install digest. It calls only `encode_installer_request` for install and recovery documents. Every generated wire document therefore has exactly the six top-level request keys, keeps construction-attempt and recovery-generation fields inside the exact operation payload, and records an explicit request ID that byte-identical replay preserves. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks, passing its still-locked construction FD to `UnixInstallerSession`; the session derives response matching from the explicit request ID rather than the body digest. The store opens protected evidence read-only and calls only `decode_exact_publication_journal` and `decode_exact_publication_receipt`, passing the immutable original install request plus the complete exact fsynced authorization, owner-transition, and canonical owner-record histories. The decoder resolves journal actors by request ID; it permits earlier no-journal authorizations and the intervening install-reactivation transition to be absent as journal actors while still requiring every immutable history entry and chain link to validate against its persisted before/after owner bytes. It rehashes the fsynced wire response bytes and requires the digest to equal the terminal-response digest in the final record for that same install or recovery request before checking every response field against the independently decoded journal/receipt/root values. The response digest is excluded from the receipt, so constructing the response after receipt creation and binding its digest into the final journal record creates no hash cycle.
+`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, an independent append-only owner-transition JSONL, append-only locked-response uncertainty records, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. `OWNER_RECORD_KEYS` is the exact persisted schema, not a reduced authorization view: it includes the complete construction identity and attempt state, both tokens, owner process identity, paths, phase and pending state, cleanup and uncertainty state, immutable install authorization, complete recovery authorization/result histories, active reference and `active_authorization_sha256`, authorization sequence, protected-validation mirrors, component/final/receipt identities, diagnostics, and terminal state. `read_owner_record_bytes()` reopens the current owner path with no-follow/beneath semantics, requires a canonical regular-file record, and returns the exact bytes whose decoded object is also exposed by `validated_snapshot`; every `owner_transition_history` entry stores those actual canonical before/after objects, never fixture projections.
 
-`persist_received_reply` places result-append and handoff-close hooks around every valid `INSTALLED`, null-recovery, or `RECOVERED` reply. A final-result response (`INSTALLED` or `RECOVERED`) durably records the wire response and clears the active service authorization, but deliberately leaves the owner phase at `INSTALLING` (or `BASE_METADATA_NORMALIZED`), sets `pending_local_transition="VALIDATE_PUBLICATION"`, keeps `cleanup_required=true`, and is nonterminal. `ABORTED_BEFORE_PREPARED` durably records only the received result and sets `pending_local_transition="MIRROR_ABORTED_ATTEMPT"`. Four restartable transitions then run separately: (1) validate the exact `INITIAL → RECOVERY_STARTED → STAGING_REMOVE_PENDING → ABORTED_BEFORE_PREPARED` journal with null result fields, fsync `attempt_status="aborted-before-prepared"`, clear the old active authorization, and set `ALLOCATE_FRESH_BASE_ATTEMPT`; (2) increment the attempt, generate a fresh operation token, fsync `attempt_status="active"`, `phase="BASE_ALLOCATED"`, and `REBUILD_FRESH_BASE`; (3) resume the normal write-ahead base-copy operation and separately fsync `phase="BASE_COPIED"` plus `ACTIVATE_FRESH_INSTALL`; and only then (4) create/fsync the new immutable install authorization, empty recovery histories, active install reference, and exact fresh install request. No method performs two of these owner-record replacements, and crash tests reopen each of the four durable states before allowing the next transition. `advance_publication_validation()` is driven only by the last fsynced owner phase and performs exactly one durable owner-phase transition per call. From `INSTALLING`/`BASE_METADATA_NORMALIZED`, it no-follow opens the token-derived protected journal and receipt, validates the complete journal sequence/hash chain, separately rehashes the persisted response against its recorded digest, and validates the exact receipt schema/digest/tokens/final/component/completion hashes/root identity. It then atomically mirrors `FINAL_RENAMED`/`BASE_FINAL_RENAMED` and separately fsyncs owner and parent. From that fsynced phase it repeats both protected validations, atomically mirrors `RECEIPT_CREATED`/`BASE_RECEIPT_CREATED`, and separately fsyncs owner and parent. From that fsynced phase it repeats both protected validations, no-follow reopens the configured digest-derived published root, validates its device/inode/mount/UID/GID/mode, component manifests, completion metadata, and receipt binding, then atomically enters `COMPLETE`/`BASE_COMPLETE`, sets `cleanup_required=false`, clears the pending transition, and separately fsyncs owner and parent. Validation-only progress is never stored, so a crash at any validation hook simply repeats the validation from the last durable phase instead of skipping or looping on an unrecorded substep. Every invocation refuses extra paths, suffix records, symlinks, or values learned only from the wire. No service request is resent once the valid final-result response is fsynced.
+Authorization construction is explicitly acyclic. For a newly created authorization, the transition intent hashes the exact prior canonical owner-record bytes plus the complete intended target owner record with only the new authorization's own `authorization_sha256`, its embedded `owner_transition`, and the top-level `active_authorization_sha256` neutralized to null. Every other security-relevant field remains in that projection. The authorization digest then binds the transition intent and exact request digest; only afterward is the same target record encoded with the new authorization and identical digest at both the active object and top-level active-digest field. Reactivation creates no authorization, so its projection is the complete intended target record without neutralization. The append-only transition evidence stores the exact canonical before/after owner objects beside the intent, and `validate_owner_transition_against_records` must recompute the prior full-record digest, target projection digest, full field-for-field owner delta, active authorization object and digest, active IDs/sequences/actions, authorization digest, and transition chain from those persisted bytes. A target full-owner digest is never an authorization input. The durable store, installer service, and tests all call the same owner-record, projection, authorization, and transition encoders and validators; fixtures may not invent owner hashes or reduced owner objects. Tests bootstrap the real `DiskAuthorizationStore`, compare its actual `owner-record.json` bytes with its transition-history target, and mutate construction state, tokens, phase, cleanup state, both recovery histories, active reference, and active digest independently.
+
+The root manifest pins the construction- and transaction-lock device/inode/mount identities, the configured protected journal/receipt/publication roots, and the original install digest. The store calls only `encode_installer_request` for install and recovery documents. Every generated wire document therefore has exactly the six top-level request keys, keeps construction-attempt and recovery-generation fields inside the exact operation payload, and records an explicit request ID that byte-identical replay preserves. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks, passing its still-locked construction FD to `UnixInstallerSession`; the session derives response matching from the explicit request ID rather than the body digest. The store opens protected evidence read-only and calls only `decode_exact_publication_journal` and `decode_exact_publication_receipt`, passing the immutable original install request plus the complete exact fsynced authorization, owner-transition, and canonical owner-record histories. The decoder resolves journal actors by request ID; it permits earlier no-journal authorizations and the intervening install-reactivation transition to be absent as journal actors while still requiring every immutable history entry and chain link to validate against its persisted before/after owner bytes. It rehashes the fsynced wire response bytes and requires the digest to equal the terminal-response digest in the final record for that same install or recovery request before checking every response field against the independently decoded journal/receipt/root values. The response digest is excluded from the receipt, so constructing the response after receipt creation and binding its digest into the final journal record creates no hash cycle.
+
+`persist_received_reply` places result-append and handoff-close hooks around every valid `INSTALLED`, null-recovery, or `RECOVERED` reply. A final-result response (`INSTALLED` or `RECOVERED`) durably records the wire response and clears the active service authorization, but deliberately leaves the owner phase at `INSTALLING` (or `BASE_METADATA_NORMALIZED`), sets `pending_local_transition="VALIDATE_PUBLICATION"`, keeps `cleanup_required=true`, and is nonterminal. `ABORTED_BEFORE_PREPARED` durably records only the received result and sets `pending_local_transition="MIRROR_ABORTED_ATTEMPT"`. Four restartable transitions then run separately: (1) validate the exact `INITIAL → RECOVERY_STARTED → STAGING_REMOVE_PENDING → ABORTED_BEFORE_PREPARED` journal with null result fields, fsync `attempt_status="aborted-before-prepared"`, clear the old active authorization, and set `ALLOCATE_FRESH_BASE_ATTEMPT`; (2) increment the attempt, generate a fresh operation token, fsync `attempt_status="active"`, `phase="BASE_ALLOCATED"`, and `REBUILD_FRESH_BASE`; (3) resume the normal write-ahead base-copy operation and separately fsync `phase="BASE_COPIED"` plus `ACTIVATE_FRESH_INSTALL`; and only then (4) create/fsync the new immutable install authorization, empty recovery histories, active install reference, and exact fresh install request. No method performs two of these owner-record replacements. Each method and `fsync_owner_and_parent` accepts a transition-specific fault-hook prefix and exposes eight ordered boundaries: before the transition, before/after atomic owner replacement, before/after owner-file fsync, before/after parent-directory fsync, and after the transition. Fork/`_exit` tests cover all 32 boundaries, reopen the real store, require exactly the prior or new canonical state appropriate to that boundary, and then finish from disk without fabricating an intermediate object.
+
+`advance_publication_validation()` is driven only by the last fsynced owner phase and performs exactly one durable owner-phase transition per call. From `INSTALLING`/`BASE_METADATA_NORMALIZED`, it no-follow opens the token-derived protected journal and receipt, validates the complete journal sequence/hash chain, separately rehashes the persisted response against its recorded digest, and validates the exact receipt schema/digest/tokens/final/component/completion hashes/root identity. It then atomically mirrors `FINAL_RENAMED`/`BASE_FINAL_RENAMED` and separately fsyncs owner and parent. From that fsynced phase it repeats both protected validations, atomically mirrors `RECEIPT_CREATED`/`BASE_RECEIPT_CREATED`, and separately fsyncs owner and parent. From that fsynced phase it repeats both protected validations, no-follow reopens the configured digest-derived published root, validates its device/inode/mount/UID/GID/mode, component manifests, completion metadata, and receipt binding, then atomically enters `COMPLETE`/`BASE_COMPLETE`, sets `cleanup_required=false`, clears the pending transition, and separately fsyncs owner and parent. Validation-only progress is never stored, so a crash at any validation hook simply repeats the validation from the last durable phase instead of skipping or looping on an unrecorded substep. Every invocation refuses extra paths, suffix records, symlinks, or values learned only from the wire. No service request is resent once the valid final-result response is fsynced.
 
 `commit_locked_response_uncertain` records the bounded error code and received-prefix digest while the valid transaction-lock OFD is still held: an install decision appends and activates the next recovery generation, while a recovery decision retains that exact active generation and request bytes. Both paths replace and fsync the owner record and parent before the OFD closes. Missing, extra, intervened, or wrong-identity descriptors cannot authorize this response-driven transition and instead use `record_transport_uncertain` under only the stable construction lock. A strictly decoded `INSTALLER_TRANSACTION_BUSY` is different: it has zero FDs, exact retryable error semantics, and all mutation-result fields null. `record_preacquisition_failure` appends only an fsynced diagnostic; it does not change the active authorization/reference, request bytes, phase, pending action, construction attempt, recovery histories, or cleanup state. A retry must send byte-identical bytes.
 
@@ -8830,9 +9732,9 @@ The service never calls `LOCK_UN`. Every install/recover instance opens a distin
 
 Base-Python journals are keyed by `<intake-sha256>.<operation-token-sha256>.jsonl`; closure journals by `<closure-id>.<operation-token-sha256>.jsonl`. Before `PREPARED`, the only legal final digest is null, the stable staging identity excludes mode, and each record carries the actual phase-observed mode. At or after `PREPARED`, every record must carry the first bound non-null digest and observed mode `0555`. Recovery opens the existing install-token journal, accepts only a legal contiguous durable prefix, derives the next filesystem action from its last phase, and appends missing action records under the active recovery authorization to the same inode. Every install and recovery record binds the expected authorization digest/sequence, previous authorization-entry digest, and exact owner-record transition. Recovery validates or reconstructs the install-implied receipt byte-for-byte and never creates a recovery-keyed replacement journal or recovery-derived receipt. Root journals, completion metadata, and receipts are never within payload hashes.
 
-Before `PREPARED`, staging cleanup is implemented only by a confined descriptor walk rooted at the already validated staging FD. The native service enumerates each directory through that FD, opens child directories with no-follow/beneath restrictions, rejects a mount-ID change, unlinks non-directories with `unlinkat`, removes emptied child directories with `unlinkat(..., AT_REMOVEDIR)`, fsyncs every changed directory, and finally removes the exact token basename through the retained staging-parent FD. It never constructs a child pathname, traverses `..`, or enumerates/removes any sibling. Partial nested content, symlinks, and a staging-local final-looking completion file are removable; an unrelated sibling and its inode/content must remain unchanged.
+Before `PREPARED`, staging cleanup is implemented only by a confined descriptor walk rooted at the already validated staging FD. The native service enumerates each directory through that FD, opens child directories with no-follow/beneath restrictions, rejects a mount-ID change, unlinks non-directories with `unlinkat`, removes emptied child directories with `unlinkat(..., AT_REMOVEDIR)`, and fsyncs every changed child directory. It then removes the exact token basename through the retained staging-parent FD, emits the `after_exact_staging_rmdir` crash barrier before any parent fsync, fsyncs that already-open configured parent, and emits `after_staging_parent_fsync` before appending `STAGING_REMOVED`. Restart from durable `STAGING_REMOVE_PENDING` accepts either the exact revalidated staging inode or its absence under the unchanged configured parent identity; it repeats/finishes the parent fsync before advancing. It never constructs a child pathname, traverses `..`, or enumerates/removes any sibling. Partial nested content, symlinks, and a staging-local final-looking completion file are removable; fork/`_exit` tests at both new barriers prove restart completion while an unrelated sibling's bytes and inode remain unchanged.
 
-Receipt adoption uses the configured `input_uid`/`input_gid`, not the service's ambient identity. The service opens the derived basename through the retained receipt-parent FD with no-follow resolution and requires a regular file, link count exactly one, owner/group equal to configuration, mode `0444`, the configured receipt-parent mount ID, exact length and canonical bytes, and stable device/inode/type/link/owner/mode/size before and after reading. Only `ENOENT` permits `O_CREAT|O_EXCL`; a symlink, directory, hard link, wrong owner/group/mode, cross-mount object, byte mismatch, or metadata drift blocks recovery without replacement.
+Receipt adoption uses the configured `input_uid`/`input_gid` and configured receipt-parent device/inode/mount/UID/GID/mode identity, not the service's ambient identity or a mount ID learned from the candidate path. Before appending any recovery record—even when the existing journal already ends in `RECEIPT_CREATED`—the service no-follow opens and validates the configured parent FD, derives the receipt basename from the install-bound digest, and opens the entry through that FD. It requires a regular file, link count exactly one, owner/group equal to configuration, mode `0444`, the configured parent mount ID, exact length and canonical bytes, and stable device/inode/mount/type/link/owner/mode/size before and after reading. Immediately before the recovery append it closes and performs one final no-follow reopen through the same configured parent, requiring the same inode and bytes; successful recovery repeats this final reopen before constructing its response. Only `ENOENT` at a journal phase that legally precedes receipt creation permits `O_CREAT|O_EXCL`; a symlink, directory, hard link, wrong owner/group/mode, cross-mount object, byte mismatch, metadata drift, or changed parent identity blocks recovery without replacement or journal append.
 
 - [ ] **Step 6: Add native crash/race tests**
 
@@ -8844,10 +9746,11 @@ after PREPARED; before/after RENAME_PENDING; after rename; after FINAL_RENAMED;
 before/after receipt O_EXCL; after receipt fsync; before/after canonical response
 construction; before terminal-response-digest append; after its journal fsync;
 after RECEIPT_CREATED/RECOVERY_RESPONSE_CREATED; before sendmsg; after sendmsg;
+after exact pre-PREPARED staging rmdir; after staging-parent fsync;
 before local FD close; during shutdown
 ```
 
-For each point assert a restart produces either no final path or one manifest-valid immutable final path with exactly one byte-identical receipt. Drive every case through the six-field canonical request transport with one already-locked construction FD. Add one-mutation-at-a-time rejection cases for missing/extra/wrong FDs, ancillary truncation, wrong `fd_roles`, generation fields outside `payload`, noncanonical JSON, an echoed request-ID mismatch, a valid-lowercase-but-incorrect authorization digest, and deletion/change of any immutable owner-transition entry; every rejection must precede journal access or the next mutation. Persist canonical before/after owner records for each transition, recompute the acyclic target projection and authorization digest from those bytes, and reject a one-field owner projection mutation. Add the mandatory generation-1 no-journal → identical install replay → post-journal uncertainty → generation-2 recovery sentinel and assert generation 1 plus the intervening install-reactivation transition remain in the independently verified histories even though neither is a publication-journal actor. Add the `INITIAL`-only recovery matrix at `RECOVERY_STARTED`, `STAGING_REMOVE_PENDING`, confined recursive staging removal, and `ABORTED_BEFORE_PREPARED`; seed nested partial/final-looking files plus symlinks and prove an unrelated sibling's bytes and inode are preserved. After abort, crash/restart independently at the fsynced old-attempt terminal state, fresh `BASE_ALLOCATED`, fresh `BASE_COPIED`, and new install authorization. Add the receipt-fsync-before-journal-append boundary and require recovery to adopt only a byte-identical receipt while preserving bytes, hash, inode, owner, mode, regular-file type, and link count. Independently mutate receipt UID/GID, mode, type, and link count and require rejection without replacement. Run two concurrent installers and two concurrent recoverers; require one mutation winner and zero signals/deletions by losers.
+For each point assert a restart produces either no final path or one manifest-valid immutable final path with exactly one byte-identical receipt. Drive every case through the six-field canonical request transport with one already-locked construction FD. Add one-mutation-at-a-time rejection cases for missing/extra/wrong FDs, ancillary truncation, wrong `fd_roles`, generation fields outside `payload`, noncanonical JSON, an echoed request-ID mismatch, a valid-lowercase-but-incorrect authorization digest, and deletion/change of any immutable owner-transition entry; every rejection must precede journal access or the next mutation. Persist the full actual `DiskAuthorizationStore` owner objects before and after each transition, recompute the acyclic complete-target projection and authorization digest from those bytes, assert `after.active_authorization_sha256` equals the activated authorization's recomputed digest, and independently mutate construction attempt, owner/operation tokens, phase, cleanup state, recovery authorizations/results, active reference, and active digest. Add the mandatory generation-1 no-journal → identical install replay → post-journal uncertainty → generation-2 recovery sentinel and assert generation 1 plus the intervening install-reactivation transition remain in the independently verified histories even though neither is a publication-journal actor. Add the `INITIAL`-only recovery matrix at `RECOVERY_STARTED`, `STAGING_REMOVE_PENDING`, after the exact staging-root `rmdir`, after its parent fsync, and `ABORTED_BEFORE_PREPARED`; seed nested partial/final-looking files plus symlinks and prove restart removes only the target while preserving an unrelated sibling's bytes and inode. After abort, fork/`_exit` before the transition, before/after owner replacement, before/after owner-file fsync, before/after parent-directory fsync, and after the transition for each of old-attempt abort, fresh `BASE_ALLOCATED`, fresh `BASE_COPIED`, and new install authorization. Add the receipt-fsync-before-journal-append boundary and require recovery to adopt only a byte-identical receipt while preserving bytes, hash, inode, owner, mode, regular-file type, and link count. Starting from a journal already complete through `RECEIPT_CREATED`, independently mutate configured parent mount identity and receipt UID/GID, mode, type, and link count; each case must fail before `RECOVERY_STARTED`, preserve the journal bytes, and perform no replacement. Run two concurrent installers and two concurrent recoverers; require one mutation winner and zero signals/deletions by losers.
 
 Exercise every response codec independently. Post-acquisition cases mutate exactly one of: outer key set; request identity; operation/authorization/token/generation echo; lowercase 64-hex final/completion/receipt digest; exact base or closure component-key set; component digest; root device/inode/mount/UID/GID integer type (with Boolean explicitly rejected); root mode; success `error=null`; status/operation; terminal phase; and null-result final fields. Each carries the valid locked handoff and must enter the durable locked-response uncertainty path before any publication mirror. Pre-acquisition cases send zero FDs and mutate exactly one of status, error key set, code, strict Boolean `retryable`, echo, null final fields, or terminal phase; only the exact busy document is returned as `PreAcquisitionReply`, and every invalid variant enters stable-lock transport uncertainty. Separately mutate the protected journal sequence/chain/terminal-response digest, receipt schema/hash/content, published-root identity/mode, component bytes/manifests, and completion metadata after a wire-valid response. Each must fail before the first affected owner mirror, retain `cleanup_required=true`, and never enter `COMPLETE`. Recovery tests snapshot the install journal prefix and receipt bytes/hash/inode before issuing recovery, then prove all four are unchanged after the recovery suffix and exact response digest are fsynced.
 
