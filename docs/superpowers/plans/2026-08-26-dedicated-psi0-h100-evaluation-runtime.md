@@ -283,10 +283,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import array
 import fcntl
-import hashlib
+import stat
 import struct
 import threading
 import time
@@ -388,12 +389,14 @@ class ForkedInstallerService:
         self.root = root
         self.pid = pid
         self.socket_path = root / "installer.sock"
+        self._stop_requested = False
 
     @classmethod
     def start(
         cls,
         root: Path,
         *,
+        construction_lock: Path,
         transaction_lock: Path,
         script: tuple[str, ...] | None = None,
     ) -> "ForkedInstallerService":
@@ -419,56 +422,67 @@ class ForkedInstallerService:
                 while True:
                     connection, _ = listener.accept()
                     with connection:
-                        body = cls._receive_request(connection)
-                        if body == b"__stop__":
-                            break
-                        request = json.loads(body)
-                        if script is not None:
-                            response_status = script[
-                                min(script_index, len(script) - 1)
-                            ]
-                            script_index += 1
-                        elif request["operation"] == "install_base_python":
-                            install_count += 1
-                            response_status = (
-                                "TRANSPORT_DROPPED"
-                                if install_count == 1
-                                else "TRANSPORT_DROPPED_AFTER_JOURNAL"
-                            )
-                        elif request["operation"] == "recover_base_python":
-                            generation = request["recovery_generation"]
-                            response_status = (
-                                "NO_JOURNAL_NO_MUTATION"
-                                if generation == 1 and not journal_created
-                                else "RECOVERED"
-                            )
-                        else:
-                            raise RuntimeError("INSTALLER_TEST_OPERATION")
-                        cls._append_jsonl(
-                            request_log,
-                            {"body_hex": body.hex()},
-                        )
-                        cls._append_jsonl(
-                            response_log,
-                            {"status": response_status},
-                        )
-                        if response_status == "TRANSPORT_DROPPED":
-                            continue
-                        if response_status == "TRANSPORT_DROPPED_AFTER_JOURNAL":
-                            journal = root / "service-journal.json"
-                            journal.write_bytes(b'{"phase":"PREPARED"}\n')
-                            with journal.open("rb") as stream:
-                                os.fsync(stream.fileno())
-                            cls._fsync_dir(root)
-                            journal_created = True
-                            continue
                         try:
-                            cls._send_response(
+                            body, request, construction_fd = cls._receive_request(
                                 connection,
-                                transaction_lock=transaction_lock,
-                                request=body,
-                                status=response_status,
+                                construction_lock=construction_lock,
                             )
+                            try:
+                                if script is not None:
+                                    response_status = script[
+                                        min(script_index, len(script) - 1)
+                                    ]
+                                    script_index += 1
+                                elif request["operation"] == "install_base_python":
+                                    install_count += 1
+                                    response_status = (
+                                        "TRANSPORT_DROPPED"
+                                        if install_count == 1
+                                        else "TRANSPORT_DROPPED_AFTER_JOURNAL"
+                                    )
+                                elif request["operation"] == "recover_base_python":
+                                    generation = request["payload"]["recovery_generation"]
+                                    response_status = (
+                                        "NO_JOURNAL_NO_MUTATION"
+                                        if generation == 1 and not journal_created
+                                        else "RECOVERED"
+                                    )
+                                else:
+                                    raise RuntimeError("INSTALLER_TEST_OPERATION")
+                                cls._append_jsonl(
+                                    request_log,
+                                    {
+                                        "body_hex": body.hex(),
+                                        "construction_lock_validated": True,
+                                        "fd_roles": request["fd_roles"],
+                                        "request_id": request["request_id"],
+                                    },
+                                )
+                                cls._append_jsonl(
+                                    response_log,
+                                    {
+                                        "request_id": request["request_id"],
+                                        "status": response_status,
+                                    },
+                                )
+                                if response_status == "TRANSPORT_DROPPED":
+                                    continue
+                                if response_status == "TRANSPORT_DROPPED_AFTER_JOURNAL":
+                                    journal = root / "service-journal.json"
+                                    journal.write_bytes(b'{"phase":"PREPARED"}\n')
+                                    with journal.open("rb") as stream:
+                                        os.fsync(stream.fileno())
+                                    cls._fsync_dir(root)
+                                    journal_created = True
+                                    continue
+                                cls._send_response(
+                                    connection,
+                                    transaction_lock=transaction_lock,
+                                    request=request,
+                                    status=response_status,
+                                )
+                            finally:
+                                os.close(construction_fd)
                         except BrokenPipeError:
                             continue
             finally:
@@ -481,12 +495,129 @@ class ForkedInstallerService:
         return cls(root, pid)
 
     @staticmethod
-    def _receive_request(connection: socket.socket) -> bytes:
-        header = ForkedInstallerService._receive_exact(connection, 4)
+    def _receive_request(
+        connection: socket.socket,
+        *,
+        construction_lock: Path,
+    ) -> tuple[bytes, dict[str, object], int]:
+        header, ancillary, flags, _ = connection.recvmsg(
+            4,
+            socket.CMSG_SPACE(array.array("i", [0]).itemsize),
+            socket.MSG_CMSG_CLOEXEC | socket.MSG_WAITALL,
+        )
+        rights = array.array("i")
+        invalid_kind = False
+        for level, kind, data in ancillary:
+            if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                invalid_kind = True
+            else:
+                rights.frombytes(data[: len(data) - len(data) % rights.itemsize])
+        if (
+            flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC)
+            or not header
+            or len(header) > 4
+            or invalid_kind
+            or len(rights) != 1
+        ):
+            for fd in rights:
+                os.close(fd)
+            raise RuntimeError("INSTALLER_TEST_REQUEST_HEADER_OR_ANCILLARY")
+        construction_fd = rights[0]
+        if len(header) < 4:
+            try:
+                header += ForkedInstallerService._receive_exact(
+                    connection, 4 - len(header)
+                )
+            except BaseException:
+                os.close(construction_fd)
+                raise
         length = struct.unpack("!I", header)[0]
         if length <= 0 or length > 1_048_576:
+            os.close(construction_fd)
             raise RuntimeError("INSTALLER_TEST_REQUEST_LENGTH")
-        return ForkedInstallerService._receive_exact(connection, length)
+        try:
+            body = ForkedInstallerService._receive_exact(connection, length)
+            request = json.loads(body)
+            if type(request) is not dict or set(request) != {
+                "schema_version", "operation", "request_id", "profile_sha256",
+                "payload", "fd_roles",
+            }:
+                raise RuntimeError("INSTALLER_TEST_REQUEST_SCHEMA")
+            if json.dumps(
+                request, sort_keys=True, separators=(",", ":")
+            ).encode() != body:
+                raise RuntimeError("INSTALLER_TEST_REQUEST_NONCANONICAL")
+            if request["schema_version"] != 1:
+                raise RuntimeError("INSTALLER_TEST_REQUEST_VERSION")
+            if (
+                request["operation"] not in {
+                    "install_closure", "recover_closure",
+                    "install_base_python", "recover_base_python",
+                }
+                or type(request["request_id"]) is not str
+                or not request["request_id"]
+                or type(request["profile_sha256"]) is not str
+                or len(request["profile_sha256"]) != 64
+            ):
+                raise RuntimeError("INSTALLER_TEST_REQUEST_VALUE")
+            if request["fd_roles"] != ["construction_lock"]:
+                raise RuntimeError("INSTALLER_TEST_REQUEST_FD_ROLES")
+            payload = request["payload"]
+            if type(payload) is not dict or set(payload) != {
+                "authorization_id", "construction_attempt",
+                "descriptor_or_intake_sha256", "destination_id",
+                "expected_destination_kind", "expected_source_kind",
+                "operation_token_sha256", "owner_token_sha256",
+                "recovery_generation", "recovery_token_sha256", "source_id",
+            }:
+                raise RuntimeError("INSTALLER_TEST_REQUEST_PAYLOAD")
+            recovery = request["operation"].startswith("recover_")
+            generation = payload["recovery_generation"]
+            recovery_token = payload["recovery_token_sha256"]
+            if recovery:
+                if type(generation) is not int or generation <= 0:
+                    raise RuntimeError("INSTALLER_TEST_RECOVERY_GENERATION")
+                if type(recovery_token) is not str or len(recovery_token) != 64:
+                    raise RuntimeError("INSTALLER_TEST_RECOVERY_TOKEN")
+            elif generation is not None or recovery_token is not None:
+                raise RuntimeError("INSTALLER_TEST_INSTALL_GENERATION")
+            contender = os.open(
+                construction_lock, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            )
+            try:
+                status = os.fstat(construction_fd)
+                expected = os.fstat(contender)
+                if (
+                    not (
+                        fcntl.fcntl(construction_fd, fcntl.F_GETFD)
+                        & fcntl.FD_CLOEXEC
+                    )
+                    or (status.st_dev, status.st_ino)
+                    != (expected.st_dev, expected.st_ino)
+                    or ForkedInstallerService._mount_id(construction_fd)
+                    != ForkedInstallerService._mount_id(contender)
+                    or stat.S_IMODE(status.st_mode) != 0o600
+                ):
+                    raise RuntimeError("INSTALLER_TEST_CONSTRUCTION_LOCK_IDENTITY")
+                try:
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise RuntimeError("INSTALLER_TEST_CONSTRUCTION_LOCK_NOT_HELD")
+            finally:
+                os.close(contender)
+            return body, request, construction_fd
+        except BaseException:
+            os.close(construction_fd)
+            raise
+
+    @staticmethod
+    def _mount_id(fd: int) -> int:
+        for line in Path(f"/proc/self/fdinfo/{fd}").read_text().splitlines():
+            if line.startswith("mnt_id:"):
+                return int(line.split(":", 1)[1])
+        raise RuntimeError("INSTALLER_TEST_LOCK_MOUNT_ID")
 
     @staticmethod
     def _receive_exact(connection: socket.socket, count: int) -> bytes:
@@ -503,16 +634,38 @@ class ForkedInstallerService:
         connection: socket.socket,
         *,
         transaction_lock: Path,
-        request: bytes,
+        request: dict[str, object],
         status: str,
     ) -> None:
-        request_id = hashlib.sha256(request).hexdigest()
+        request_payload = request["payload"]
+        post_prepared = status == "RECOVERED"
+        if status in {
+            "NO_JOURNAL_NO_MUTATION", "ABORTED_BEFORE_PREPARED", "RECOVERED",
+        } and not request["operation"].startswith("recover_"):
+            raise RuntimeError("INSTALLER_TEST_RESPONSE_OPERATION")
+        response_payload = {
+            "authorization_id": request_payload["authorization_id"],
+            "completion_sha256": "5" * 64 if post_prepared else None,
+            "component_hashes": {"base_python": "4" * 64}
+            if post_prepared else None,
+            "final_tree_sha256": "3" * 64 if post_prepared else None,
+            "operation": request["operation"],
+            "operation_token_sha256": request_payload["operation_token_sha256"],
+            "owner_token_sha256": request_payload["owner_token_sha256"],
+            "receipt_sha256": "6" * 64 if post_prepared else None,
+            "recovery_generation": request_payload["recovery_generation"],
+            "recovery_token_sha256": request_payload["recovery_token_sha256"],
+            "root_identity": {
+                "device": 1, "inode": 2, "mode": 0o555, "mount_id": 3,
+            } if post_prepared else None,
+            "terminal_phase": "BASE_COMPLETE" if post_prepared else status,
+        }
         payload = json.dumps(
             {
                 "schema_version": 1,
-                "request_id": request_id,
+                "request_id": request["request_id"],
                 "status": status,
-                "payload": {},
+                "payload": response_payload,
                 "error": None,
             },
             sort_keys=True,
@@ -522,16 +675,18 @@ class ForkedInstallerService:
             transaction_lock,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
         )
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        rights = array.array("i", [lock_fd])
-        connection.sendmsg(
-            [struct.pack("!I", len(payload)), payload],
-            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
-        )
-        os.close(lock_fd)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            rights = array.array("i", [lock_fd])
+            connection.sendmsg(
+                [struct.pack("!I", len(payload)), payload],
+                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+            )
+        finally:
+            os.close(lock_fd)
 
     @staticmethod
-    def _append_jsonl(path: Path, value: dict[str, str]) -> None:
+    def _append_jsonl(path: Path, value: dict[str, object]) -> None:
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
         with path.open("a", encoding="utf-8") as stream:
             stream.write(encoded)
@@ -552,16 +707,17 @@ class ForkedInstallerService:
         while time.monotonic() < deadline:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
             if pid == self.pid:
-                if os.waitstatus_to_exitcode(status) != 0:
+                exit_code = os.waitstatus_to_exitcode(status)
+                expected = {-signal.SIGTERM} if self._stop_requested else {0}
+                if exit_code not in expected:
                     raise RuntimeError("INSTALLER_TEST_SERVICE_EXIT")
                 return
             time.sleep(0.01)
         raise TimeoutError("INSTALLER_TEST_SERVICE_WAIT")
 
     def stop(self) -> None:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.connect(self.socket_path)
-            connection.sendall(struct.pack("!I", 8) + b"__stop__")
+        self._stop_requested = True
+        os.kill(self.pid, signal.SIGTERM)
 
     def request_bytes(self) -> list[bytes]:
         return [
@@ -573,6 +729,18 @@ class ForkedInstallerService:
         return [
             json.loads(line)["status"]
             for line in (self.root / "responses.jsonl").read_text().splitlines()
+        ]
+
+    def response_records(self) -> list[dict[str, object]]:
+        return [
+            json.loads(line)
+            for line in (self.root / "responses.jsonl").read_text().splitlines()
+        ]
+
+    def request_records(self) -> list[dict[str, object]]:
+        return [
+            json.loads(line)
+            for line in (self.root / "requests.jsonl").read_text().splitlines()
         ]
 
 
@@ -817,14 +985,18 @@ class FakeCliBackend:
                 unknown_remote_state=True,
             )
             return
-        if self.retirement_state == "pass":
+        if self.retirement_state in {"pass", "task-failed"}:
+            task_failed = self.retirement_state == "task-failed"
             populate_complete_evidence(store, episodes=(2, 3))
             store.finalize_terminal_manifest(
                 run_id=run_id,
                 episodes=(2, 3),
                 infrastructure_verdict="PASS",
-                overall_verdict="PASS",
-                task_results={"episode_2": True, "episode_3": True},
+                overall_verdict="FAIL" if task_failed else "PASS",
+                task_results={
+                    "episode_2": not task_failed,
+                    "episode_3": True,
+                },
                 owned_processes_alive=[],
                 unknown_remote_state=False,
                 unresolved_errors=[],
@@ -2862,6 +3034,7 @@ def test_pre_prepared_abort_never_derives_final_digest_path() -> None:
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 
 import pytest
@@ -2870,9 +3043,32 @@ from simple.eval_runtime.installer_manager import (
     DiskAuthorizationStore,
     InstallerOrchestrator,
 )
+from simple.eval_runtime.installer_client import encode_installer_request
 from .fakes import ForkedInstallerService
 
-INSTALL_BYTES = b'{"operation":"install_base_python","schema_version":1}\n'
+INSTALL_REQUEST = {
+    "fd_roles": ["construction_lock"],
+    "operation": "install_base_python",
+    "payload": {
+        "authorization_id": "install-authorization-1",
+        "construction_attempt": 1,
+        "descriptor_or_intake_sha256": "b" * 64,
+        "destination_id": None,
+        "expected_destination_kind": "base_python",
+        "expected_source_kind": "base_python_intake",
+        "operation_token_sha256": "c" * 64,
+        "owner_token_sha256": "d" * 64,
+        "recovery_generation": None,
+        "recovery_token_sha256": None,
+        "source_id": "base-python-intake-1",
+    },
+    "profile_sha256": "e" * 64,
+    "request_id": "install-base-python-attempt-1",
+    "schema_version": 1,
+}
+INSTALL_BYTES = json.dumps(
+    INSTALL_REQUEST, sort_keys=True, separators=(",", ":")
+).encode()
 CRASH_BOUNDARIES = (
     "before_authorization_append", "after_authorization_append",
     "before_active_reference_switch", "after_active_reference_switch",
@@ -2891,6 +3087,17 @@ LIVE_PERSISTENCE_BOUNDARIES = (
     "before_owner_parent_fsync", "after_owner_parent_fsync",
 )
 
+
+def test_complete_install_fixture_matches_production_encoder() -> None:
+    payload = INSTALL_REQUEST["payload"]
+    assert encode_installer_request(
+        operation=INSTALL_REQUEST["operation"],
+        request_id=INSTALL_REQUEST["request_id"],
+        profile_sha256=INSTALL_REQUEST["profile_sha256"],
+        **payload,
+    ) == INSTALL_BYTES
+
+
 @pytest.mark.parametrize("boundary", CRASH_BOUNDARIES)
 def test_fork_exit_restart_uses_real_wire_order_and_byte_exact_replay(
     boundary: str, tmp_path
@@ -2898,13 +3105,14 @@ def test_fork_exit_restart_uses_real_wire_order_and_byte_exact_replay(
     root = tmp_path / "manager-state"
     construction = tmp_path / "construction.lock"
     transaction = tmp_path / "transaction.lock"
-    service = ForkedInstallerService.start(
-        tmp_path / "service",
-        transaction_lock=transaction,
-    )
     DiskAuthorizationStore.bootstrap(
         root,
         install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
         construction_lock=construction,
         transaction_lock=transaction,
     )
@@ -2944,6 +3152,23 @@ def test_fork_exit_restart_uses_real_wire_order_and_byte_exact_replay(
     assert "NO_JOURNAL_NO_MUTATION" in responses
     assert "TRANSPORT_DROPPED_AFTER_JOURNAL" in responses
     assert responses[-1] == "RECOVERED"
+    records = service.request_records()
+    assert all(record["construction_lock_validated"] is True for record in records)
+    assert all(record["fd_roles"] == ["construction_lock"] for record in records)
+    decoded_requests = [json.loads(bytes.fromhex(record["body_hex"])) for record in records]
+    assert all(set(request) == {
+        "schema_version", "operation", "request_id", "profile_sha256", "payload",
+        "fd_roles",
+    } for request in decoded_requests)
+    assert all("recovery_generation" not in request for request in decoded_requests)
+    assert all(
+        request["payload"]["recovery_generation"] is not None
+        for request in decoded_requests
+        if request["operation"] == "recover_base_python"
+    )
+    assert [record["request_id"] for record in records] == [
+        record["request_id"] for record in service.response_records()
+    ]
     assert snapshot.replayed_install_sha256 == snapshot.install_request_sha256
     assert snapshot.terminal_response_status == "RECOVERED"
 
@@ -2963,9 +3188,14 @@ def test_live_persistence_failure_retains_both_locks_until_reconciled(
     )
     service = ForkedInstallerService.start(
         tmp_path / "service",
+        construction_lock=construction,
         transaction_lock=transaction,
-        script=("RECOVERED",),
+        script=("TRANSPORT_DROPPED_AFTER_JOURNAL", "RECOVERED"),
     )
+    initial = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(Exception, match="INSTALLER_TRANSPORT_UNCERTAIN"):
+        initial.begin_install()
+    initial.close_after_uncertain_transport()
     manager = InstallerOrchestrator.restart(root, service.socket_path)
     with pytest.raises(Exception, match="HANDOFF_PERSISTENCE_UNCERTAIN"):
         manager.drive_to_terminal(
@@ -2984,7 +3214,7 @@ def test_live_persistence_failure_retains_both_locks_until_reconciled(
     service.wait(timeout=5.0)
 ```
 
-`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child, reads the production length-prefixed request frame, appends the exact received bytes and response status to fsynced files, and sends terminal frames plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, fsyncs a journal and drops the byte-identical second install response, then returns the same `RECOVERED` result for generation 2 replays. A broken response socket never advances authorization state; request generation and the fsynced service journal determine the response. The explicit stop frame is sent only after the manager verifies terminal state. `InstallerOrchestrator` uses the production session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after actual request delivery and actual terminal-frame-plus-handoff receipt. A fresh orchestrator reopens only the fsynced prefix, performs any required wire operation, and cannot mark terminal without a newly received, validated, durably persisted terminal response. The assertion proves the two actual install frames are byte-identical. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
+`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child and receives each production length-prefixed canonical six-field request with exactly one construction-lock FD via `recvmsg(MSG_CMSG_CLOEXEC)`. Before recording or acting, it validates the exact `fd_roles`, FD count/CLOEXEC/device/inode/mode, and the fact that an independently opened construction-lock descriptor cannot acquire the already-held lock. It appends the exact received bytes, explicit request ID, and validation evidence to fsynced files, and sends operation-specific terminal frames that echo that request ID plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, fsyncs a journal and drops the byte-identical second install response, then returns the same `RECOVERED` result for generation 2 replays. A broken response socket never advances authorization state; request generation and the fsynced service journal determine the response. Test-only shutdown signals the owned child only after the manager verifies terminal state; there is no unauthenticated stop request. `InstallerOrchestrator` uses the production `sendmsg` session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after authenticated request delivery and actual terminal-frame-plus-handoff receipt. A fresh orchestrator reopens only the fsynced prefix, performs any required authenticated wire operation, and cannot mark terminal without a newly received, schema-valid, durably persisted terminal response. Assertions prove the two actual install frames are byte-identical, all generations are inside `payload`, and every accepted request carried the stable construction-lock FD. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
 
 - [ ] **Step 2: Write failing systemd/config exactness tests**
 
@@ -3051,6 +3281,157 @@ import stat
 import struct
 from dataclasses import dataclass
 from typing import Any, Mapping
+
+INSTALLER_REQUEST_KEYS = {
+    "schema_version", "operation", "request_id", "profile_sha256", "payload",
+    "fd_roles",
+}
+INSTALLER_PAYLOAD_KEYS = {
+    "authorization_id", "construction_attempt", "descriptor_or_intake_sha256",
+    "destination_id", "expected_destination_kind", "expected_source_kind",
+    "operation_token_sha256", "owner_token_sha256", "recovery_generation",
+    "recovery_token_sha256", "source_id",
+}
+INSTALLER_RESPONSE_PAYLOAD_KEYS = {
+    "authorization_id", "completion_sha256", "component_hashes",
+    "final_tree_sha256", "operation", "operation_token_sha256",
+    "owner_token_sha256", "receipt_sha256", "recovery_generation",
+    "recovery_token_sha256", "root_identity", "terminal_phase",
+}
+
+
+def decode_exact_installer_request(request_bytes: bytes) -> dict[str, object]:
+    request = json.loads(request_bytes)
+    if type(request) is not dict or set(request) != INSTALLER_REQUEST_KEYS:
+        raise RuntimeError("INSTALLER_REQUEST_SCHEMA")
+    canonical = json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+    if canonical != request_bytes:
+        raise RuntimeError("INSTALLER_REQUEST_NONCANONICAL")
+    if (
+        request["schema_version"] != 1
+        or request["operation"] not in {
+            "install_closure", "recover_closure",
+            "install_base_python", "recover_base_python",
+        }
+        or type(request["request_id"]) is not str
+        or not request["request_id"]
+        or type(request["profile_sha256"]) is not str
+        or len(request["profile_sha256"]) != 64
+        or request["fd_roles"] != ["construction_lock"]
+    ):
+        raise RuntimeError("INSTALLER_REQUEST_VALUE")
+    payload = request["payload"]
+    if type(payload) is not dict or set(payload) != INSTALLER_PAYLOAD_KEYS:
+        raise RuntimeError("INSTALLER_REQUEST_PAYLOAD_SCHEMA")
+    for key in (
+        "authorization_id", "expected_destination_kind", "expected_source_kind",
+        "source_id",
+    ):
+        if type(payload[key]) is not str or not payload[key]:
+            raise RuntimeError("INSTALLER_REQUEST_PAYLOAD_VALUE")
+    for key in (
+        "descriptor_or_intake_sha256", "operation_token_sha256",
+        "owner_token_sha256",
+    ):
+        if type(payload[key]) is not str or len(payload[key]) != 64:
+            raise RuntimeError("INSTALLER_REQUEST_PAYLOAD_DIGEST")
+    if payload["destination_id"] is not None and (
+        type(payload["destination_id"]) is not str or not payload["destination_id"]
+    ):
+        raise RuntimeError("INSTALLER_REQUEST_DESTINATION_ID")
+    base_python = str(request["operation"]).endswith("base_python")
+    attempt = payload["construction_attempt"]
+    if base_python:
+        if type(attempt) is not int or attempt <= 0:
+            raise RuntimeError("INSTALLER_REQUEST_CONSTRUCTION_ATTEMPT")
+    elif attempt is not None:
+        raise RuntimeError("INSTALLER_REQUEST_CLOSURE_ATTEMPT")
+    recovery = str(request["operation"]).startswith("recover_")
+    generation = payload["recovery_generation"]
+    recovery_token = payload["recovery_token_sha256"]
+    if recovery:
+        if type(generation) is not int or generation <= 0:
+            raise RuntimeError("INSTALLER_REQUEST_RECOVERY_GENERATION")
+        if type(recovery_token) is not str or len(recovery_token) != 64:
+            raise RuntimeError("INSTALLER_REQUEST_RECOVERY_TOKEN")
+    elif generation is not None or recovery_token is not None:
+        raise RuntimeError("INSTALLER_REQUEST_INSTALL_GENERATION")
+    return request
+
+
+def encode_installer_request(
+    *,
+    operation: str,
+    request_id: str,
+    profile_sha256: str,
+    authorization_id: str,
+    expected_source_kind: str,
+    expected_destination_kind: str,
+    source_id: str,
+    destination_id: str | None,
+    descriptor_or_intake_sha256: str,
+    owner_token_sha256: str,
+    operation_token_sha256: str,
+    recovery_token_sha256: str | None,
+    construction_attempt: int | None,
+    recovery_generation: int | None,
+) -> bytes:
+    request = {
+        "fd_roles": ["construction_lock"],
+        "operation": operation,
+        "payload": {
+            "authorization_id": authorization_id,
+            "construction_attempt": construction_attempt,
+            "descriptor_or_intake_sha256": descriptor_or_intake_sha256,
+            "destination_id": destination_id,
+            "expected_destination_kind": expected_destination_kind,
+            "expected_source_kind": expected_source_kind,
+            "operation_token_sha256": operation_token_sha256,
+            "owner_token_sha256": owner_token_sha256,
+            "recovery_generation": recovery_generation,
+            "recovery_token_sha256": recovery_token_sha256,
+            "source_id": source_id,
+        },
+        "profile_sha256": profile_sha256,
+        "request_id": request_id,
+        "schema_version": 1,
+    }
+    encoded = json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+    decode_exact_installer_request(encoded)
+    return encoded
+
+
+def validate_reply_for_request(
+    reply: "InstallerReply", request: Mapping[str, object]
+) -> None:
+    payload = reply.payload
+    request_payload = request["payload"]
+    if type(payload) is not dict or set(payload) != INSTALLER_RESPONSE_PAYLOAD_KEYS:
+        raise RuntimeError("INSTALLER_RESPONSE_PAYLOAD_SCHEMA")
+    echoed = {
+        "authorization_id", "operation_token_sha256", "owner_token_sha256",
+        "recovery_generation", "recovery_token_sha256",
+    }
+    if payload["operation"] != request["operation"] or any(
+        payload[key] != request_payload[key] for key in echoed
+    ):
+        raise RuntimeError("INSTALLER_RESPONSE_PAYLOAD_IDENTITY")
+    null_result = reply.status in {
+        "NO_JOURNAL_NO_MUTATION", "ABORTED_BEFORE_PREPARED",
+    }
+    final_fields = (
+        "completion_sha256", "component_hashes", "final_tree_sha256",
+        "receipt_sha256", "root_identity",
+    )
+    if null_result and any(payload[key] is not None for key in final_fields):
+        raise RuntimeError("INSTALLER_RESPONSE_NULL_RESULT")
+    if not null_result and any(payload[key] is None for key in final_fields):
+        raise RuntimeError("INSTALLER_RESPONSE_FINAL_RESULT")
+    recovery = str(request["operation"]).startswith("recover_")
+    if reply.status in {
+        "NO_JOURNAL_NO_MUTATION", "ABORTED_BEFORE_PREPARED", "RECOVERED",
+    } and not recovery:
+        raise RuntimeError("INSTALLER_RESPONSE_OPERATION")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3236,26 +3617,44 @@ class UnixInstallerSession:
         self,
         socket_path: os.PathLike[str],
         *,
+        construction_lock_fd: int,
         expected_lock: LockIdentity,
     ) -> None:
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._socket.connect(os.fspath(socket_path))
+        self._construction_lock_fd = construction_lock_fd
         self._expected_lock = expected_lock
         self._request_id: str | None = None
+        self._request: dict[str, object] | None = None
 
     def send_request(self, request_bytes: bytes) -> None:
-        self._request_id = hashlib.sha256(request_bytes).hexdigest()
+        request = decode_exact_installer_request(request_bytes)
+        self._request_id = str(request["request_id"])
+        self._request = request
         frame = struct.pack("!I", len(request_bytes)) + request_bytes
-        self._socket.sendall(frame)
+        rights = array.array("i", [self._construction_lock_fd])
+        sent = self._socket.sendmsg(
+            [frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)]
+        )
+        if sent <= 0:
+            raise TransportUncertain("INSTALLER_REQUEST_SEND")
+        view = memoryview(frame)
+        while sent < len(frame):
+            count = self._socket.send(view[sent:])
+            if count <= 0:
+                raise TransportUncertain("INSTALLER_REQUEST_SEND")
+            sent += count
 
     def receive_reply(self) -> InstallerReply:
-        if self._request_id is None:
+        if self._request_id is None or self._request is None:
             raise RuntimeError("INSTALLER_REQUEST_NOT_SENT")
-        return recv_installer_reply(
+        reply = recv_installer_reply(
             self._socket.fileno(),
             request_id=self._request_id,
             expected_lock=self._expected_lock,
         )
+        validate_reply_for_request(reply, self._request)
+        return reply
 
     def close(self) -> None:
         self._socket.close()
@@ -3305,6 +3704,13 @@ class InstallerManagerOwnership:
         self._retained: RetainedHandoff | None = None
         self._closed = False
         store.validate_locked_construction_fd(construction_lock_fd)
+
+    @property
+    def construction_lock_fd(self) -> int:
+        if self._closed:
+            raise RuntimeError("CONSTRUCTION_LOCK_CLOSED")
+        self.store.validate_locked_construction_fd(self._construction_lock_fd)
+        return self._construction_lock_fd
 
     @classmethod
     def open(
@@ -3429,8 +3835,6 @@ class InstallerOrchestrator:
                 self.store.record_transport_uncertain(decision)
                 self.store.fsync_owner_and_parent()
                 continue
-            if decision.is_resubmission and fault_hook is not None:
-                fault_hook("after_resubmission")
             self.ownership.persist_received_reply(
                 decision,
                 reply,
@@ -3474,6 +3878,7 @@ class InstallerOrchestrator:
     ) -> InstallerReply:
         session = UnixInstallerSession(
             self.socket_path,
+            construction_lock_fd=self.ownership.construction_lock_fd,
             expected_lock=self.store.transaction_lock_identity,
         )
         try:
@@ -3482,6 +3887,8 @@ class InstallerOrchestrator:
             session.send_request(decision.request_bytes)
             if fault_hook is not None:
                 fault_hook("after_request_delivery")
+                if decision.is_resubmission:
+                    fault_hook("after_resubmission")
                 fault_hook("before_terminal_handoff_receipt")
             reply = session.receive_reply()
             if fault_hook is not None:
@@ -3493,7 +3900,7 @@ class InstallerOrchestrator:
             session.close()
 ```
 
-`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. Its root manifest pins the construction- and transaction-lock device/inode/mount identities and original install digest. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks. `persist_received_reply` places result-append and handoff-close hooks around the received reply's actual durable transition. Reactivation, terminal-clear, and resubmission hooks surround those real orchestration operations, never a synthetic reply. `validated_snapshot`, `recovery_decision`, `reconcile_exact_reply`, and restart methods reopen all files with `openat2`/no-follow semantics, reject any invalid suffix or temporary entry, verify both independent hash chains and the active-reference digest, and never infer state from an un-fsynced pending file. Live reconciliation closes neither FD on any error. Restart acquires the pinned construction lock and uses only the fsynced prefix, but it can reach terminal only by driving the next required wire request through a newly opened production session and persisting the newly received response.
+`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. Its root manifest pins the construction- and transaction-lock device/inode/mount identities and original install digest. It calls only `encode_installer_request` for install and recovery documents. Every generated wire document therefore has exactly the six top-level request keys, keeps construction-attempt and recovery-generation fields inside the exact operation payload, and records an explicit request ID that byte-identical replay preserves. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks, passing its still-locked construction FD to `UnixInstallerSession`; the session derives response matching from the explicit request ID rather than the body digest. `persist_received_reply` places result-append and handoff-close hooks around the received reply's actual durable transition. Reactivation, terminal-clear, and resubmission hooks surround those real orchestration operations, never a synthetic reply. `validated_snapshot`, `recovery_decision`, `reconcile_exact_reply`, and restart methods reopen all files with `openat2`/no-follow semantics, reject any invalid suffix or temporary entry, verify both independent hash chains and the active-reference digest, and never infer state from an un-fsynced pending file. Live reconciliation closes neither FD on any error. Restart acquires the pinned construction lock and uses only the fsynced prefix, but it can reach terminal only by driving the next required authenticated wire request through a newly opened production session and persisting the newly received response.
 
 `AuthorizationHistory.append_recovery()` requires generation `last + 1`, a fresh token and authorization ID, `previous_entry_sha256=None` for generation 1 and otherwise the exact canonical digest of the preceding authorization entry, a monotonic authorization sequence, and one active reference. `RecoveryResultHistory.append()` separately requires a contiguous result prefix and `previous_result_sha256=None` for its first result and otherwise the preceding result digest. Authorization objects contain no result field, and result entries never participate in the authorization chain. `NO_JOURNAL_NO_MUTATION` reactivates the unchanged install authorization and byte-identical request; every further uncertainty appends a new recovery generation. Neither history overwrites or reorders an entry, marks an older entry active, or uses `pending_action` as authority.
 
@@ -3504,7 +3911,9 @@ class InstallerOrchestrator:
 Both binaries use `installer.rs` and enforce this order:
 
 ```text
-SO_PEERCRED -> fixed request schema -> stable construction lock identity ->
+SO_PEERCRED -> recvmsg(MSG_CMSG_CLOEXEC) exact request plus one SCM_RIGHTS FD ->
+six-field canonical schema and exact fd_roles=[construction_lock] ->
+stable construction lock FD CLOEXEC/device/inode/mode/held-lock proof ->
 preliminary no-follow current owner record and manager PID/start ticks ->
 independently open root-owned transaction lock -> flock(LOCK_EX) ->
 close the preliminary owner FD -> fresh openat2 of the current owner-record path ->
@@ -3535,7 +3944,7 @@ before/after receipt O_EXCL; after receipt fsync; after RECEIPT_CREATED;
 before response; before sendmsg; after sendmsg; before local FD close; during shutdown
 ```
 
-For each point assert a restart produces either no final path or one manifest-valid immutable final path with exactly one byte-identical receipt. Add the mandatory generation-1 no-journal → identical install replay → post-journal uncertainty → generation-2 recovery sentinel. Run two concurrent installers and two concurrent recoverers; require one mutation winner and zero signals/deletions by losers.
+For each point assert a restart produces either no final path or one manifest-valid immutable final path with exactly one byte-identical receipt. Drive every case through the six-field canonical request transport with one already-locked construction FD. Add one-mutation-at-a-time rejection cases for missing/extra/wrong FDs, ancillary truncation, wrong `fd_roles`, generation fields outside `payload`, noncanonical JSON, and an echoed request-ID mismatch; every rejection must precede journal access. Add the mandatory generation-1 no-journal → identical install replay → post-journal uncertainty → generation-2 recovery sentinel. Run two concurrent installers and two concurrent recoverers; require one mutation winner and zero signals/deletions by losers.
 
 Add a production-service owner-record race: instance A reads owner generation 1 and pauses before the transaction lock; the manager atomically installs generation 2; instance B queues; A acquires first, reopens the current owner path, and must return `AUTHORIZATION_STALE` without journal or mutation; B then reopens generation 2 and is the sole journal/mutation winner. Assert the service never authorizes from the preliminary FD or its cached bytes.
 
@@ -4944,6 +5353,48 @@ def test_interrupted_gate9_run_is_terminalized_preserved_and_retired(
     assert read_run_id_handoff(handoff) == "eval-new"
 
 
+def test_normal_task_failure_with_clean_infrastructure_can_retire_for_retry(
+    tmp_path: Path,
+) -> None:
+    output_parent = tmp_path / "workloads"
+    output_parent.mkdir(mode=0o700)
+    store = EvidenceStore.create(output_parent, run_id="eval-task-failed")
+    populate_complete_evidence(store, episodes=(2, 3))
+    store.write("task-failure-proof.json", {"schema_version": 1, "success": False})
+    store.finalize_terminal_manifest(
+        run_id="eval-task-failed",
+        episodes=(2, 3),
+        infrastructure_verdict="PASS",
+        overall_verdict="FAIL",
+        task_results={"episode_2": False, "episode_3": True},
+        owned_processes_alive=[],
+        unknown_remote_state=False,
+        unresolved_errors=[],
+    )
+    manifest_before = (store.root / "manifest.json").read_bytes()
+    artifact_before = (store.root / "task-failure-proof.json").read_bytes()
+    handoff = tmp_path / "evaluation-run-id"
+    create_run_id_handoff(handoff, "eval-task-failed")
+
+    receipt = Gate9HandoffReconciler(
+        output_parent,
+        recover_owned_run=lambda run_id, run_root: None,
+    ).reconcile_and_retire(handoff, reason="interrupted-retry")
+
+    assert receipt.verdict == "FAIL"
+    assert (store.root / "manifest.json").read_bytes() == manifest_before
+    assert (store.root / "task-failure-proof.json").read_bytes() == artifact_before
+    verified = store.verify_terminal_manifest(expected_run_id="eval-task-failed")
+    assert verified.infrastructure_verdict == "PASS"
+    assert verified.overall_verdict == "FAIL"
+    assert verified.owned_processes_alive == ()
+    assert verified.unknown_remote_state is False
+    assert (store.root / "operator-handoff-retired.json").is_file()
+    assert not handoff.exists()
+    create_run_id_handoff(handoff, "eval-fresh")
+    assert read_run_id_handoff(handoff) == "eval-fresh"
+
+
 def test_gate9_interrupt_before_run_root_creates_failed_evidence_root(
     tmp_path: Path,
 ) -> None:
@@ -5322,6 +5773,28 @@ def test_complete_retirement_options_use_canonical_reconciler(tmp_path: Path) ->
     ).is_file()
 
 
+def test_cli_retires_clean_task_failure_and_allows_fresh_run_id(tmp_path: Path) -> None:
+    output_parent, handoff = _make_retirement_fixture(tmp_path)
+    backend = FakeCliBackend()
+    backend.retirement_state = "task-failed"
+    partial = output_parent / "eval-old" / "partial-evidence.json"
+    partial_before = partial.read_bytes()
+    result = runner.invoke(
+        app,
+        ["stop", *_flatten(_retirement_groups(output_parent, handoff))],
+        obj=backend,
+    )
+    assert result.exit_code == 0, result.stdout
+    assert backend.signals == []
+    assert partial.read_bytes() == partial_before
+    assert (
+        output_parent / "eval-old" / "operator-handoff-retired.json"
+    ).is_file()
+    assert not handoff.exists()
+    create_run_id_handoff(handoff, "eval-fresh")
+    assert read_run_id_handoff(handoff) == "eval-fresh"
+
+
 @pytest.mark.parametrize(
     "missing",
     ["recover", "output", "handoff", "enable", "reason"],
@@ -5503,7 +5976,7 @@ def _verify_terminal_manifest(
 
 `EvidenceStore.finalize_terminal_manifest(...)` first freezes the command and state-transition streams, no-follow enumerates every current allowlisted regular payload, computes the sorted `artifact_index` and independent `command_index`, validates exact types, writes `manifest.json` with `O_EXCL` plus file/parent fsync, then immediately calls `_verify_terminal_manifest`. `EvidenceStore.verify_terminal_manifest` is the public bound form of that same verifier; no caller re-parses selected keys. A FAIL manifest may contain the fsynced operation prefix rather than every PASS-only artifact, but it must index every existing artifact and command and contain all five terminal cleanup records. PASS additionally requires every `mandatory_evidence_paths(episodes)` entry. Any changed, absent, extra, unindexed, duplicate, out-of-order, or path-escaping artifact/command makes verification fail. The Markdown rendering and Gate 9 retirement receipt are deliberately late derived files and are the only unindexed exceptions.
 
-The same module imports `hashlib`, `json`, `os`, `stat`, `dataclass`, `Path`, and `Callable`, then implements `create_run_id_handoff`, `read_run_id_handoff`, `remove_run_id_handoff`, and `Gate9HandoffReconciler`. Creation uses `O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW`, mode `0600`, one validated run ID plus newline, file fsync, and parent fsync. Reading uses `O_RDONLY|O_CLOEXEC|O_NOFOLLOW` and requires a regular single-link file owned by the current UID, exact mode `0600`, bounded size, one newline, and a valid identifier. Removal reopens and revalidates the current path, requires the expected run ID plus the originally captured path/FD identity, unlinks by parent FD only after acceptance or authenticated failed-run reconciliation, and fsyncs the parent. The reconciler opens the attested output parent and exact existing run root without following links. If interruption occurred after handoff creation but before the run root, `EvidenceStore.open_or_create_reconciliation` alone may exclusively create that exact child and fsync an immutable `prestart-interruption.json` binding the handoff identity; no ordinary existing run is adopted by that path. It then invokes normal owned stale cleanup and calls the same `verify_terminal_manifest` used by final acceptance. Only a fully indexed canonical terminal infrastructure-FAIL manifest with zero live owned processes and known-clean remote state can authorize the immutable retirement receipt and exact handoff unlink. A toy subset, changed artifact, missing command digest, PASS, foreign/unknown ownership, incomplete cleanup, changed inode, mismatched run ID, or missing/nonterminal manifest retains the handoff and forbids a fresh Gate 9 run.
+The same module imports `hashlib`, `json`, `os`, `stat`, `dataclass`, `Path`, and `Callable`, then implements `create_run_id_handoff`, `read_run_id_handoff`, `remove_run_id_handoff`, and `Gate9HandoffReconciler`. Creation uses `O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW`, mode `0600`, one validated run ID plus newline, file fsync, and parent fsync. Reading uses `O_RDONLY|O_CLOEXEC|O_NOFOLLOW` and requires a regular single-link file owned by the current UID, exact mode `0600`, bounded size, one newline, and a valid identifier. Removal reopens and revalidates the current path, requires the expected run ID plus the originally captured path/FD identity, unlinks by parent FD only after acceptance or authenticated failed-run reconciliation, and fsyncs the parent. The reconciler opens the attested output parent and exact existing run root without following links. If interruption occurred after handoff creation but before the run root, `EvidenceStore.open_or_create_reconciliation` alone may exclusively create that exact child and fsync an immutable `prestart-interruption.json` binding the handoff identity; no ordinary existing run is adopted by that path. It then invokes normal owned stale cleanup and calls the same `verify_terminal_manifest` used by final acceptance. Only a fully indexed canonical terminal overall-FAIL manifest with zero live owned processes and known-clean remote state can authorize the immutable retirement receipt and exact handoff unlink. Infrastructure may be `FAIL`, or it may be `PASS` when a normally completed episode failed its task; both cases preserve the complete old run and receive a new run ID only after verified terminal cleanup. A toy subset, changed artifact, missing command digest, overall `PASS`, foreign/unknown ownership, incomplete cleanup, changed inode, mismatched run ID, or missing/nonterminal manifest retains the handoff and forbids a fresh Gate 9 run.
 
 ```python
 # src/simple/eval_runtime/evidence.py (run-ID handoff helpers)
@@ -5661,8 +6134,7 @@ class Gate9HandoffReconciler:
         verified = store.verify_terminal_manifest(expected_run_id=run_id)
         if (
             verified.lifecycle != "TERMINAL"
-            or verified.infrastructure_verdict != "FAIL"
-            or verified.overall_verdict == "PASS"
+            or verified.overall_verdict != "FAIL"
             or verified.owned_processes_alive != ()
             or verified.unknown_remote_state is not False
         ):
@@ -5770,7 +6242,7 @@ Persist/fsync each transition before the next external action. Register cleanup 
 
 - [ ] **Step 7: Implement the CLI and script entrypoints**
 
-`cli.py` defines a Typer `app` with exact commands `freeze-provenance`, `create`, `status`, `evaluate`, and `stop`; only `stop` accepts `--recover-stale RUN_ID`. Its Gate 9 reconciliation form additionally requires the indivisible set `--output-root PARENT --run-id-handoff FILE --retire-terminal-handoff --retire-reason interrupted-retry`. Parse those five option groups into one `RetirementOptions` value before obtaining a backend or performing cleanup; zero groups means ordinary stop, all five means retirement, and every other subset is rejected. The complete form invokes `Gate9HandoffReconciler` with the normal identity-checked owned cleanup backend. The reconciler accepts only the canonical full-manifest verifier result; PASS, foreign, unknown, and nonterminal states retain the handoff and issue no signal. Every mutating command interprets `--output-root` as the existing attested workload-parent directory and combines it with the separately validated `--run-id`; it never accepts a full child path in `--output-root`. `create --preflight-only` is the Gate-4 form: it requires `<output-root>/<run-id>` to be absent, exclusively creates that child, executes the exact local and leased preflight used by normal `create`, including `prepare_output` and the distinct loader/CUDA probes, then releases the lease after proving no helper/container/workload exists. It never calls Docker create and records a terminal preflight-only manifest. Normal `create` has no changed behavior. `evaluate` likewise requires an existing approved parent plus an absent run-ID child, exact `--episodes 2,3`, optional unbound loopback `--local-port` default 22085, and existing approved profile/container. All subprocesses receive argv arrays and monotonic deadlines through injectable runners; no `shell=True`, `os.system`, glob kill, force option, or prior-output mutation exists.
+`cli.py` defines a Typer `app` with exact commands `freeze-provenance`, `create`, `status`, `evaluate`, and `stop`; only `stop` accepts `--recover-stale RUN_ID`. Its Gate 9 reconciliation form additionally requires the indivisible set `--output-root PARENT --run-id-handoff FILE --retire-terminal-handoff --retire-reason interrupted-retry`. Parse those five option groups into one `RetirementOptions` value before obtaining a backend or performing cleanup; zero groups means ordinary stop, all five means retirement, and every other subset is rejected. The complete form invokes `Gate9HandoffReconciler` with the normal identity-checked owned cleanup backend. The reconciler accepts only the canonical full-manifest verifier result; overall `PASS`, foreign, unknown, and nonterminal states retain the handoff and issue no signal, while infrastructure `PASS` plus overall `FAIL` is a valid clean task-failure retirement. Every mutating command interprets `--output-root` as the existing attested workload-parent directory and combines it with the separately validated `--run-id`; it never accepts a full child path in `--output-root`. `create --preflight-only` is the Gate-4 form: it requires `<output-root>/<run-id>` to be absent, exclusively creates that child, executes the exact local and leased preflight used by normal `create`, including `prepare_output` and the distinct loader/CUDA probes, then releases the lease after proving no helper/container/workload exists. It never calls Docker create and records a terminal preflight-only manifest. Normal `create` has no changed behavior. `evaluate` likewise requires an existing approved parent plus an absent run-ID child, exact `--episodes 2,3`, optional unbound loopback `--local-port` default 22085, and existing approved profile/container. All subprocesses receive argv arrays and monotonic deadlines through injectable runners; no `shell=True`, `os.system`, glob kill, force option, or prior-output mutation exists.
 
 `freeze-provenance --phase` accepts exactly `pc2`, `h100`, or `verify`; all three require the same existing run ID and immutable output root. `status` accepts optional `--run-id` plus `--verify-evidence` and remains read-only. `evaluate --stop-after` is absent by default and accepts only `warmup`; it is recorded as Gate-7 infrastructure evidence and exits through the full cleanup path before any runner episode operation. None of these options adds a sixth lifecycle command.
 
@@ -7314,7 +7786,7 @@ print(read_run_id_handoff(Path(sys.argv[1])))
   --local-port 22085
 ```
 
-Expected: an absent handoff proceeds immediately. A retained handoff first authenticates its exact old run, completes only identity-owned cleanup, writes a terminal FAIL manifest plus immutable retirement receipt, preserves the whole old run, and retires the exact handoff inode. PASS, foreign, unknown, or nonterminal old state stops before a new ID is generated. Then one exclusive lease, protected preflight, container/server/tracer/tunnel/warm-up, runner probes, episode 2 and 3, reverse-order cleanup, exited container, and lease release all complete. The evaluator command is exactly the approved `psi0_decoupled_wbc`, `mujoco_isaac`, headless, one-worker, managed-FD, standard-video argv. No third-person flag or real interface exists.
+Expected: an absent handoff proceeds immediately. A retained handoff first authenticates its exact old run, completes only identity-owned cleanup, verifies a terminal overall-FAIL manifest, writes an immutable retirement receipt, preserves the whole old run, and retires the exact handoff inode. Infrastructure `FAIL`, or infrastructure `PASS` with a normal task failure, may retire; overall `PASS`, foreign, unknown, or nonterminal old state stops before a new ID is generated. Then one exclusive lease, protected preflight, container/server/tracer/tunnel/warm-up, runner probes, episode 2 and 3, reverse-order cleanup, exited container, and lease release all complete. The evaluator command is exactly the approved `psi0_decoupled_wbc`, `mujoco_isaac`, headless, one-worker, managed-FD, standard-video argv. No third-person flag or real interface exists.
 
 - [ ] **Step 3: Validate runtime-contract/event ordering for both episodes**
 
