@@ -73,7 +73,7 @@ Later tasks must use these names and signatures exactly:
 
 The concrete signatures and bodies appear in the task that first creates each module. Later tasks must import those symbols rather than defining a second version.
 
-The native wire protocol is canonical UTF-8 JSON preceded by one unsigned 32-bit big-endian length. A request contains exactly `schema_version`, `operation`, `request_id`, `profile_sha256`, `payload`, and `fd_roles`; a response contains exactly `schema_version`, `request_id`, `status`, `payload`, and `error`. The terminal installer response transfers exactly one still-locked, `FD_CLOEXEC` transaction-lock descriptor by `SCM_RIGHTS`. The manager persists the required authorization/result transition before closing that descriptor; EOF has no state-transition meaning.
+The native wire protocol is canonical UTF-8 JSON preceded by one unsigned 32-bit big-endian length. A request contains exactly `schema_version`, `operation`, `request_id`, `profile_sha256`, `payload`, and `fd_roles`; a response contains exactly `schema_version`, `request_id`, `status`, `payload`, and `error`. Install success is exactly `INSTALLED`; recovery accepts exactly `NO_JOURNAL_NO_MUTATION`, `ABORTED_BEFORE_PREPARED`, or `RECOVERED`, with operation-specific terminal phases and final-field nullability defined in Task 5. The terminal installer response transfers exactly one still-locked, `FD_CLOEXEC` transaction-lock descriptor by `SCM_RIGHTS`. FD ownership transfers to the manager before frame decoding or semantic validation. Every valid or malformed response with that valid handoff is durably transitioned before closing the descriptor; missing or invalid handoffs use only the stable construction-lock uncertainty path. EOF has no state-transition meaning.
 
 ## Global test commands
 
@@ -399,6 +399,7 @@ class ForkedInstallerService:
         construction_lock: Path,
         transaction_lock: Path,
         script: tuple[str, ...] | None = None,
+        response_fault: str | None = None,
     ) -> "ForkedInstallerService":
         root.mkdir(mode=0o700)
         transaction_lock.touch(mode=0o600)
@@ -462,7 +463,7 @@ class ForkedInstallerService:
                                     response_log,
                                     {
                                         "request_id": request["request_id"],
-                                        "status": response_status,
+                                        "status": response_fault or response_status,
                                     },
                                 )
                                 if response_status == "TRANSPORT_DROPPED":
@@ -480,6 +481,7 @@ class ForkedInstallerService:
                                     transaction_lock=transaction_lock,
                                     request=request,
                                     status=response_status,
+                                    fault=response_fault,
                                 )
                             finally:
                                 os.close(construction_fd)
@@ -636,9 +638,12 @@ class ForkedInstallerService:
         transaction_lock: Path,
         request: dict[str, object],
         status: str,
+        fault: str | None = None,
     ) -> None:
         request_payload = request["payload"]
-        post_prepared = status == "RECOVERED"
+        post_prepared = status in {"INSTALLED", "RECOVERED"}
+        if status == "INSTALLED" and not request["operation"].startswith("install_"):
+            raise RuntimeError("INSTALLER_TEST_RESPONSE_OPERATION")
         if status in {
             "NO_JOURNAL_NO_MUTATION", "ABORTED_BEFORE_PREPARED", "RECOVERED",
         } and not request["operation"].startswith("recover_"):
@@ -658,29 +663,46 @@ class ForkedInstallerService:
             "root_identity": {
                 "device": 1, "inode": 2, "mode": 0o555, "mount_id": 3,
             } if post_prepared else None,
-            "terminal_phase": "BASE_COMPLETE" if post_prepared else status,
+            "terminal_phase": (
+                "BASE_COMPLETE"
+                if post_prepared and request["operation"].endswith("base_python")
+                else "COMPLETE" if post_prepared else status
+            ),
         }
+        response = {
+            "schema_version": 1,
+            "request_id": request["request_id"],
+            "status": status,
+            "payload": response_payload,
+            "error": None,
+        }
+        if fault == "malformed_schema":
+            response.pop("error")
+        elif fault == "request_id_mismatch":
+            response["request_id"] = "not-the-request"
+        elif fault == "payload_identity_mismatch":
+            response_payload["authorization_id"] = "not-the-authorization"
         payload = json.dumps(
-            {
-                "schema_version": 1,
-                "request_id": request["request_id"],
-                "status": status,
-                "payload": response_payload,
-                "error": None,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
+            response, sort_keys=True, separators=(",", ":")
         ).encode()
+        lock_path = transaction_lock
+        if fault == "wrong_handoff":
+            lock_path = transaction_lock.with_name("foreign-transaction.lock")
+            lock_path.touch(mode=0o600)
         lock_fd = os.open(
-            transaction_lock,
+            lock_path,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
         )
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            rights = array.array("i", [lock_fd])
+            rights = array.array("i", [] if fault == "missing_handoff" else [lock_fd])
+            body = payload[: max(1, len(payload) // 2)] if fault == "partial_body" else payload
+            ancillary = [] if not rights else [
+                (socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)
+            ]
             connection.sendmsg(
-                [struct.pack("!I", len(payload)), payload],
-                [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+                [struct.pack("!I", len(payload)), body],
+                ancillary,
             )
         finally:
             os.close(lock_fd)
@@ -2818,7 +2840,7 @@ def test_manager_fsyncs_transition_before_closing_handoff(
     fcntl.flock(handoff_fd, fcntl.LOCK_EX)
     real_close = os.close
     monkeypatch.setattr(os, "close", lambda fd: order.append(f"close:{fd}"))
-    reply = InstallerReply("PREPARED", {}, "a" * 64, handoff_fd)
+    reply = InstallerReply("INSTALLED", {}, "a" * 64, handoff_fd)
     apply_locked_reply(RecordingHistory(order), reply, expected_lock=expected)
     assert order == [
         "install_authorization",
@@ -2853,7 +2875,7 @@ def test_failed_transition_retains_handoff_and_blocks_waiter(
     handoff_fd = os.open(lock, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     fcntl.flock(handoff_fd, fcntl.LOCK_EX)
     history = RecordingHistory([], fail_at=(transition, edge))
-    reply = InstallerReply("PREPARED", {}, "a" * 64, handoff_fd)
+    reply = InstallerReply("INSTALLED", {}, "a" * 64, handoff_fd)
     with pytest.raises(HandoffPersistenceUncertain) as captured:
         apply_locked_reply(history, reply, expected_lock=expected)
     assert captured.value.handoff_fd == handoff_fd
@@ -2888,7 +2910,7 @@ def _send_response_with_fds(sock: socket.socket, lock_fds: list[int]) -> None:
         {
             "schema_version": 1,
             "request_id": "request-a",
-            "status": "PREPARED",
+            "status": "INSTALLED",
             "payload": {},
             "error": None,
         },
@@ -3098,6 +3120,230 @@ def test_complete_install_fixture_matches_production_encoder() -> None:
     ) == INSTALL_BYTES
 
 
+def test_immediate_successful_install_is_durably_terminal(tmp_path) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("INSTALLED",),
+    )
+    manager = InstallerOrchestrator.restart(root, service.socket_path)
+    manager.begin_install()
+    snapshot = manager.store.validated_snapshot()
+    assert snapshot.terminal is True
+    assert snapshot.active_reference is None
+    assert snapshot.pending_local_transition is None
+    assert snapshot.terminal_response_status == "INSTALLED"
+    assert service.request_bytes() == [INSTALL_BYTES]
+    service.stop()
+    service.wait(timeout=5.0)
+
+
+def test_replayed_install_success_uses_same_durable_handoff_path(tmp_path) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("TRANSPORT_DROPPED", "NO_JOURNAL_NO_MUTATION", "INSTALLED"),
+    )
+    first = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(Exception, match="INSTALLER_TRANSPORT_UNCERTAIN"):
+        first.begin_install()
+    first.close_after_uncertain_transport()
+    restarted = InstallerOrchestrator.restart(root, service.socket_path)
+    restarted.drive_to_terminal()
+    snapshot = restarted.store.validated_snapshot()
+    assert snapshot.terminal is True
+    assert snapshot.terminal_response_status == "INSTALLED"
+    assert [body for body in service.request_bytes() if body == INSTALL_BYTES] == [
+        INSTALL_BYTES,
+        INSTALL_BYTES,
+    ]
+    service.stop()
+    service.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    "response_fault",
+    [
+        "partial_body",
+        "malformed_schema",
+        "request_id_mismatch",
+        "payload_identity_mismatch",
+    ],
+)
+def test_locked_malformed_install_response_is_durable_before_unlock(
+    response_fault: str, tmp_path
+) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("INSTALLED",),
+        response_fault=response_fault,
+    )
+    contender = os.open(transaction, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    events: list[str] = []
+
+    def inspect_lock(name: str) -> None:
+        if name == "before_owner_record_fsync":
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            events.append("locked_through_fsync")
+        elif name == "after_handoff_close":
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(contender, fcntl.LOCK_UN)
+            events.append("released_after_fsync")
+
+    manager = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(Exception, match="INSTALLER_RESPONSE_UNCERTAIN"):
+        manager.begin_install(fault_hook=inspect_lock)
+    snapshot = manager.store.validated_snapshot()
+    assert snapshot.response_uncertain is True
+    assert snapshot.active_authorization_kind == "recovery"
+    assert snapshot.active_recovery_generation == 1
+    assert events == ["locked_through_fsync", "released_after_fsync"]
+    manager.close_after_uncertain_transport()
+    os.close(contender)
+    service.stop()
+    service.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize("response_fault", ["missing_handoff", "wrong_handoff"])
+def test_invalid_handoff_uses_stable_lock_uncertainty_only(
+    response_fault: str, tmp_path
+) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("INSTALLED",),
+        response_fault=response_fault,
+    )
+    manager = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(Exception, match="INSTALLER_TRANSPORT_UNCERTAIN"):
+        manager.begin_install()
+    snapshot = manager.store.validated_snapshot()
+    assert snapshot.transport_uncertain is True
+    assert snapshot.locked_response_records == ()
+    manager.close_after_uncertain_transport()
+    service.stop()
+    service.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize("boundary", LIVE_PERSISTENCE_BOUNDARIES)
+def test_malformed_response_persistence_failure_retains_handoff_until_reconciled(
+    boundary: str, tmp_path
+) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("INSTALLED",),
+        response_fault="malformed_schema",
+    )
+    manager = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(Exception, match="HANDOFF_PERSISTENCE_UNCERTAIN"):
+        manager.begin_install(
+            fault_hook=lambda name: (_ for _ in ()).throw(OSError(name))
+            if name == boundary
+            else None,
+        )
+    contender = os.open(transaction, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    with pytest.raises(BlockingIOError):
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    manager.reconcile_locked_handoff()
+    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.close(contender)
+    snapshot = manager.store.validated_snapshot()
+    assert snapshot.response_uncertain is True
+    assert snapshot.active_recovery_generation == 1
+    service.stop()
+    service.wait(timeout=5.0)
+
+
+def test_malformed_recovery_keeps_same_generation_for_exact_replay(tmp_path) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("TRANSPORT_DROPPED", "RECOVERED"),
+        response_fault="payload_identity_mismatch",
+    )
+    first = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(Exception, match="INSTALLER_TRANSPORT_UNCERTAIN"):
+        first.begin_install()
+    first.close_after_uncertain_transport()
+    manager = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(OSError, match="stop-after-locked-response"):
+        manager.drive_to_terminal(
+            fault_hook=lambda name: (_ for _ in ()).throw(
+                OSError("stop-after-locked-response")
+            ) if name == "after_handoff_close" else None,
+        )
+    snapshot = manager.store.validated_snapshot()
+    assert snapshot.active_authorization_kind == "recovery"
+    assert snapshot.active_recovery_generation == 1
+    assert snapshot.next_wire_request_bytes == snapshot.last_wire_request_bytes
+    manager.close_after_uncertain_transport()
+    service.stop()
+    service.wait(timeout=5.0)
+
+
 @pytest.mark.parametrize("boundary", CRASH_BOUNDARIES)
 def test_fork_exit_restart_uses_real_wire_order_and_byte_exact_replay(
     boundary: str, tmp_path
@@ -3214,7 +3460,7 @@ def test_live_persistence_failure_retains_both_locks_until_reconciled(
     service.wait(timeout=5.0)
 ```
 
-`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child and receives each production length-prefixed canonical six-field request with exactly one construction-lock FD via `recvmsg(MSG_CMSG_CLOEXEC)`. Before recording or acting, it validates the exact `fd_roles`, FD count/CLOEXEC/device/inode/mode, and the fact that an independently opened construction-lock descriptor cannot acquire the already-held lock. It appends the exact received bytes, explicit request ID, and validation evidence to fsynced files, and sends operation-specific terminal frames that echo that request ID plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, fsyncs a journal and drops the byte-identical second install response, then returns the same `RECOVERED` result for generation 2 replays. A broken response socket never advances authorization state; request generation and the fsynced service journal determine the response. Test-only shutdown signals the owned child only after the manager verifies terminal state; there is no unauthenticated stop request. `InstallerOrchestrator` uses the production `sendmsg` session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after authenticated request delivery and actual terminal-frame-plus-handoff receipt. A fresh orchestrator reopens only the fsynced prefix, performs any required authenticated wire operation, and cannot mark terminal without a newly received, schema-valid, durably persisted terminal response. Assertions prove the two actual install frames are byte-identical, all generations are inside `payload`, and every accepted request carried the stable construction-lock FD. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
+`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child and receives each production length-prefixed canonical six-field request with exactly one construction-lock FD via `recvmsg(MSG_CMSG_CLOEXEC)`. Before recording or acting, it validates the exact `fd_roles`, FD count/CLOEXEC/device/inode/mode, and the fact that an independently opened construction-lock descriptor cannot acquire the already-held lock. It appends the exact received bytes, explicit request ID, and validation evidence to fsynced files, and sends operation-specific terminal frames that echo that request ID plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. `INSTALLED` is the only successful terminal status for an install operation; it carries `BASE_COMPLETE` for base Python or `COMPLETE` for a closure and all final fields. `RECOVERED` is the corresponding post-publication recovery status. Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, fsyncs a journal and drops the byte-identical second install response, then returns the same `RECOVERED` result for generation 2 replays. Parameterized scripts additionally exercise immediate `INSTALLED` and `NO_JOURNAL_NO_MUTATION` followed by byte-identical replay ending in `INSTALLED`. A broken response socket never advances authorization state; request generation and the fsynced service journal determine the response. Test-only shutdown signals the owned child only after the manager verifies terminal state; there is no unauthenticated stop request. `InstallerOrchestrator` uses the production `sendmsg` session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after authenticated request delivery and actual terminal-frame-plus-handoff receipt. A fresh orchestrator reopens only the fsynced prefix, performs any required authenticated wire operation, and cannot mark terminal without a newly received, schema-valid, durably persisted terminal response. Assertions prove the two actual install frames are byte-identical, all generations are inside `payload`, and every accepted request carried the stable construction-lock FD. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
 
 - [ ] **Step 2: Write failing systemd/config exactness tests**
 
@@ -3428,10 +3674,29 @@ def validate_reply_for_request(
     if not null_result and any(payload[key] is None for key in final_fields):
         raise RuntimeError("INSTALLER_RESPONSE_FINAL_RESULT")
     recovery = str(request["operation"]).startswith("recover_")
+    install = str(request["operation"]).startswith("install_")
+    if reply.status == "INSTALLED" and not install:
+        raise RuntimeError("INSTALLER_RESPONSE_OPERATION")
     if reply.status in {
         "NO_JOURNAL_NO_MUTATION", "ABORTED_BEFORE_PREPARED", "RECOVERED",
     } and not recovery:
         raise RuntimeError("INSTALLER_RESPONSE_OPERATION")
+    allowed = (
+        {"INSTALLED"}
+        if install
+        else {"NO_JOURNAL_NO_MUTATION", "ABORTED_BEFORE_PREPARED", "RECOVERED"}
+    )
+    if reply.status not in allowed:
+        raise RuntimeError("INSTALLER_RESPONSE_STATUS")
+    expected_complete = (
+        "BASE_COMPLETE" if str(request["operation"]).endswith("base_python")
+        else "COMPLETE"
+    )
+    if reply.status in {"INSTALLED", "RECOVERED"}:
+        if payload["terminal_phase"] != expected_complete:
+            raise RuntimeError("INSTALLER_RESPONSE_TERMINAL_PHASE")
+    elif payload["terminal_phase"] != reply.status:
+        raise RuntimeError("INSTALLER_RESPONSE_TERMINAL_PHASE")
 
 
 @dataclass(frozen=True, slots=True)
@@ -3495,6 +3760,26 @@ class TransportUncertain(RuntimeError):
     pass
 
 
+class PartialInstallerFrame(TransportUncertain):
+    def __init__(self, partial: bytes):
+        super().__init__("HANDOFF_FRAME_EOF")
+        self.partial = partial
+
+
+class LockedReplyUncertain(RuntimeError):
+    def __init__(
+        self,
+        *,
+        handoff_fd: int,
+        received_prefix_sha256: str,
+        cause: BaseException,
+    ) -> None:
+        super().__init__(f"LOCKED_INSTALLER_RESPONSE_UNCERTAIN:{type(cause).__name__}")
+        self.handoff_fd = handoff_fd
+        self.received_prefix_sha256 = received_prefix_sha256
+        self.error_code = str(cause)[:128]
+
+
 def lock_identity_from_fd(fd: int) -> LockIdentity:
     status = os.fstat(fd)
     mount_id = None
@@ -3553,7 +3838,7 @@ def _recv_exact(channel: socket.socket, count: int) -> bytes:
     while len(value) < count:
         chunk = channel.recv(count - len(value))
         if not chunk:
-            raise TransportUncertain("HANDOFF_FRAME_EOF")
+            raise PartialInstallerFrame(bytes(value))
         value.extend(chunk)
     return bytes(value)
 
@@ -3589,8 +3874,15 @@ def recv_installer_reply(
             raise TransportUncertain("HANDOFF_FRAME_EOF")
         if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
             close_all_rights_fds(ancillary)
-            raise RuntimeError("HANDOFF_ANCILLARY_TRUNCATED")
-        received = extract_exactly_one_rights_fd(ancillary)
+            raise TransportUncertain("HANDOFF_ANCILLARY_TRUNCATED")
+        try:
+            received = extract_exactly_one_rights_fd(ancillary)
+            validate_locked_handoff_fd(received, expected_lock)
+        except Exception as error:
+            if "received" in locals():
+                os.close(received)
+            raise TransportUncertain(str(error)) from error
+        response_prefix = bytearray(header)
         try:
             if len(header) != 4:
                 raise RuntimeError("HANDOFF_FRAME_HEADER")
@@ -3598,18 +3890,26 @@ def recv_installer_reply(
             if length <= 0 or length > 1_048_576:
                 raise RuntimeError("HANDOFF_FRAME_LENGTH")
             payload = _recv_exact(channel, length)
-        except Exception:
-            os.close(received)
-            raise
+            response_prefix.extend(payload)
+        except BaseException as error:
+            if isinstance(error, PartialInstallerFrame):
+                response_prefix.extend(error.partial)
+            raise LockedReplyUncertain(
+                handoff_fd=received,
+                received_prefix_sha256=hashlib.sha256(response_prefix).hexdigest(),
+                cause=error,
+            ) from error
     try:
-        validate_locked_handoff_fd(received, expected_lock)
         response = decode_exact_response_payload(payload, request_id=request_id)
         return InstallerReply(
             response.status, response.payload, response.sha256, received
         )
-    except Exception:
-        os.close(received)
-        raise
+    except BaseException as error:
+        raise LockedReplyUncertain(
+            handoff_fd=received,
+            received_prefix_sha256=hashlib.sha256(payload).hexdigest(),
+            cause=error,
+        ) from error
 
 
 class UnixInstallerSession:
@@ -3653,7 +3953,14 @@ class UnixInstallerSession:
             request_id=self._request_id,
             expected_lock=self._expected_lock,
         )
-        validate_reply_for_request(reply, self._request)
+        try:
+            validate_reply_for_request(reply, self._request)
+        except BaseException as error:
+            raise LockedReplyUncertain(
+                handoff_fd=reply.handoff_fd,
+                received_prefix_sha256=reply.response_sha256,
+                cause=error,
+            ) from error
         return reply
 
     def close(self) -> None:
@@ -3688,7 +3995,11 @@ class WireDecision:
 
 @dataclass(slots=True)
 class RetainedHandoff:
-    reply: InstallerReply
+    handoff_fd: int
+    decision: WireDecision
+    reply: InstallerReply | None
+    received_prefix_sha256: str
+    error_code: str | None
     cause: BaseException
 
 
@@ -3747,9 +4058,50 @@ class InstallerManagerOwnership:
             if fault_hook is not None:
                 fault_hook("before_handoff_close")
         except BaseException as error:
-            self._retained = RetainedHandoff(reply, error)
+            self._retained = RetainedHandoff(
+                reply.handoff_fd,
+                decision,
+                reply,
+                reply.response_sha256,
+                None,
+                error,
+            )
             raise HandoffPersistenceUncertain(reply.handoff_fd, error) from error
         os.close(reply.handoff_fd)
+        if fault_hook is not None:
+            fault_hook("after_handoff_close")
+
+    def persist_locked_uncertainty(
+        self,
+        decision: WireDecision,
+        uncertain: LockedReplyUncertain,
+        *,
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        if self._closed or self._retained is not None:
+            raise RuntimeError("HANDOFF_OWNER_STATE")
+        self.store.validate_locked_handoff(uncertain.handoff_fd)
+        try:
+            self.store.commit_locked_response_uncertain(
+                decision,
+                received_prefix_sha256=uncertain.received_prefix_sha256,
+                error_code=uncertain.error_code,
+                fault_hook=fault_hook,
+            )
+            self.store.fsync_owner_and_parent(fault_hook=fault_hook)
+            if fault_hook is not None:
+                fault_hook("before_handoff_close")
+        except BaseException as error:
+            self._retained = RetainedHandoff(
+                uncertain.handoff_fd,
+                decision,
+                None,
+                uncertain.received_prefix_sha256,
+                uncertain.error_code,
+                error,
+            )
+            raise HandoffPersistenceUncertain(uncertain.handoff_fd, error) from error
+        os.close(uncertain.handoff_fd)
         if fault_hook is not None:
             fault_hook("after_handoff_close")
 
@@ -3758,10 +4110,17 @@ class InstallerManagerOwnership:
         if retained is None or self._closed:
             raise RuntimeError("NO_RETAINED_HANDOFF")
         self.store.validate_locked_construction_fd(self._construction_lock_fd)
-        self.store.validate_locked_handoff(retained.reply.handoff_fd)
-        self.store.reconcile_exact_reply(retained.reply)
+        self.store.validate_locked_handoff(retained.handoff_fd)
+        if retained.reply is not None:
+            self.store.reconcile_exact_reply(retained.decision, retained.reply)
+        else:
+            self.store.reconcile_locked_response_uncertain(
+                retained.decision,
+                received_prefix_sha256=retained.received_prefix_sha256,
+                error_code=retained.error_code,
+            )
         self.store.fsync_owner_and_parent()
-        os.close(retained.reply.handoff_fd)
+        os.close(retained.handoff_fd)
         self._retained = None
         self._close_construction_lock()
 
@@ -3801,17 +4160,33 @@ class InstallerOrchestrator:
             socket_path=socket_path,
         )
 
-    def begin_install(self) -> None:
+    def begin_install(
+        self,
+        *,
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> None:
         decision = self.store.prepare_initial_install_delivery()
         try:
-            self._exchange(decision, fault_hook=None)
+            reply = self._exchange(decision, fault_hook=fault_hook)
+        except LockedReplyUncertain as error:
+            self.ownership.persist_locked_uncertainty(
+                decision,
+                error,
+                fault_hook=fault_hook,
+            )
+            raise RuntimeError("INSTALLER_RESPONSE_UNCERTAIN") from error
         except TransportUncertain as error:
             self.store.record_transport_uncertain(decision)
             self.store.fsync_owner_and_parent()
             raise RuntimeError("INSTALLER_TRANSPORT_UNCERTAIN") from error
+        self._persist_valid_reply(decision, reply, fault_hook=fault_hook)
+        if not self.store.validated_snapshot().terminal:
+            raise RuntimeError("INSTALLER_SUCCESS_NOT_TERMINAL")
+        self.ownership.close_terminal_construction_lock()
 
     def close_after_uncertain_transport(self) -> None:
-        if not self.store.validated_snapshot().transport_uncertain:
+        snapshot = self.store.validated_snapshot()
+        if not (snapshot.transport_uncertain or snapshot.response_uncertain):
             raise RuntimeError("INSTALLER_NOT_UNCERTAIN")
         self.ownership.close_without_handoff()
 
@@ -3831,18 +4206,39 @@ class InstallerOrchestrator:
                 fault_hook("before_resubmission")
             try:
                 reply = self._exchange(decision, fault_hook=fault_hook)
+            except LockedReplyUncertain as error:
+                self.ownership.persist_locked_uncertainty(
+                    decision,
+                    error,
+                    fault_hook=fault_hook,
+                )
+                continue
             except TransportUncertain:
                 self.store.record_transport_uncertain(decision)
                 self.store.fsync_owner_and_parent()
                 continue
-            self.ownership.persist_received_reply(
-                decision,
-                reply,
-                fault_hook=fault_hook,
-            )
-            if reply.status not in {"NO_JOURNAL_NO_MUTATION", "RECOVERED"}:
-                raise RuntimeError("INSTALLER_RESPONSE_STATUS")
+            self._persist_valid_reply(decision, reply, fault_hook=fault_hook)
         self.ownership.close_terminal_construction_lock()
+
+    def _persist_valid_reply(
+        self,
+        decision: WireDecision,
+        reply: InstallerReply,
+        *,
+        fault_hook: Callable[[str], None] | None,
+    ) -> None:
+        allowed = (
+            {"INSTALLED"}
+            if decision.authorization_kind == "install"
+            else {"NO_JOURNAL_NO_MUTATION", "ABORTED_BEFORE_PREPARED", "RECOVERED"}
+        )
+        if reply.status not in allowed:
+            raise RuntimeError("INSTALLER_RESPONSE_STATUS")
+        self.ownership.persist_received_reply(
+            decision,
+            reply,
+            fault_hook=fault_hook,
+        )
 
     def _complete_pending_local_transition(
         self,
@@ -3900,7 +4296,7 @@ class InstallerOrchestrator:
             session.close()
 ```
 
-`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. Its root manifest pins the construction- and transaction-lock device/inode/mount identities and original install digest. It calls only `encode_installer_request` for install and recovery documents. Every generated wire document therefore has exactly the six top-level request keys, keeps construction-attempt and recovery-generation fields inside the exact operation payload, and records an explicit request ID that byte-identical replay preserves. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks, passing its still-locked construction FD to `UnixInstallerSession`; the session derives response matching from the explicit request ID rather than the body digest. `persist_received_reply` places result-append and handoff-close hooks around the received reply's actual durable transition. Reactivation, terminal-clear, and resubmission hooks surround those real orchestration operations, never a synthetic reply. `validated_snapshot`, `recovery_decision`, `reconcile_exact_reply`, and restart methods reopen all files with `openat2`/no-follow semantics, reject any invalid suffix or temporary entry, verify both independent hash chains and the active-reference digest, and never infer state from an un-fsynced pending file. Live reconciliation closes neither FD on any error. Restart acquires the pinned construction lock and uses only the fsynced prefix, but it can reach terminal only by driving the next required authenticated wire request through a newly opened production session and persisting the newly received response.
+`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, append-only locked-response uncertainty records, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. Its root manifest pins the construction- and transaction-lock device/inode/mount identities and original install digest. It calls only `encode_installer_request` for install and recovery documents. Every generated wire document therefore has exactly the six top-level request keys, keeps construction-attempt and recovery-generation fields inside the exact operation payload, and records an explicit request ID that byte-identical replay preserves. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks, passing its still-locked construction FD to `UnixInstallerSession`; the session derives response matching from the explicit request ID rather than the body digest. `persist_received_reply` places result-append and handoff-close hooks around every valid `INSTALLED`, null-recovery, or `RECOVERED` reply. `commit_locked_response_uncertain` records the bounded error code and received-prefix digest while the valid transaction-lock OFD is still held: an install decision appends and activates the next recovery generation, while a recovery decision retains that exact active generation and request bytes. Both paths replace and fsync the owner record and parent before the OFD closes. Missing, extra, intervened, or wrong-identity descriptors cannot authorize this response-driven transition and instead use `record_transport_uncertain` under only the stable construction lock. Reactivation, terminal-clear, and resubmission hooks surround those real orchestration operations, never a synthetic reply. `validated_snapshot` exposes non-null `transport_uncertain`, `response_uncertain`, active authorization kind/generation, locked-response records, and exact next/last request bytes; `recovery_decision`, `reconcile_exact_reply`, `reconcile_locked_response_uncertain`, and restart methods reopen all files with `openat2`/no-follow semantics, reject any invalid suffix or temporary entry, verify both independent hash chains and the active-reference digest, and never infer state from an un-fsynced pending file. Live reconciliation closes neither FD on any error. Restart acquires the pinned construction lock and uses only the fsynced prefix, but it can reach terminal only by driving the next required authenticated wire request through a newly opened production session and persisting the newly received response. An `INSTALLED` result atomically records the final payload, clears the install active reference and pending action, and marks the attempt terminal in that same durable handoff transition; it never requires a recovery-only local-clear phase.
 
 `AuthorizationHistory.append_recovery()` requires generation `last + 1`, a fresh token and authorization ID, `previous_entry_sha256=None` for generation 1 and otherwise the exact canonical digest of the preceding authorization entry, a monotonic authorization sequence, and one active reference. `RecoveryResultHistory.append()` separately requires a contiguous result prefix and `previous_result_sha256=None` for its first result and otherwise the preceding result digest. Authorization objects contain no result field, and result entries never participate in the authorization chain. `NO_JOURNAL_NO_MUTATION` reactivates the unchanged install authorization and byte-identical request; every further uncertainty appends a new recovery generation. Neither history overwrites or reorders an entry, marks an older entry active, or uses `pending_action` as authority.
 
@@ -3924,6 +4320,8 @@ exclusively create/open root journal ->
 append/fsync pending -> fork confined mutation child -> validate PREPARED ->
 append/fsync PREPARED -> parent renameat2(RENAME_NOREPLACE) -> fsync parents ->
 append FINAL_RENAMED -> exclusive receipt create/fsync -> append RECEIPT_CREATED ->
+derive status INSTALLED for install_* or RECOVERED for recover_* and phase
+BASE_COMPLETE for *_base_python or COMPLETE for *_closure ->
 send one terminal response plus duplicated still-locked FD -> close service FD
 ```
 
@@ -5247,6 +5645,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -5393,6 +5792,107 @@ def test_normal_task_failure_with_clean_infrastructure_can_retire_for_retry(
     assert not handoff.exists()
     create_run_id_handoff(handoff, "eval-fresh")
     assert read_run_id_handoff(handoff) == "eval-fresh"
+
+
+def _replace_manifest_for_adversarial_test(
+    store: EvidenceStore,
+    mutate: Callable[[dict[str, object]], None],
+) -> None:
+    path = store.root / "manifest.json"
+    manifest = json.loads(path.read_bytes())
+    mutate(manifest)
+    path.write_bytes(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "code"),
+    [
+        (lambda value: value.update(task_results={}), "MANIFEST_TASK_RESULTS_EMPTY"),
+        (
+            lambda value: value.update(task_results={"episode_2": False}),
+            "MANIFEST_TASK_RESULT_KEYS",
+        ),
+        (
+            lambda value: value.update(
+                task_results={
+                    "episode_2": False,
+                    "episode_3": True,
+                    "episode_4": False,
+                }
+            ),
+            "MANIFEST_TASK_RESULT_KEYS",
+        ),
+        (
+            lambda value: value.update(
+                task_results={"episode_2": 0, "episode_3": True}
+            ),
+            "MANIFEST_TASK_RESULT_TYPE",
+        ),
+        (
+            lambda value: value.update(
+                task_results={"episode_2": True, "episode_3": True}
+            ),
+            "MANIFEST_VERDICT_REDUCER",
+        ),
+    ],
+)
+def test_terminal_manifest_rejects_inconsistent_task_results(
+    tmp_path: Path,
+    mutate: Callable[[dict[str, object]], None],
+    code: str,
+) -> None:
+    store = EvidenceStore.create(tmp_path, run_id="eval-inconsistent")
+    populate_complete_evidence(store, episodes=(2, 3))
+    store.finalize_terminal_manifest(
+        run_id="eval-inconsistent",
+        episodes=(2, 3),
+        infrastructure_verdict="PASS",
+        overall_verdict="FAIL",
+        task_results={"episode_2": False, "episode_3": True},
+        owned_processes_alive=[],
+        unknown_remote_state=False,
+        unresolved_errors=[],
+    )
+    _replace_manifest_for_adversarial_test(store, mutate)
+    with pytest.raises(Exception, match=code):
+        store.verify_terminal_manifest(expected_run_id="eval-inconsistent")
+
+
+def test_gate9_retains_handoff_for_all_success_results_paired_with_fail(
+    tmp_path: Path,
+) -> None:
+    output_parent = tmp_path / "workloads"
+    output_parent.mkdir(mode=0o700)
+    store = EvidenceStore.create(output_parent, run_id="eval-inconsistent")
+    populate_complete_evidence(store, episodes=(2, 3))
+    store.finalize_terminal_manifest(
+        run_id="eval-inconsistent",
+        episodes=(2, 3),
+        infrastructure_verdict="PASS",
+        overall_verdict="FAIL",
+        task_results={"episode_2": False, "episode_3": True},
+        owned_processes_alive=[],
+        unknown_remote_state=False,
+        unresolved_errors=[],
+    )
+    _replace_manifest_for_adversarial_test(
+        store,
+        lambda value: value.update(
+            task_results={"episode_2": True, "episode_3": True}
+        ),
+    )
+    handoff = tmp_path / "evaluation-run-id"
+    create_run_id_handoff(handoff, "eval-inconsistent")
+    reconciler = Gate9HandoffReconciler(
+        output_parent,
+        recover_owned_run=lambda run_id, run_root: None,
+    )
+    with pytest.raises(Exception, match="MANIFEST_VERDICT_REDUCER"):
+        reconciler.reconcile_and_retire(handoff, reason="interrupted-retry")
+    assert read_run_id_handoff(handoff) == "eval-inconsistent"
+    assert not (store.root / "operator-handoff-retired.json").exists()
 
 
 def test_gate9_interrupt_before_run_root_creates_failed_evidence_root(
@@ -5872,6 +6372,52 @@ LATE_UNINDEXED_PATHS = frozenset(
 )
 
 
+def reduce_overall_verdict(
+    *,
+    infrastructure_verdict: str,
+    task_results: dict[str, bool],
+) -> str:
+    if infrastructure_verdict not in {"PASS", "FAIL"}:
+        raise RuntimeBlocked("MANIFEST_INFRASTRUCTURE_VERDICT", infrastructure_verdict)
+    if type(task_results) is not dict or any(
+        type(key) is not str or type(value) is not bool
+        for key, value in task_results.items()
+    ):
+        raise RuntimeBlocked("MANIFEST_TASK_RESULT_TYPE", "strict Booleans required")
+    passed = (
+        infrastructure_verdict == "PASS"
+        and bool(task_results)
+        and all(task_results.values())
+    )
+    return "PASS" if passed else "FAIL"
+
+
+def _validate_task_verdict_contract(
+    manifest: dict[str, object], *, expected_run_id: str
+) -> None:
+    episodes = manifest["episodes"]
+    task_results = manifest["task_results"]
+    if (
+        any(value <= 0 for value in episodes)
+        or len(episodes) != len(set(episodes))
+        or episodes != sorted(episodes)
+    ):
+        raise RuntimeBlocked("MANIFEST_EPISODE_SET", expected_run_id)
+    if manifest["infrastructure_verdict"] == "PASS" and not episodes:
+        raise RuntimeBlocked("MANIFEST_TASK_RESULTS_EMPTY", expected_run_id)
+    expected_keys = {f"episode_{episode}" for episode in episodes}
+    if set(task_results) != expected_keys:
+        raise RuntimeBlocked("MANIFEST_TASK_RESULT_KEYS", expected_run_id)
+    if any(type(value) is not bool for value in task_results.values()):
+        raise RuntimeBlocked("MANIFEST_TASK_RESULT_TYPE", expected_run_id)
+    reduced = reduce_overall_verdict(
+        infrastructure_verdict=manifest["infrastructure_verdict"],
+        task_results=task_results,
+    )
+    if manifest["overall_verdict"] != reduced:
+        raise RuntimeBlocked("MANIFEST_VERDICT_REDUCER", expected_run_id)
+
+
 @dataclass(frozen=True, slots=True)
 class VerifiedTerminalManifest:
     run_id: str
@@ -5915,6 +6461,7 @@ def _verify_terminal_manifest(
         or type(manifest["unknown_remote_state"]) is not bool
     ):
         raise RuntimeBlocked("MANIFEST_TYPE", expected_run_id)
+    _validate_task_verdict_contract(manifest, expected_run_id=expected_run_id)
     entries = manifest["artifact_index"]
     if type(entries) is not list:
         raise RuntimeBlocked("MANIFEST_ARTIFACT_SCHEMA", expected_run_id)
@@ -5974,7 +6521,7 @@ def _verify_terminal_manifest(
     )
 ```
 
-`EvidenceStore.finalize_terminal_manifest(...)` first freezes the command and state-transition streams, no-follow enumerates every current allowlisted regular payload, computes the sorted `artifact_index` and independent `command_index`, validates exact types, writes `manifest.json` with `O_EXCL` plus file/parent fsync, then immediately calls `_verify_terminal_manifest`. `EvidenceStore.verify_terminal_manifest` is the public bound form of that same verifier; no caller re-parses selected keys. A FAIL manifest may contain the fsynced operation prefix rather than every PASS-only artifact, but it must index every existing artifact and command and contain all five terminal cleanup records. PASS additionally requires every `mandatory_evidence_paths(episodes)` entry. Any changed, absent, extra, unindexed, duplicate, out-of-order, or path-escaping artifact/command makes verification fail. The Markdown rendering and Gate 9 retirement receipt are deliberately late derived files and are the only unindexed exceptions.
+`EvidenceStore.finalize_terminal_manifest(...)` first freezes the command and state-transition streams, no-follow enumerates every current allowlisted regular payload, computes the sorted `artifact_index` and independent `command_index`, validates the exact candidate schema/types, and calls `_validate_task_verdict_contract` before creating anything. It then writes `manifest.json` with `O_EXCL` plus file/parent fsync and immediately calls `_verify_terminal_manifest`, which repeats the same validation over the persisted bytes. `EvidenceStore.verify_terminal_manifest` is the public bound form of that same verifier; no caller re-parses selected keys. Episode IDs must be unique positive integers in sorted order, `task_results` must have exactly the corresponding `episode_<id>` keys with strict Boolean values, and `overall_verdict` must equal `reduce_overall_verdict`. Empty task results are permitted only for infrastructure-failed runs with no episodes; they can never represent a clean-infrastructure task failure. A FAIL manifest may contain the fsynced operation prefix rather than every PASS-only artifact, but it must index every existing artifact and command and contain all five terminal cleanup records. PASS additionally requires every `mandatory_evidence_paths(episodes)` entry. Any changed, absent, extra, unindexed, duplicate, out-of-order, path-escaping, or internally inconsistent task/verdict field makes verification fail before Gate 9 can issue a receipt. The Markdown rendering and Gate 9 retirement receipt are deliberately late derived files and are the only unindexed exceptions.
 
 The same module imports `hashlib`, `json`, `os`, `stat`, `dataclass`, `Path`, and `Callable`, then implements `create_run_id_handoff`, `read_run_id_handoff`, `remove_run_id_handoff`, and `Gate9HandoffReconciler`. Creation uses `O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW`, mode `0600`, one validated run ID plus newline, file fsync, and parent fsync. Reading uses `O_RDONLY|O_CLOEXEC|O_NOFOLLOW` and requires a regular single-link file owned by the current UID, exact mode `0600`, bounded size, one newline, and a valid identifier. Removal reopens and revalidates the current path, requires the expected run ID plus the originally captured path/FD identity, unlinks by parent FD only after acceptance or authenticated failed-run reconciliation, and fsyncs the parent. The reconciler opens the attested output parent and exact existing run root without following links. If interruption occurred after handoff creation but before the run root, `EvidenceStore.open_or_create_reconciliation` alone may exclusively create that exact child and fsync an immutable `prestart-interruption.json` binding the handoff identity; no ordinary existing run is adopted by that path. It then invokes normal owned stale cleanup and calls the same `verify_terminal_manifest` used by final acceptance. Only a fully indexed canonical terminal overall-FAIL manifest with zero live owned processes and known-clean remote state can authorize the immutable retirement receipt and exact handoff unlink. Infrastructure may be `FAIL`, or it may be `PASS` when a normally completed episode failed its task; both cases preserve the complete old run and receive a new run ID only after verified terminal cleanup. A toy subset, changed artifact, missing command digest, overall `PASS`, foreign/unknown ownership, incomplete cleanup, changed inode, mismatched run ID, or missing/nonterminal manifest retains the handoff and forbids a fresh Gate 9 run.
 
@@ -6182,6 +6729,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
+from simple.eval_runtime.evidence import reduce_overall_verdict
+
 
 class LifecycleState(str, Enum):
     NEW = "NEW"
@@ -6234,11 +6783,17 @@ class VerdictSummary:
 def reduce_verdict(
     *, task_results: dict[int, bool], infrastructure_valid: bool
 ) -> VerdictSummary:
-    passed = infrastructure_valid and bool(task_results) and all(task_results.values())
-    return VerdictSummary(infrastructure_valid, dict(task_results), "PASS" if passed else "FAIL")
+    canonical_results = {
+        f"episode_{episode}": result for episode, result in task_results.items()
+    }
+    verdict = reduce_overall_verdict(
+        infrastructure_verdict="PASS" if infrastructure_valid else "FAIL",
+        task_results=canonical_results,
+    )
+    return VerdictSummary(infrastructure_valid, dict(task_results), verdict)
 ```
 
-Persist/fsync each transition before the next external action. Register cleanup before every resource start. Cleanup order is runner ownership unit/finalize, tunnel, tracer, server, remote evidence, container, local/remote postconditions. Every action receives one shared absolute deadline; failure is recorded and does not skip later actions. Terminal restoration, log closure, and manifest finalization execute unconditionally outside deadline short-circuiting. Foreign/unknown identity records `FOREIGN_BLOCKED` and sends no signal/stop for that resource.
+`manager.py` imports `reduce_overall_verdict` from `evidence.py`; this is the single reducer used by live evaluation, manifest finalization, verification, and Gate 9 reconciliation. Persist/fsync each transition before the next external action. Register cleanup before every resource start. Cleanup order is runner ownership unit/finalize, tunnel, tracer, server, remote evidence, container, local/remote postconditions. Every action receives one shared absolute deadline; failure is recorded and does not skip later actions. Terminal restoration, log closure, and manifest finalization execute unconditionally outside deadline short-circuiting. Foreign/unknown identity records `FOREIGN_BLOCKED` and sends no signal/stop for that resource.
 
 - [ ] **Step 7: Implement the CLI and script entrypoints**
 
