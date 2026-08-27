@@ -342,15 +342,23 @@ class RecoveryHarness:
     def append_recovery_generation(self) -> SimpleNamespace:
         number = len(self._authorizations) + 1
         previous = (
-            self._authorizations[-1].authorization_sha256
+            self._authorizations[-1].canonical_entry_sha256
             if self._authorizations else None
         )
+        canonical_entry = {
+            "recovery_generation": number,
+            "previous_entry_sha256": previous,
+            "request_digest": f"{number:064x}",
+            "authorization_sha256": f"{number + 100:064x}",
+        }
         entry = SimpleNamespace(
-            recovery_generation=number,
+            **canonical_entry,
             active_reference=f"recovery:{number}",
-            previous_entry_sha256=previous,
-            request_digest=f"{number:064x}",
-            authorization_sha256=f"{number + 100:064x}",
+            canonical_entry_sha256=hashlib.sha256(
+                json.dumps(
+                    canonical_entry, sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest(),
         )
         self._authorizations.append(entry)
         return entry
@@ -650,6 +658,7 @@ def fixture_owner_record_for_reactivation(
     transition: dict[str, object],
     *,
     previous_owner_record: bytes,
+    terminal_phase: str = "NO_JOURNAL_NO_MUTATION",
 ) -> bytes:
     from simple.eval_runtime.installer_client import (
         encode_authorization_owner_record,
@@ -663,7 +672,7 @@ def fixture_owner_record_for_reactivation(
         encode_recovery_result(
             recovery_authorization=recovery,
             terminal_response_sha256="b" * 64,
-            terminal_phase="NO_JOURNAL_NO_MUTATION",
+            terminal_phase=terminal_phase,
             transaction_lock_identity_sha256="c" * 64,
             previous_result=(
                 owner["recovery_results"][-1]
@@ -695,6 +704,7 @@ def fixture_install_reactivation_transition(
     previous_authorization: dict[str, object],
     previous_transition: dict[str, object],
     previous_owner_record: bytes,
+    terminal_phase: str = "NO_JOURNAL_NO_MUTATION",
 ) -> dict[str, object]:
     from simple.eval_runtime.installer_client import (
         encode_authorization_owner_projection,
@@ -712,6 +722,7 @@ def fixture_install_reactivation_transition(
         install_authorization,
         provisional_transition,
         previous_owner_record=previous_owner_record,
+        terminal_phase=terminal_phase,
     )
     target_projection = encode_authorization_owner_projection(
         json.loads(provisional_owner), creates_authorization=False
@@ -739,6 +750,7 @@ def fixture_install_reactivation_transition(
             install_authorization,
             transition,
             previous_owner_record=previous_owner_record,
+            terminal_phase=terminal_phase,
         ),
         expected_authorization=install_authorization,
         creates_authorization=False,
@@ -4909,7 +4921,6 @@ import socket
 import struct
 
 import pytest
-
 from simple.eval_runtime.installer_client import (
     HandoffPersistenceUncertain,
     InstallerReply,
@@ -5166,7 +5177,10 @@ def test_two_uncertain_cycles_use_hash_chained_recovery_generations() -> None:
     harness.service_create_journal_then_drop_transport()
     generation_2 = harness.append_recovery_generation()
     assert generation_2.recovery_generation == 2
-    assert generation_2.previous_entry_sha256 == generation_1.authorization_sha256
+    assert generation_2.previous_entry_sha256 == (
+        generation_1.canonical_entry_sha256
+    )
+    assert generation_2.previous_entry_sha256 != generation_1.authorization_sha256
     assert generation_2.request_digest != generation_1.request_digest
     result_2 = harness.recover(generation_2)
     assert result_2.status == "RECOVERED"
@@ -5200,17 +5214,14 @@ import hashlib
 import json
 import os
 import stat
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
-
-from simple.eval_runtime.installer_manager import (
-    DiskAuthorizationStore,
-    InstallerOrchestrator,
-)
 from simple.eval_runtime.installer_client import (
     INSTALL_AUTHORIZATION_KEYS,
     INSTALL_PUBLICATION_PHASES,
+    OWNER_TRANSITION_ENTRY_KEYS,
     RECOVERY_AUTHORIZATION_KEYS,
     append_publication_phase,
     decode_exact_publication_journal,
@@ -5223,7 +5234,13 @@ from simple.eval_runtime.installer_client import (
     encode_pending_publication_authorization,
     encode_publication_authorization,
     validate_owner_transition_against_records,
+    validate_owner_transition_entry,
 )
+from simple.eval_runtime.installer_manager import (
+    DiskAuthorizationStore,
+    InstallerOrchestrator,
+)
+
 from .fakes import (
     ForkedInstallerService,
     fixture_install_reactivation_transition,
@@ -6691,17 +6708,58 @@ def test_install_and_recovery_authorizations_use_distinct_full_schemas() -> None
     assert RECOVERY_AUTHORIZATION["operation"] == "recover_base_python"
     assert RECOVERY_AUTHORIZATION["recovery_generation"] == 1
     assert RECOVERY_AUTHORIZATION["reason"] == "transport_uncertain"
-    assert RECOVERY_AUTHORIZATION["previous_entry_sha256"] == hashlib.sha256(
-        json.dumps(
-            INSTALL_AUTHORIZATION, sort_keys=True, separators=(",", ":")
-        ).encode()
-    ).hexdigest()
+    assert RECOVERY_AUTHORIZATION["previous_entry_sha256"] is None
     for authorization in (INSTALL_AUTHORIZATION, RECOVERY_AUTHORIZATION):
         assert authorization["construction_kind"] == "base_python"
         assert authorization["source_id"] == "base-python-intake-1"
         assert authorization["construction_attempt"] == 1
         assert authorization["owner_token_sha256"] == "d" * 64
         assert authorization["operation_token_sha256"] == "c" * 64
+
+
+def test_generation_one_rejects_non_null_previous_authorization_link() -> None:
+    owner = json.loads(RECOVERY_OWNER_RECORD)
+    authorization = owner["recovery_authorizations"][0]
+    authorization["previous_entry_sha256"] = "9" * 64
+    _rehash_fixture_authorization(authorization, RECOVERY_REQUEST)
+    owner["active_authorization_sha256"] = authorization[
+        "authorization_sha256"
+    ]
+    with pytest.raises(RuntimeError, match="PUBLICATION_AUTHORIZATION_PREVIOUS"):
+        encode_authorization_owner_record(owner)
+
+
+def test_generation_two_links_complete_canonical_recovery_entry() -> None:
+    _, authorization, _ = _fixture_two_generation_owner()
+    expected = hashlib.sha256(
+        json.dumps(
+            RECOVERY_AUTHORIZATION,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert authorization["previous_entry_sha256"] == expected
+    assert expected != RECOVERY_AUTHORIZATION["authorization_sha256"]
+
+
+@pytest.mark.parametrize(
+    "terminal_phase",
+    ("ABORTED_BEFORE_PREPARED", "BASE_COMPLETE", "COMPLETE"),
+)
+def test_install_reactivation_requires_exact_no_journal_result(
+    terminal_phase: str,
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="PUBLICATION_OWNER_TRANSITION_REACTIVATION_RESULT",
+    ):
+        fixture_install_reactivation_transition(
+            INSTALL_AUTHORIZATION,
+            previous_authorization=RECOVERY_AUTHORIZATION,
+            previous_transition=RECOVERY_AUTHORIZATION["owner_transition"],
+            previous_owner_record=RECOVERY_OWNER_RECORD,
+            terminal_phase=terminal_phase,
+        )
 
 
 @pytest.mark.parametrize(
@@ -6836,6 +6894,11 @@ def test_store_authorization_binds_actual_full_owner_record(tmp_path) -> None:
     store = DiskAuthorizationStore.open_readonly(root)
     snapshot = store.validated_snapshot()
     transition_entry = snapshot.owner_transition_history[0]
+    encoded_transition_entry = transition_entry.as_mapping()
+    assert set(encoded_transition_entry) == OWNER_TRANSITION_ENTRY_KEYS
+    assert validate_owner_transition_entry(encoded_transition_entry) == (
+        encoded_transition_entry
+    )
     before = encode_authorization_owner_record(
         transition_entry.from_owner_record
     )
@@ -6865,6 +6928,36 @@ def test_store_authorization_binds_actual_full_owner_record(tmp_path) -> None:
         expected_authorization=authorization,
         creates_authorization=True,
     )
+    transition_history = tuple(
+        entry.as_mapping() for entry in snapshot.owner_transition_history
+    )
+    publication = {
+        "source_parent_identity": {
+            "device": 1, "inode": 2, "mount_id": 3,
+            "mode": 0o700, "uid": os.getuid(), "gid": os.getgid(),
+        },
+        "staging_identity": {
+            "device": 1, "inode": 4, "mount_id": 3,
+            "mode": 0o700, "uid": os.getuid(), "gid": os.getgid(),
+        },
+    }
+    journal = append_publication_phase(
+        b"",
+        install_request=INSTALL_REQUEST,
+        install_authorization=authorization,
+        actor_request=INSTALL_REQUEST,
+        actor_authorization=authorization,
+        phase="INITIAL",
+        publication=publication,
+        observed_root_mode=0o700,
+        owner_transition_history=transition_history,
+    )
+    assert decode_exact_publication_journal(
+        journal,
+        install_request=INSTALL_REQUEST,
+        install_authorization=authorization,
+        owner_transition_history=transition_history,
+    )[0]["actor_owner_transition"] == transition
 
 
 @pytest.mark.parametrize(
@@ -7079,6 +7172,97 @@ def test_privileged_journal_rejects_transition_only_history() -> None:
             owner_transition_history=(
                 INSTALL_AUTHORIZATION["owner_transition"],
             ),
+        )
+
+
+def test_privileged_decoder_rejects_flattened_transition_entry() -> None:
+    flattened = {
+        **INSTALL_TRANSITION_ENTRY["transition"],
+        "from_owner_record": INSTALL_TRANSITION_ENTRY["from_owner_record"],
+        "to_owner_record": INSTALL_TRANSITION_ENTRY["to_owner_record"],
+    }
+    with pytest.raises(
+        RuntimeError, match="PUBLICATION_OWNER_TRANSITION_ENTRY_SCHEMA"
+    ):
+        validate_owner_transition_entry(flattened)
+
+
+def _initial_journal_after_owner_gap(
+    updates: dict[str, object],
+) -> bytes:
+    gap_owner = json.loads(INSTALL_OWNER_RECORD)
+    gap_owner.update(updates)
+    gap_before = encode_authorization_owner_record(gap_owner)
+    authorization = fixture_publication_authorization(
+        RECOVERY_REQUEST,
+        previous=INSTALL_AUTHORIZATION,
+        previous_transition=INSTALL_TRANSITION_ENTRY,
+        previous_owner_record=gap_before,
+    )
+    gap_after = fixture_owner_record_for_authorization(
+        authorization,
+        request=RECOVERY_REQUEST,
+        previous_owner_record=gap_before,
+    )
+    transition_history = (
+        INSTALL_TRANSITION_ENTRY,
+        fixture_owner_transition_entry(
+            authorization,
+            previous_owner_record=gap_before,
+            target_owner_record=gap_after,
+            creates_authorization=True,
+        ),
+    )
+    publication = {
+        "source_parent_identity": {
+            "device": 1, "inode": 2, "mount_id": 3,
+            "mode": 0o700, "uid": os.getuid(), "gid": os.getgid(),
+        },
+        "staging_identity": {
+            "device": 1, "inode": 4, "mount_id": 3,
+            "mode": 0o700, "uid": os.getuid(), "gid": os.getgid(),
+        },
+    }
+    return append_publication_phase(
+        b"",
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+        recovery_requests=(RECOVERY_REQUEST,),
+        recovery_authorizations=(authorization,),
+        actor_request=INSTALL_REQUEST,
+        actor_authorization=INSTALL_AUTHORIZATION,
+        phase="INITIAL",
+        publication=publication,
+        observed_root_mode=0o700,
+        owner_transition_history=transition_history,
+    )
+
+
+def test_owner_transition_history_allows_only_explicit_phase_heartbeat_gap() -> None:
+    journal = _initial_journal_after_owner_gap(
+        {
+            "phase": "HSSD_NORMALIZED",
+            "pending_action": "prepare-recovery",
+            "heartbeat_monotonic_ns": 2,
+            "heartbeat_wall_ns": 2,
+        }
+    )
+    assert journal.endswith(b"\n")
+
+
+def test_owner_transition_history_rejects_security_identity_gap() -> None:
+    with pytest.raises(
+        RuntimeError, match="PUBLICATION_OWNER_TRANSITION_RECORD_CHAIN"
+    ):
+        _initial_journal_after_owner_gap({"run_id": "forged-gap-run"})
+
+
+def test_owner_transition_history_rejects_heartbeat_rollback() -> None:
+    with pytest.raises(
+        RuntimeError, match="PUBLICATION_OWNER_TRANSITION_HEARTBEAT_ORDER"
+    ):
+        _initial_journal_after_owner_gap(
+            {"heartbeat_monotonic_ns": 0, "heartbeat_wall_ns": 0}
         )
 
 
@@ -7775,8 +7959,9 @@ def test_fork_exit_restart_uses_real_wire_order_and_byte_exact_replay(
     assert [
         entry.recovery_generation for entry in snapshot.recovery_authorizations
     ] == [1, 2]
+    assert snapshot.recovery_authorizations[0].previous_entry_sha256 is None
     assert [
-        entry.reason for entry in snapshot.owner_transition_history
+        entry.transition["reason"] for entry in snapshot.owner_transition_history
     ] == [
         "activate_authorization",
         "activate_authorization",
@@ -7784,10 +7969,18 @@ def test_fork_exit_restart_uses_real_wire_order_and_byte_exact_replay(
         "activate_authorization",
     ]
     assert snapshot.recovery_authorizations[1].previous_entry_sha256 == (
-        snapshot.recovery_authorizations[0].authorization_sha256
+        hashlib.sha256(
+            json.dumps(
+                asdict(snapshot.recovery_authorizations[0]),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
     )
-    assert snapshot.owner_transition_history[3].previous_transition_sha256 == (
-        snapshot.owner_transition_history[2].transition_sha256
+    assert snapshot.owner_transition_history[3].transition[
+        "previous_transition_sha256"
+    ] == (
+        snapshot.owner_transition_history[2].transition["transition_sha256"]
     )
     assert snapshot.result_chain_valid is True
     assert snapshot.temporary_entries == ()
@@ -8053,6 +8246,12 @@ RECOVERY_RESULT_KEYS = {
 }
 OWNER_TRANSITION_ENTRY_KEYS = {
     "transition", "from_owner_record", "to_owner_record",
+}
+OWNER_TRANSITION_GAP_MUTABLE_KEYS = {
+    "phase", "cleanup_required", "pending_action", "pending_local_transition",
+    "heartbeat_monotonic_ns", "heartbeat_wall_ns", "last_error",
+    "transport_uncertain", "response_uncertain", "last_preacquisition_status",
+    "locked_response_records",
 }
 PUBLICATION_JOURNAL_ENTRY_KEYS = PUBLICATION_RECEIPT_KEYS | {
     "sequence", "phase", "previous_entry_sha256", "receipt_sha256",
@@ -8447,6 +8646,20 @@ def validate_owner_transition_against_records(
         }
         if changed - allowed:
             raise RuntimeError("PUBLICATION_OWNER_TRANSITION_FORBIDDEN_DELTA")
+        before_active = before["active_service_authorization"]
+        active_recovery = (
+            None
+            if before_active is None or before_active["kind"] != "recovery"
+            else before["recovery_authorizations"][
+                before_active["generation"] - 1
+            ]
+        )
+        appended_result = (
+            after["recovery_results"][-1]
+            if len(after["recovery_results"])
+            == len(before["recovery_results"]) + 1
+            else None
+        )
         if (
             expected_authorization["kind"] != "install"
             or after["install_authorization"] != before["install_authorization"]
@@ -8457,8 +8670,20 @@ def validate_owner_transition_against_records(
             or after["recovery_results"][:-1] != before["recovery_results"]
             or after["active_service_authorization"]
             != {"kind": "install", "generation": 0}
+            or active_recovery is None
+            or appended_result is None
+            or before_active["generation"]
+            != len(before["recovery_authorizations"])
+            or appended_result["recovery_generation"]
+            != before_active["generation"]
+            or appended_result["authorization_sha256"]
+            != active_recovery["authorization_sha256"]
+            or appended_result["request_sha256"]
+            != active_recovery["request_sha256"]
+            or appended_result["terminal_phase"]
+            != "NO_JOURNAL_NO_MUTATION"
         ):
-            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_REACTIVATION_DELTA")
+            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_REACTIVATION_RESULT")
     else:
         raise RuntimeError("PUBLICATION_OWNER_TRANSITION_REASON")
 
@@ -8606,8 +8831,20 @@ def encode_pending_publication_authorization(
     if kind == "install":
         if recovery_reason is not None or payload["recovery_token_sha256"] is not None:
             raise RuntimeError("PUBLICATION_AUTHORIZATION_RECOVERY_FIELDS")
-    elif type(recovery_reason) is not str or not recovery_reason:
-        raise RuntimeError("PUBLICATION_AUTHORIZATION_RECOVERY_REASON")
+    else:
+        if type(recovery_reason) is not str or not recovery_reason:
+            raise RuntimeError("PUBLICATION_AUTHORIZATION_RECOVERY_REASON")
+        expected_generation = previous_authorization.get(
+            "recovery_generation", 0
+        ) + 1
+        if generation != expected_generation or (
+            generation == 1
+            and previous_authorization["kind"] != "install"
+        ) or (
+            generation > 1
+            and previous_authorization["kind"] != "recovery"
+        ):
+            raise RuntimeError("PUBLICATION_AUTHORIZATION_PREVIOUS")
     authorization = {
         **_authorization_request_fields(request),
         "kind": kind,
@@ -8621,8 +8858,10 @@ def encode_pending_publication_authorization(
                 "recovery_generation": generation,
                 "recovery_token_sha256": payload["recovery_token_sha256"],
                 "reason": recovery_reason,
-                "previous_entry_sha256": _authorization_entry_sha256(
-                    previous_authorization
+                "previous_entry_sha256": (
+                    None
+                    if generation == 1
+                    else _authorization_entry_sha256(previous_authorization)
                 ),
             }
         )
@@ -8720,9 +8959,17 @@ def _validate_authorization_shape(
             or not authorization["reason"]
         ):
             raise RuntimeError("PUBLICATION_AUTHORIZATION_RECOVERY_VALUE")
-        for key in ("recovery_token_sha256", "previous_entry_sha256"):
+        _require_sha256(
+            authorization["recovery_token_sha256"],
+            code="PUBLICATION_OWNER_RECORD_AUTHORIZATION_DIGEST",
+        )
+        previous_entry = authorization["previous_entry_sha256"]
+        if authorization["recovery_generation"] == 1:
+            if previous_entry is not None:
+                raise RuntimeError("PUBLICATION_AUTHORIZATION_PREVIOUS")
+        else:
             _require_sha256(
-                authorization[key],
+                previous_entry,
                 code="PUBLICATION_OWNER_RECORD_AUTHORIZATION_DIGEST",
             )
     digest = authorization["authorization_sha256"]
@@ -8751,22 +8998,26 @@ def _validate_owner_authorization_histories(
         )
         if install["kind"] != "install":
             raise RuntimeError("PUBLICATION_AUTHORIZATION_KIND")
-    previous_authorization = install
     for generation, authorization in enumerate(recoveries, 1):
         _validate_authorization_shape(
             authorization, allow_pending=allow_pending_authorization
         )
+        predecessor = install if generation == 1 else recoveries[generation - 2]
+        expected_previous_entry = (
+            None
+            if generation == 1
+            else _authorization_entry_sha256(predecessor)
+        )
         if (
             authorization["kind"] != "recovery"
             or authorization["recovery_generation"] != generation
-            or previous_authorization is None
             or authorization["previous_entry_sha256"]
-            != _authorization_entry_sha256(previous_authorization)
+            != expected_previous_entry
+            or predecessor is None
             or authorization["authorization_sequence"]
-            <= previous_authorization["authorization_sequence"]
+            <= predecessor["authorization_sequence"]
         ):
             raise RuntimeError("PUBLICATION_AUTHORIZATION_CHAIN")
-        previous_authorization = authorization
     if len(results) > len(recoveries):
         raise RuntimeError("PUBLICATION_OWNER_RECOVERY_RESULT_PREFIX")
     previous_result = None
@@ -8808,6 +9059,32 @@ def _validate_owner_authorization_histories(
         expected_result_count -= 1
     if len(results) != expected_result_count:
         raise RuntimeError("PUBLICATION_OWNER_RECOVERY_RESULT_PREFIX")
+
+
+def _owner_transition_gap_projection(
+    owner: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        key: owner[key]
+        for key in OWNER_RECORD_KEYS - OWNER_TRANSITION_GAP_MUTABLE_KEYS
+    }
+
+
+def _validate_permitted_owner_transition_gap(
+    previous_after: Mapping[str, object],
+    current_before: Mapping[str, object],
+) -> None:
+    if _owner_transition_gap_projection(
+        previous_after
+    ) != _owner_transition_gap_projection(current_before):
+        raise RuntimeError("PUBLICATION_OWNER_TRANSITION_RECORD_CHAIN")
+    for key in ("heartbeat_monotonic_ns", "heartbeat_wall_ns"):
+        if current_before[key] < previous_after[key]:
+            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_HEARTBEAT_ORDER")
+    previous_locked = previous_after["locked_response_records"]
+    current_locked = current_before["locked_response_records"]
+    if current_locked[: len(previous_locked)] != previous_locked:
+        raise RuntimeError("PUBLICATION_OWNER_TRANSITION_DIAGNOSTIC_PREFIX")
 
 
 def _validate_owner_transition_history(
@@ -8862,14 +9139,12 @@ def _validate_owner_transition_history(
             != previous["to_authorization_id"]
             or transition["from_authorization_sequence"]
             != previous["to_authorization_sequence"]
-            or transition["from_pending_action"]
-            != previous["to_pending_action"]
         ):
             raise RuntimeError("PUBLICATION_OWNER_TRANSITION_SOURCE")
-        if previous_after is not None and (
-            validated_entry["from_owner_record"] != previous_after
-        ):
-            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_RECORD_CHAIN")
+        if previous_after is not None:
+            _validate_permitted_owner_transition_gap(
+                previous_after, validated_entry["from_owner_record"]
+            )
         previous = transition
         previous_after = validated_entry["to_owner_record"]
         transitions.append(transition)
@@ -8961,12 +9236,28 @@ def _validate_publication_authorization(
         if authorization["kind"] != "install":
             raise RuntimeError("PUBLICATION_AUTHORIZATION_KIND")
     else:
+        expected_generation = previous_authorization.get(
+            "recovery_generation", 0
+        ) + 1
+        expected_previous_entry = (
+            None
+            if expected_generation == 1
+            else _authorization_entry_sha256(previous_authorization)
+        )
         if (
             authorization["kind"] != "recovery"
             or authorization["previous_entry_sha256"]
-            != _authorization_entry_sha256(previous_authorization)
+            != expected_previous_entry
             or authorization["recovery_generation"]
-            != previous_authorization.get("recovery_generation", 0) + 1
+            != expected_generation
+            or (
+                expected_generation == 1
+                and previous_authorization["kind"] != "install"
+            )
+            or (
+                expected_generation > 1
+                and previous_authorization["kind"] != "recovery"
+            )
             or sequence <= previous_authorization["authorization_sequence"]
         ):
             raise RuntimeError("PUBLICATION_AUTHORIZATION_PREVIOUS")
@@ -9837,25 +10128,34 @@ class RecoveryAuthorization:
     recovery_generation: int
     recovery_token_sha256: str
     reason: str
-    previous_entry_sha256: str
+    previous_entry_sha256: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class OwnerTransitionEntry:
-    transition_sequence: int
-    transition_sha256: str
-    previous_transition_sha256: str | None
-    reason: str
-    from_authorization_id: str | None
-    from_authorization_sequence: int
-    from_owner_record_sha256: str
+    transition: Mapping[str, object]
     from_owner_record: Mapping[str, object]
-    from_pending_action: str
-    to_authorization_id: str
-    to_authorization_sequence: int
-    to_owner_record_projection_sha256: str
     to_owner_record: Mapping[str, object]
-    to_pending_action: str
+
+    @classmethod
+    def from_mapping(
+        cls, value: Mapping[str, object]
+    ) -> "OwnerTransitionEntry":
+        validated = validate_owner_transition_entry(dict(value))
+        return cls(
+            transition=validated["transition"],
+            from_owner_record=validated["from_owner_record"],
+            to_owner_record=validated["to_owner_record"],
+        )
+
+    def as_mapping(self) -> dict[str, object]:
+        return validate_owner_transition_entry(
+            {
+                "transition": dict(self.transition),
+                "from_owner_record": dict(self.from_owner_record),
+                "to_owner_record": dict(self.to_owner_record),
+            }
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -10549,9 +10849,9 @@ class InstallerOrchestrator:
             session.close()
 ```
 
-`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, an independent append-only owner-transition JSONL, append-only locked-response uncertainty records, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. `OWNER_RECORD_KEYS` is the exact persisted schema, not a reduced authorization view: it includes the complete construction identity and attempt state, both tokens, owner process identity, paths, phase and pending state, cleanup and uncertainty state, immutable install authorization, complete recovery authorization/result histories, active reference and `active_authorization_sha256`, authorization sequence, protected-validation mirrors, component/final/receipt identities, diagnostics, and terminal state. Install and recovery authorizations use distinct exact schemas. Both persist operation, complete construction identity/attempt/token fields, canonical request digest, sequence, authorization digest, and owner transition; recovery additionally persists generation, fresh recovery-token digest, reason, and the digest of the preceding canonical authorization entry. Recovery results have their own canonical `result_sha256`, form a contiguous generation prefix, bind the corresponding authorization/request, and hash-link only to the preceding result. `read_owner_record_bytes()` reopens the current owner path with no-follow/beneath semantics, requires a canonical regular-file record, and returns the exact bytes whose decoded object is also exposed by `validated_snapshot`; every `owner_transition_history` entry stores the transition plus the actual canonical before/after owner objects, never fixture projections.
+`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, an independent append-only owner-transition JSONL, append-only locked-response uncertainty records, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. `OWNER_RECORD_KEYS` is the exact persisted schema, not a reduced authorization view: it includes the complete construction identity and attempt state, both tokens, owner process identity, paths, phase and pending state, cleanup and uncertainty state, immutable install authorization, complete recovery authorization/result histories, active reference and `active_authorization_sha256`, authorization sequence, protected-validation mirrors, component/final/receipt identities, diagnostics, and terminal state. Install and recovery authorizations use distinct exact schemas. Both persist operation, complete construction identity/attempt/token fields, canonical request digest, sequence, authorization digest, and owner transition; recovery additionally persists generation, fresh recovery-token digest, reason, and `previous_entry_sha256`, which is null for generation 1 and otherwise hashes the complete preceding canonical recovery-authorization entry—not the install authorization and not its inner authorization digest. Recovery results have their own canonical `result_sha256`, form a contiguous generation prefix, bind the corresponding authorization/request, and hash-link only to the preceding result. `read_owner_record_bytes()` reopens the current owner path with no-follow/beneath semantics, requires a canonical regular-file record, and returns the exact bytes whose decoded object is also exposed by `validated_snapshot`; every `owner_transition_history` entry has exactly the nested `{transition, from_owner_record, to_owner_record}` representation in memory, JSONL, manager snapshots, and privileged-decoder input. `OwnerTransitionEntry.from_mapping()` and `.as_mapping()` are the only object/mapping conversion seam; flattened transition fields are forbidden.
 
-Authorization construction is explicitly acyclic. For a newly created authorization, the transition intent hashes the exact prior canonical owner-record bytes plus the complete intended target owner record with only the new authorization's own `authorization_sha256`, its embedded `owner_transition`, and the top-level `active_authorization_sha256` neutralized to null. Every other security-relevant field remains in that projection. The authorization digest then binds the transition intent and exact request digest; only afterward is the same target record encoded with the new authorization and identical digest at both the active object and top-level active-digest field. Reactivation creates no authorization, so its projection is the complete intended target record without neutralization. The append-only transition evidence stores the exact canonical before/after owner objects beside the intent, and `validate_owner_transition_against_records` must recompute the prior full-record digest, target projection digest, full field-for-field owner delta, active authorization object and digest, active IDs/sequences/actions, authorization digest, and transition chain from those persisted bytes. A target full-owner digest is never an authorization input. The durable store, installer service, and tests all call the same owner-record, projection, authorization, and transition encoders and validators; fixtures may not invent owner hashes or reduced owner objects. Tests bootstrap the real `DiskAuthorizationStore`, compare its actual `owner-record.json` bytes with its transition-history target, and mutate construction state, tokens, phase, cleanup state, both recovery histories, active reference, and active digest independently.
+Authorization construction is explicitly acyclic. For a newly created authorization, the transition intent hashes the exact prior canonical owner-record bytes plus the complete intended target owner record with only the new authorization's own `authorization_sha256`, its embedded `owner_transition`, and the top-level `active_authorization_sha256` neutralized to null. Every other security-relevant field remains in that projection. The authorization digest then binds the transition intent and exact request digest; only afterward is the same target record encoded with the new authorization and identical digest at both the active object and top-level active-digest field. Reactivation creates no authorization, so its projection is the complete intended target record without neutralization. The append-only transition evidence stores the exact canonical before/after owner objects beside the intent, and `validate_owner_transition_against_records` must recompute the prior full-record digest, target projection digest, full field-for-field owner delta, active authorization object and digest, active IDs/sequences/actions, authorization digest, and transition chain from those persisted bytes. Consecutive authorization entries need not have byte-identical boundary records because separately fsynced construction-phase, heartbeat, and bounded diagnostic replacements may intervene. `_owner_transition_gap_projection` therefore removes only the exact `OWNER_TRANSITION_GAP_MUTABLE_KEYS` lifecycle/diagnostic fields and requires every construction identity/path/attempt, owner/operation token, owner process identity, install/recovery authorization and result history, active reference/digest, authorization sequence, and protected publication field to remain byte-identical across the gap. Heartbeats must be nondecreasing and locked-response diagnostics append-only. Transition SHA/sequence and source authorization ID/sequence chains remain exact; pending action is validated against each entry's own full record rather than the prior entry. A target full-owner digest is never an authorization input. The durable store, installer service, and tests all call the same owner-record, projection, authorization, and transition encoders and validators; fixtures may not invent owner hashes or reduced owner objects. Tests bootstrap the real `DiskAuthorizationStore`, pass its actual nested transition entries through the privileged decoder, accept a coherently rehashed heartbeat/phase/pending-action gap, and reject heartbeat rollback, a coherently rehashed security-identity gap, plus independent construction-state, token, cleanup, history, active-reference, and active-digest mutations.
 
 The root manifest pins the construction- and transaction-lock device/inode/mount identities, the configured protected journal/receipt/publication roots, and the original install digest. The store calls only `encode_installer_request` for install and recovery documents. Every generated wire document therefore has exactly the six top-level request keys, keeps construction-attempt and recovery-generation fields inside the exact operation payload, and records an explicit request ID that byte-identical replay preserves. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks, passing its still-locked construction FD to `UnixInstallerSession`; the session derives response matching from the explicit request ID rather than the body digest. After the privileged service acquires its root transaction lock and reopens the current owner record, it opens the token-derived authorization, result, and transition JSONL files beneath the fixed configured manager-control parent with no-follow/beneath semantics. It accepts only full transition entries containing canonical before/after owner objects, requires the last target bytes to equal the independently reopened current owner bytes, and calls the same reason-specific full-record delta validator used by the manager; a caller-supplied transition dictionary is never an authorization input. The store likewise opens protected evidence read-only and calls only `decode_exact_publication_journal` and `decode_exact_publication_receipt`, passing the immutable original install request plus the complete exact fsynced authorization, result, transition-entry, and canonical owner-record histories. The decoder resolves journal actors by request ID; it permits earlier no-journal authorizations and the intervening install-reactivation transition to be absent as journal actors while still requiring every immutable history entry and chain link to validate against its persisted before/after owner bytes. It rehashes the fsynced wire response bytes and requires the digest to equal the terminal-response digest in the final record for that same install or recovery request before checking every response field against the independently decoded journal/receipt/root values. The response digest is excluded from the receipt, so constructing the response after receipt creation and binding its digest into the final journal record creates no hash cycle.
 
@@ -10563,7 +10863,7 @@ The root manifest pins the construction- and transaction-lock device/inode/mount
 
 Reactivation, publication-validation, terminal-clear, and resubmission hooks surround those real orchestration operations, never a synthetic reply. `validated_snapshot` exposes non-null `transport_uncertain`, `response_uncertain`, last pre-acquisition status, active authorization kind/generation, locked-response records, protected-validation progress, and exact next/last request bytes; `recovery_decision`, `reconcile_exact_reply`, `reconcile_locked_response_uncertain`, and restart methods reopen all files with `openat2`/no-follow semantics, reject any invalid suffix or temporary entry, verify both independent hash chains and the active-reference digest, and never infer state from an un-fsynced pending file. Live reconciliation closes neither FD on any error. Restart acquires the pinned construction lock and uses only the fsynced prefix. It reaches terminal only by receiving and durably recording the next required authenticated wire response, if one is still required, and then completing all pending independent publication-validation transitions.
 
-`AuthorizationHistory.append_recovery()` requires generation `last + 1`, a fresh token and authorization ID, `previous_entry_sha256=None` for generation 1 and otherwise the exact canonical digest of the preceding authorization entry, a monotonic authorization sequence, and one active reference. `RecoveryResultHistory.append()` separately requires a contiguous result prefix and `previous_result_sha256=None` for its first result and otherwise the preceding result digest. Authorization objects contain no result field, and result entries never participate in the authorization chain. `NO_JOURNAL_NO_MUTATION` reactivates the unchanged install authorization and byte-identical request; every further uncertainty appends a new recovery generation. Neither history overwrites or reorders an entry, marks an older entry active, or uses `pending_action` as authority.
+`AuthorizationHistory.append_recovery()` requires generation `last + 1`, a fresh token and authorization ID, `previous_entry_sha256=None` for generation 1 and otherwise the exact canonical digest of the preceding recovery-authorization entry, a monotonic authorization sequence, and one active reference. `RecoveryResultHistory.append()` separately requires a contiguous result prefix and `previous_result_sha256=None` for its first result and otherwise the preceding result digest. Authorization objects contain no result field, and result entries never participate in the authorization chain. `NO_JOURNAL_NO_MUTATION` reactivates the unchanged install authorization and byte-identical request only when the newly appended result has that exact terminal phase and matches the before-record's active final recovery generation, authorization digest, and request digest. `ABORTED_BEFORE_PREPARED`, `BASE_COMPLETE`, `COMPLETE`, or a result for any other generation cannot reactivate install even if every affected object and hash is recomputed coherently. Every further uncertainty appends a new recovery generation. Neither history overwrites or reorders an entry, marks an older entry active, or uses `pending_action` as authority.
 
 `InstallerManagerOwnership` closes the handed-off transaction-lock OFD only on the success path after the wire-result owner record and parent-directory fsyncs return. On any transition write, replacement, file fsync, or parent fsync failure it retains the still-open descriptor and the already-held stable construction-lock FD in `HANDOFF_PERSISTENCE_UNCERTAIN`. `reconcile_locked_handoff()` follows the same split lifetime: after it reopens and reconciles the exact fsynced response/uncertainty transition, it closes only the transaction OFD and clears `_retained`; it never calls `_close_construction_lock`. A reconciled `INSTALLED`/`RECOVERED` snapshot must remain nonterminal with `VALIDATE_PUBLICATION` pending, after which `drive_to_terminal()` performs both mirrors and published-root validation without another wire request. A reconciled malformed response remains uncertain and may release construction ownership only through the explicit uncertain-transport close path.
 
