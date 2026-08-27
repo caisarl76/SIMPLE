@@ -385,12 +385,67 @@ class RecoveryHarness:
         return "AUTHORIZATION_KIND" if reference.startswith("install:") else "accepted"
 
 
+def fixture_publication_authorization(
+    request: dict[str, object],
+    *,
+    previous: dict[str, object] | None,
+) -> dict[str, object]:
+    sequence = 1 if previous is None else previous["authorization_sequence"] + 1
+    before_id = None if previous is None else previous["authorization_id"]
+    before_sequence = sequence - 1
+    before_pending = (
+        "prepare_install_authorization"
+        if previous is None else previous["owner_transition"]["to_pending_action"]
+    )
+    transition = {
+        "from_authorization_id": before_id,
+        "from_authorization_sequence": before_sequence,
+        "from_owner_record_sha256": hashlib.sha256(
+            f"fixture-owner-before:{sequence}".encode()
+        ).hexdigest(),
+        "from_pending_action": before_pending,
+        "to_authorization_id": request["payload"]["authorization_id"],
+        "to_authorization_sequence": sequence,
+        "to_owner_record_sha256": hashlib.sha256(
+            f"fixture-owner-after:{sequence}".encode()
+        ).hexdigest(),
+        "to_pending_action": request["operation"],
+    }
+    digest_input = {
+        "authorization_id": request["payload"]["authorization_id"],
+        "authorization_sequence": sequence,
+        "owner_transition": transition,
+        "previous_authorization_sha256": (
+            None if previous is None else previous["authorization_sha256"]
+        ),
+        "request_sha256": hashlib.sha256(
+            json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+    return {
+        "authorization_id": request["payload"]["authorization_id"],
+        "authorization_sequence": sequence,
+        "authorization_sha256": hashlib.sha256(
+            json.dumps(
+                digest_input, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+        "previous_authorization_sha256": (
+            None if previous is None else previous["authorization_sha256"]
+        ),
+        "owner_transition": transition,
+    }
+
+
 class ForkedInstallerService:
-    def __init__(self, root: Path, pid: int):
+    def __init__(
+        self, root: Path, pid: int, *, expected_exit_codes: set[int] | None = None
+    ):
         self.root = root
         self.pid = pid
         self.socket_path = root / "installer.sock"
         self._stop_requested = False
+        self._expected_exit_codes = expected_exit_codes or {0}
 
     @classmethod
     def start(
@@ -401,6 +456,11 @@ class ForkedInstallerService:
         transaction_lock: Path,
         script: tuple[str, ...] | None = None,
         response_fault: str | None = None,
+        publication_crash_after: str | None = None,
+        resume_install_request: dict[str, object] | None = None,
+        resume_install_authorization: dict[str, object] | None = None,
+        resume_recovery_requests: tuple[dict[str, object], ...] = (),
+        resume_recovery_authorizations: tuple[dict[str, object], ...] = (),
     ) -> "ForkedInstallerService":
         root.mkdir(mode=0o700)
         transaction_lock.touch(mode=0o600)
@@ -412,16 +472,22 @@ class ForkedInstallerService:
         pid = os.fork()
         if pid == 0:
             os.close(ready_read)
+            if publication_crash_after is not None:
+                os.environ["SIMPLE_FIXTURE_CRASH_AFTER_PUBLICATION_PHASE"] = (
+                    publication_crash_after
+                )
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(os.fspath(root / "installer.sock"))
             listener.listen(4)
             os.write(ready_write, b"1")
             os.close(ready_write)
             install_count = 0
-            journal_created = False
-            install_request: dict[str, object] | None = None
+            journal_created = resume_install_request is not None
+            install_request = resume_install_request
+            install_authorization = resume_install_authorization
             publication: dict[str, object] | None = None
-            recovery_requests: list[dict[str, object]] = []
+            recovery_requests = list(resume_recovery_requests)
+            recovery_authorizations = list(resume_recovery_authorizations)
             script_index = 0
             try:
                 while True:
@@ -497,6 +563,39 @@ class ForkedInstallerService:
                                     and request["operation"].startswith("install_")
                                 ):
                                     bound_install_request = request
+                                bound_install_authorization = install_authorization
+                                if (
+                                    bound_install_authorization is None
+                                    and request["operation"].startswith("install_")
+                                ):
+                                    bound_install_authorization = (
+                                        fixture_publication_authorization(
+                                            request, previous=None
+                                        )
+                                    )
+                                if request["operation"].startswith("install_"):
+                                    actor_authorization = (
+                                        bound_install_authorization
+                                    )
+                                else:
+                                    known_ids = [
+                                        item["request_id"]
+                                        for item in recovery_requests
+                                    ]
+                                    actor_authorization = (
+                                        recovery_authorizations[
+                                            known_ids.index(request["request_id"])
+                                        ]
+                                        if request["request_id"] in known_ids
+                                        else fixture_publication_authorization(
+                                            request,
+                                            previous=(
+                                                recovery_authorizations[-1]
+                                                if recovery_authorizations
+                                                else bound_install_authorization
+                                            ),
+                                        )
+                                    )
                                 publication = cls._send_response(
                                     connection,
                                     transaction_lock=transaction_lock,
@@ -504,9 +603,16 @@ class ForkedInstallerService:
                                     status=response_status,
                                     fault=response_fault,
                                     install_request=bound_install_request,
+                                    install_authorization=(
+                                        bound_install_authorization
+                                    ),
+                                    actor_authorization=actor_authorization,
                                     publication=publication,
                                     prior_recovery_requests=tuple(
                                         recovery_requests
+                                    ),
+                                    prior_recovery_authorizations=tuple(
+                                        recovery_authorizations
                                     ),
                                 )
                                 if response_status in {
@@ -514,6 +620,7 @@ class ForkedInstallerService:
                                     "TRANSPORT_DROPPED_AFTER_JOURNAL",
                                 }:
                                     install_request = request
+                                    install_authorization = actor_authorization
                                     journal_created = True
                                 elif response_status == "RECOVERED":
                                     if not any(
@@ -522,6 +629,9 @@ class ForkedInstallerService:
                                         for recorded in recovery_requests
                                     ):
                                         recovery_requests.append(request)
+                                        recovery_authorizations.append(
+                                            actor_authorization
+                                        )
                             finally:
                                 os.close(construction_fd)
                         except BrokenPipeError:
@@ -533,7 +643,13 @@ class ForkedInstallerService:
         if os.read(ready_read, 1) != b"1":
             raise RuntimeError("INSTALLER_TEST_SERVICE_START")
         os.close(ready_read)
-        return cls(root, pid)
+        return cls(
+            root,
+            pid,
+            expected_exit_codes=(
+                {87} if publication_crash_after is not None else {0}
+            ),
+        )
 
     @staticmethod
     def _receive_request(
@@ -679,8 +795,11 @@ class ForkedInstallerService:
         status: str,
         fault: str | None = None,
         install_request: dict[str, object] | None,
+        install_authorization: dict[str, object] | None,
+        actor_authorization: dict[str, object],
         publication: dict[str, object] | None,
         prior_recovery_requests: tuple[dict[str, object], ...],
+        prior_recovery_authorizations: tuple[dict[str, object], ...],
     ) -> dict[str, object] | None:
         wire_status = (
             "INSTALLED"
@@ -706,6 +825,8 @@ class ForkedInstallerService:
             if wire_status in {"INSTALLED", "RECOVERED"}:
                 if install_request is None:
                     raise RuntimeError("INSTALLER_TEST_INSTALL_REQUEST_MISSING")
+                if install_authorization is None:
+                    raise RuntimeError("INSTALLER_TEST_INSTALL_AUTHORIZATION_MISSING")
                 if wire_status == "INSTALLED":
                     if request != install_request:
                         raise RuntimeError("INSTALLER_TEST_INSTALL_REQUEST_DRIFT")
@@ -722,11 +843,24 @@ class ForkedInstallerService:
                             ForkedInstallerService._materialize_protected_publication(
                                 transaction_lock.parent,
                                 install_request=install_request,
+                                install_authorization=install_authorization,
                                 component_names=component_names,
                             )
                         )
                 elif publication is None:
-                    raise RuntimeError("INSTALLER_TEST_PUBLICATION_MISSING")
+                    publication = (
+                        ForkedInstallerService._resume_protected_publication(
+                            transaction_lock.parent,
+                            install_request=install_request,
+                            install_authorization=install_authorization,
+                            prior_recovery_requests=prior_recovery_requests,
+                            prior_recovery_authorizations=(
+                                prior_recovery_authorizations
+                            ),
+                            recovery_request=request,
+                            recovery_authorization=actor_authorization,
+                        )
+                    )
             payload = ForkedInstallerService._encode_response(
                 request=request,
                 status=wire_status,
@@ -737,14 +871,20 @@ class ForkedInstallerService:
                 ForkedInstallerService._write_install_publication_journal(
                     publication,
                     install_request=install_request,
+                    install_authorization=install_authorization,
                     terminal_response=payload,
                 )
             elif wire_status == "RECOVERED":
                 ForkedInstallerService._append_recovery_publication_journal(
                     publication,
                     install_request=install_request,
+                    install_authorization=install_authorization,
                     prior_recovery_requests=prior_recovery_requests,
+                    prior_recovery_authorizations=(
+                        prior_recovery_authorizations
+                    ),
                     recovery_request=request,
+                    recovery_authorization=actor_authorization,
                     terminal_response=payload,
                 )
             if publication is not None and wire_status in {"INSTALLED", "RECOVERED"}:
@@ -897,9 +1037,11 @@ class ForkedInstallerService:
         control_parent: Path,
         *,
         install_request: dict[str, object],
+        install_authorization: dict[str, object],
         component_names: tuple[str, ...],
     ) -> dict[str, object]:
         from simple.eval_runtime.installer_client import (
+            append_publication_phase,
             encode_publication_receipt,
         )
 
@@ -926,6 +1068,33 @@ class ForkedInstallerService:
             f"{install_request['payload']['operation_token_sha256']}"
         )
         staged.mkdir(mode=0o700, exist_ok=False)
+        source_parent_identity = ForkedInstallerService._path_identity(
+            staging_parent
+        )
+        staging_identity = ForkedInstallerService._path_identity(staged)
+        journal_path = journals / (
+            f"{install_request['payload']['operation_token_sha256']}.jsonl"
+        )
+        publication: dict[str, object] = {
+            "journal_path": os.fspath(journal_path),
+            "source_parent_identity": source_parent_identity,
+            "staging_identity": staging_identity,
+        }
+        initial = append_publication_phase(
+            b"",
+            install_request=install_request,
+            install_authorization=install_authorization,
+            recovery_requests=(),
+            recovery_authorizations=(),
+            actor_request=install_request,
+            actor_authorization=install_authorization,
+            phase="INITIAL",
+            publication=publication,
+            observed_root_mode=0o700,
+        )
+        ForkedInstallerService._persist_journal_candidate(
+            journal_path, existing=b"", candidate=initial
+        )
         for name, digest in component_hashes.items():
             path = staged / f"{name}.sha256"
             path.write_text(f"{digest}\n", encoding="ascii")
@@ -963,24 +1132,61 @@ class ForkedInstallerService:
             "mount_id": mount_id,
             "uid": root_status.st_uid,
         }
-        source_parent_identity = ForkedInstallerService._path_identity(
-            staging_parent
+        if {
+            key: root_identity[key]
+            for key in ("device", "inode", "mount_id", "uid", "gid")
+        } != {
+            key: staging_identity[key]
+            for key in ("device", "inode", "mount_id", "uid", "gid")
+        }:
+            raise RuntimeError("INSTALLER_TEST_STAGING_IDENTITY_DRIFT")
+        publication.update(
+            {
+                "completion_sha256": hashlib.sha256(completion).hexdigest(),
+                "component_hashes": component_hashes,
+                "final_tree_sha256": final_tree_sha256,
+                "root_identity": root_identity,
+            }
         )
-        staging_identity = root_identity
+        for phase in ("PREPARED", "RENAME_PENDING"):
+            current = journal_path.read_bytes()
+            candidate = append_publication_phase(
+                current,
+                install_request=install_request,
+                install_authorization=install_authorization,
+                recovery_requests=(),
+                recovery_authorizations=(),
+                actor_request=install_request,
+                actor_authorization=install_authorization,
+                phase=phase,
+                publication=publication,
+                observed_root_mode=0o555,
+            )
+            ForkedInstallerService._persist_journal_candidate(
+                journal_path, existing=current, candidate=candidate
+            )
         published = published_parent / final_tree_sha256
         os.rename(staged, published)
         ForkedInstallerService._fsync_dir(staging_parent)
         ForkedInstallerService._fsync_dir(published_parent)
         if ForkedInstallerService._path_identity(published) != root_identity:
             raise RuntimeError("INSTALLER_TEST_RENAME_IDENTITY")
-        publication = {
-            "completion_sha256": hashlib.sha256(completion).hexdigest(),
-            "component_hashes": component_hashes,
-            "final_tree_sha256": final_tree_sha256,
-            "root_identity": root_identity,
-            "source_parent_identity": source_parent_identity,
-            "staging_identity": staging_identity,
-        }
+        current = journal_path.read_bytes()
+        candidate = append_publication_phase(
+            current,
+            install_request=install_request,
+            install_authorization=install_authorization,
+            recovery_requests=(),
+            recovery_authorizations=(),
+            actor_request=install_request,
+            actor_authorization=install_authorization,
+            phase="FINAL_RENAMED",
+            publication=publication,
+            observed_root_mode=0o555,
+        )
+        ForkedInstallerService._persist_journal_candidate(
+            journal_path, existing=current, candidate=candidate
+        )
         receipt_document = encode_publication_receipt(
             install_request=install_request, publication=publication
         )
@@ -992,9 +1198,6 @@ class ForkedInstallerService:
         ForkedInstallerService._fsync_dir(receipts)
         receipt_sha256 = hashlib.sha256(receipt_document).hexdigest()
         publication["receipt_sha256"] = receipt_sha256
-        journal_path = journals / (
-            f"{install_request['payload']['operation_token_sha256']}.jsonl"
-        )
         return {
             **publication,
             "journal_path": os.fspath(journal_path),
@@ -1005,52 +1208,342 @@ class ForkedInstallerService:
         }
 
     @staticmethod
+    def _resume_protected_publication(
+        control_parent: Path,
+        *,
+        install_request: dict[str, object],
+        install_authorization: dict[str, object],
+        prior_recovery_requests: tuple[dict[str, object], ...],
+        prior_recovery_authorizations: tuple[dict[str, object], ...],
+        recovery_request: dict[str, object],
+        recovery_authorization: dict[str, object],
+    ) -> dict[str, object]:
+        from simple.eval_runtime.installer_client import (
+            INSTALL_PUBLICATION_PHASES,
+            append_publication_phase,
+            decode_exact_publication_journal,
+            encode_publication_receipt,
+        )
+
+        protected = control_parent / "protected-installer"
+        published_parent = protected / "published"
+        receipts = protected / "receipts"
+        journals = protected / "journals"
+        token = install_request["payload"]["operation_token_sha256"]
+        journal = journals / f"{token}.jsonl"
+        prefix = journal.read_bytes()
+        records = decode_exact_publication_journal(
+            prefix,
+            install_request=install_request,
+            install_authorization=install_authorization,
+            recovery_requests=prior_recovery_requests,
+            recovery_authorizations=prior_recovery_authorizations,
+        )
+        install_count = sum(
+            record["phase"] in INSTALL_PUBLICATION_PHASES
+            for record in records
+        )
+        result_record = next(
+            (
+                record for record in reversed(records)
+                if record["final_tree_sha256"] is not None
+            ),
+            None,
+        )
+        staged = published_parent / f".staging-{token}"
+        component_names = (
+            ("base_python",)
+            if install_request["operation"].endswith("base_python")
+            else (
+                "source", "venv", "episode_data", "task_data",
+                "hssd_normalization_results", "runtime_identity",
+            )
+        )
+        component_hashes = {
+            name: hashlib.sha256(f"fixture:{name}\n".encode()).hexdigest()
+            for name in component_names
+        }
+        final_tree_sha256 = hashlib.sha256(
+            json.dumps(
+                component_hashes, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        published = published_parent / final_tree_sha256
+        active_root = staged if staged.exists() else published
+        publication: dict[str, object] = {
+            "journal_path": os.fspath(journal),
+            "source_parent_identity": ForkedInstallerService._path_identity(
+                published_parent
+            ),
+            "staging_identity": ForkedInstallerService._path_identity(
+                active_root
+            ),
+        }
+        if result_record is not None:
+            publication.update(
+                {
+                    key: result_record[key]
+                    for key in (
+                        "completion_sha256", "component_hashes",
+                        "final_tree_sha256", "root_identity",
+                    )
+                }
+            )
+        receipt_path = receipts / f"{final_tree_sha256}.json"
+        receipt_sha256 = (
+            hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+            if receipt_path.exists() else None
+        )
+        current = prefix
+        actor_already_started = any(
+            record["actor_request_id"] == recovery_request["request_id"]
+            for record in records
+        )
+        if actor_already_started:
+            recovery_requests = prior_recovery_requests
+            recovery_authorizations = prior_recovery_authorizations
+            candidate = current
+        else:
+            candidate = append_publication_phase(
+                current,
+                install_request=install_request,
+                install_authorization=install_authorization,
+                recovery_requests=prior_recovery_requests,
+                recovery_authorizations=prior_recovery_authorizations,
+                actor_request=recovery_request,
+                actor_authorization=recovery_authorization,
+                phase="RECOVERY_STARTED",
+                publication=publication,
+                observed_root_mode=records[-1]["observed_root_mode"],
+                receipt_sha256=receipt_sha256,
+            )
+            ForkedInstallerService._persist_journal_candidate(
+                journal, existing=current, candidate=candidate
+            )
+            current = candidate
+            recovery_requests = (*prior_recovery_requests, recovery_request)
+            recovery_authorizations = (
+                *prior_recovery_authorizations, recovery_authorization
+            )
+        if install_count < 2:
+            for name, digest in component_hashes.items():
+                path = staged / f"{name}.sha256"
+                path.write_text(f"{digest}\n", encoding="ascii")
+                path.chmod(0o444)
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            completion = json.dumps(
+                {
+                    "component_hashes": component_hashes,
+                    "final_tree_sha256": final_tree_sha256,
+                    "schema_version": 1,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            completion_path = staged / "COMPLETE.json"
+            completion_path.write_bytes(completion)
+            completion_path.chmod(0o444)
+            with completion_path.open("rb") as stream:
+                os.fsync(stream.fileno())
+            staged.chmod(0o555)
+            ForkedInstallerService._fsync_dir(staged)
+            ForkedInstallerService._fsync_dir(published_parent)
+            root_identity = ForkedInstallerService._path_identity(staged)
+            publication.update(
+                {
+                    "completion_sha256": hashlib.sha256(completion).hexdigest(),
+                    "component_hashes": component_hashes,
+                    "final_tree_sha256": final_tree_sha256,
+                    "root_identity": root_identity,
+                    "staging_identity": root_identity,
+                }
+            )
+            current = append_publication_phase(
+                current,
+                install_request=install_request,
+                install_authorization=install_authorization,
+                recovery_requests=recovery_requests,
+                recovery_authorizations=recovery_authorizations,
+                actor_request=recovery_request,
+                actor_authorization=recovery_authorization,
+                phase="PREPARED",
+                publication=publication,
+                observed_root_mode=0o555,
+            )
+            ForkedInstallerService._persist_journal_candidate(
+                journal, existing=candidate, candidate=current
+            )
+            candidate = current
+            install_count = 2
+        if install_count < 3:
+            current = append_publication_phase(
+                current,
+                install_request=install_request,
+                install_authorization=install_authorization,
+                recovery_requests=recovery_requests,
+                recovery_authorizations=recovery_authorizations,
+                actor_request=recovery_request,
+                actor_authorization=recovery_authorization,
+                phase="RENAME_PENDING",
+                publication=publication,
+                observed_root_mode=0o555,
+            )
+            ForkedInstallerService._persist_journal_candidate(
+                journal, existing=candidate, candidate=current
+            )
+            candidate = current
+            install_count = 3
+        if install_count < 4:
+            if staged.exists():
+                os.rename(staged, published)
+                ForkedInstallerService._fsync_dir(published_parent)
+            if ForkedInstallerService._path_identity(published) != (
+                publication["root_identity"]
+            ):
+                raise RuntimeError("INSTALLER_TEST_RECOVERY_RENAME_IDENTITY")
+            current = append_publication_phase(
+                current,
+                install_request=install_request,
+                install_authorization=install_authorization,
+                recovery_requests=recovery_requests,
+                recovery_authorizations=recovery_authorizations,
+                actor_request=recovery_request,
+                actor_authorization=recovery_authorization,
+                phase="FINAL_RENAMED",
+                publication=publication,
+                observed_root_mode=0o555,
+            )
+            ForkedInstallerService._persist_journal_candidate(
+                journal, existing=candidate, candidate=current
+            )
+            candidate = current
+            install_count = 4
+        if install_count < 5:
+            receipt_document = encode_publication_receipt(
+                install_request=install_request, publication=publication
+            )
+            fd = os.open(
+                receipt_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                0o444,
+            )
+            try:
+                if os.write(fd, receipt_document) != len(receipt_document):
+                    raise RuntimeError("INSTALLER_TEST_RECEIPT_SHORT_WRITE")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            ForkedInstallerService._fsync_dir(receipts)
+            receipt_sha256 = hashlib.sha256(receipt_document).hexdigest()
+            current = append_publication_phase(
+                current,
+                install_request=install_request,
+                install_authorization=install_authorization,
+                recovery_requests=recovery_requests,
+                recovery_authorizations=recovery_authorizations,
+                actor_request=recovery_request,
+                actor_authorization=recovery_authorization,
+                phase="RECEIPT_CREATED",
+                publication=publication,
+                observed_root_mode=0o555,
+                receipt_sha256=receipt_sha256,
+            )
+            ForkedInstallerService._persist_journal_candidate(
+                journal, existing=candidate, candidate=current
+            )
+        if receipt_sha256 is None:
+            raise RuntimeError("INSTALLER_TEST_RECOVERY_RECEIPT_MISSING")
+        publication.update(
+            {
+                "published_path": os.fspath(published),
+                "receipt_inode": receipt_path.stat().st_ino,
+                "receipt_path": os.fspath(receipt_path),
+                "receipt_sha256": receipt_sha256,
+            }
+        )
+        return publication
+
+    @staticmethod
     def _write_install_publication_journal(
         publication: dict[str, object],
         *,
         install_request: dict[str, object],
+        install_authorization: dict[str, object],
         terminal_response: bytes,
     ) -> None:
         from simple.eval_runtime.installer_client import (
-            encode_publication_journal,
+            append_publication_phase,
         )
 
         journal = Path(publication["journal_path"])
-        encoded = encode_publication_journal(
+        existing = journal.read_bytes()
+        candidate = append_publication_phase(
+            existing,
             install_request=install_request,
+            install_authorization=install_authorization,
+            recovery_requests=(),
+            recovery_authorizations=(),
+            actor_request=install_request,
+            actor_authorization=install_authorization,
+            phase="RECEIPT_CREATED",
             publication=publication,
+            observed_root_mode=0o555,
+            receipt_sha256=publication["receipt_sha256"],
             terminal_response=terminal_response,
         )
-        if journal.exists():
-            if journal.read_bytes() != encoded:
-                raise RuntimeError("INSTALLER_TEST_INSTALL_JOURNAL_DRIFT")
-            return
-        fd = os.open(
-            journal,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-            0o600,
+        ForkedInstallerService._persist_journal_candidate(
+            journal, existing=existing, candidate=candidate
         )
+
+    @staticmethod
+    def _persist_journal_candidate(
+        journal: Path, *, existing: bytes, candidate: bytes
+    ) -> None:
+        if not candidate.startswith(existing):
+            raise RuntimeError("INSTALLER_TEST_JOURNAL_PREFIX_CHANGED")
+        suffix = candidate[len(existing):]
+        if not suffix:
+            return
+        flags = os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        if existing:
+            journal.chmod(0o600)
+            flags |= os.O_APPEND
+        else:
+            flags |= os.O_CREAT | os.O_EXCL
+        fd = os.open(journal, flags, 0o600)
         try:
-            if os.write(fd, encoded) != len(encoded):
-                raise RuntimeError("INSTALLER_TEST_JOURNAL_SHORT_WRITE")
+            if os.write(fd, suffix) != len(suffix):
+                raise RuntimeError("INSTALLER_TEST_JOURNAL_SHORT_APPEND")
             os.fsync(fd)
             os.fchmod(fd, 0o444)
             os.fsync(fd)
         finally:
             os.close(fd)
         ForkedInstallerService._fsync_dir(journal.parent)
+        crash_after = os.environ.get(
+            "SIMPLE_FIXTURE_CRASH_AFTER_PUBLICATION_PHASE"
+        )
+        if crash_after is not None:
+            last = json.loads(candidate[:-1].split(b"\n")[-1])
+            if last["phase"] == crash_after:
+                os._exit(87)
 
     @staticmethod
     def _append_recovery_publication_journal(
         publication: dict[str, object],
         *,
         install_request: dict[str, object],
+        install_authorization: dict[str, object],
         prior_recovery_requests: tuple[dict[str, object], ...],
+        prior_recovery_authorizations: tuple[dict[str, object], ...],
         recovery_request: dict[str, object],
+        recovery_authorization: dict[str, object],
         terminal_response: bytes,
     ) -> None:
         from simple.eval_runtime.installer_client import (
-            append_recovery_publication_journal,
+            RECOVERY_PUBLICATION_PHASES,
+            append_publication_phase,
             decode_exact_publication_journal,
         )
 
@@ -1072,40 +1565,75 @@ class ForkedInstallerService:
             records = decode_exact_publication_journal(
                 prefix,
                 install_request=install_request,
+                install_authorization=install_authorization,
                 recovery_requests=prior_recovery_requests,
+                recovery_authorizations=prior_recovery_authorizations,
             )
-            if (
-                records[-1]["actor_request_id"]
-                != recovery_request["request_id"]
-                or records[-1]["terminal_response_sha256"]
-                != hashlib.sha256(terminal_response).hexdigest()
-            ):
-                raise RuntimeError("INSTALLER_TEST_RECOVERY_REPLAY_DRIFT")
-            return
-        complete = append_recovery_publication_journal(
-            prefix,
-            install_request=install_request,
-            prior_recovery_requests=prior_recovery_requests,
-            recovery_request=recovery_request,
-            publication=publication,
-            terminal_response=terminal_response,
+            if records[-1]["phase"] == "RECOVERY_RESPONSE_CREATED":
+                if (
+                    records[-1]["actor_request_id"]
+                    != recovery_request["request_id"]
+                    or records[-1]["terminal_response_sha256"]
+                    != hashlib.sha256(terminal_response).hexdigest()
+                ):
+                    raise RuntimeError("INSTALLER_TEST_RECOVERY_REPLAY_DRIFT")
+                return
+        current = prefix
+        actor_already_started = any(
+            json.loads(line)["actor_request_id"] == recovery_request["request_id"]
+            for line in prefix.decode("utf-8").splitlines()
         )
-        if not complete.startswith(prefix):
-            raise RuntimeError("INSTALLER_TEST_JOURNAL_PREFIX_CHANGED")
-        suffix = complete[len(prefix):]
-        journal.chmod(0o600)
-        fd = os.open(
-            journal, os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW
+        actor_known = any(
+            request["request_id"] == recovery_request["request_id"]
+            for request in prior_recovery_requests
         )
-        try:
-            if os.write(fd, suffix) != len(suffix):
-                raise RuntimeError("INSTALLER_TEST_JOURNAL_SHORT_APPEND")
-            os.fsync(fd)
-            os.fchmod(fd, 0o444)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        ForkedInstallerService._fsync_dir(journal.parent)
+        recovery_requests = (
+            prior_recovery_requests
+            if actor_known
+            else (*prior_recovery_requests, recovery_request)
+        )
+        recovery_authorizations = (
+            prior_recovery_authorizations
+            if actor_known
+            else (*prior_recovery_authorizations, recovery_authorization)
+        )
+        last_phase = json.loads(prefix.decode("utf-8").splitlines()[-1])["phase"]
+        if last_phase == "RECOVERY_PUBLICATION_VALIDATED":
+            phases = ("RECOVERY_RESPONSE_CREATED",)
+        elif actor_already_started:
+            phases = RECOVERY_PUBLICATION_PHASES[1:]
+        else:
+            phases = RECOVERY_PUBLICATION_PHASES
+        for phase in phases:
+            candidate = append_publication_phase(
+                current,
+                install_request=install_request,
+                install_authorization=install_authorization,
+                recovery_requests=(
+                    recovery_requests
+                    if phase != "RECOVERY_STARTED"
+                    else prior_recovery_requests
+                ),
+                recovery_authorizations=(
+                    recovery_authorizations
+                    if phase != "RECOVERY_STARTED"
+                    else prior_recovery_authorizations
+                ),
+                actor_request=recovery_request,
+                actor_authorization=recovery_authorization,
+                phase=phase,
+                publication=publication,
+                observed_root_mode=0o555,
+                receipt_sha256=publication["receipt_sha256"],
+                terminal_response=(
+                    terminal_response
+                    if phase == "RECOVERY_RESPONSE_CREATED" else None
+                ),
+            )
+            ForkedInstallerService._persist_journal_candidate(
+                journal, existing=current, candidate=candidate
+            )
+            current = candidate
         if (
             receipt.read_bytes() != receipt_bytes
             or receipt.stat().st_ino != receipt_inode
@@ -1226,7 +1754,10 @@ class ForkedInstallerService:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
             if pid == self.pid:
                 exit_code = os.waitstatus_to_exitcode(status)
-                expected = {-signal.SIGTERM} if self._stop_requested else {0}
+                expected = (
+                    {-signal.SIGTERM}
+                    if self._stop_requested else self._expected_exit_codes
+                )
                 if exit_code not in expected:
                     raise RuntimeError("INSTALLER_TEST_SERVICE_EXIT")
                 return
@@ -3226,7 +3757,7 @@ assert final_path.exists() is False
 assert verify_complete_closure(final_path, receipt_path).valid is True
 ```
 
-For pre-`PREPARED` base-Python failures assert the intake-ID/operation-token journal has `final_tree_sha256 is None`, contains no publication phase, removes only the token-owned staging inode, terminalizes the attempt as `aborted-before-prepared`, increments `construction_attempt`, and creates a fresh token before retry. For at/post-`PREPARED` failures assert one non-null digest appears unchanged in every later record.
+For pre-`PREPARED` base-Python failures assert the intake-ID/operation-token journal has `final_tree_sha256 is None`, contains `INITIAL` plus only the allowed abort/recovery bookkeeping and no `PREPARED` or later publication mutation, removes only the token-owned staging inode, terminalizes the attempt as `aborted-before-prepared`, increments `construction_attempt`, and creates a fresh token before retry. For at/post-`PREPARED` failures assert one non-null digest appears unchanged in every later record, while the stable staging identity remains fixed and phase-observed mode changes exactly once from `0700` to `0555`.
 
 - [ ] **Step 6: Run GREEN and commit**
 
@@ -3577,11 +4108,13 @@ from simple.eval_runtime.installer_manager import (
     InstallerOrchestrator,
 )
 from simple.eval_runtime.installer_client import (
+    INSTALL_PUBLICATION_PHASES,
+    append_publication_phase,
     decode_exact_publication_journal,
     decode_exact_publication_receipt,
     encode_installer_request,
 )
-from .fakes import ForkedInstallerService
+from .fakes import ForkedInstallerService, fixture_publication_authorization
 
 INSTALL_REQUEST = {
     "fd_roles": ["construction_lock"],
@@ -3606,6 +4139,23 @@ INSTALL_REQUEST = {
 INSTALL_BYTES = json.dumps(
     INSTALL_REQUEST, sort_keys=True, separators=(",", ":")
 ).encode()
+INSTALL_AUTHORIZATION = fixture_publication_authorization(
+    INSTALL_REQUEST, previous=None
+)
+RECOVERY_REQUEST = {
+    **INSTALL_REQUEST,
+    "operation": "recover_base_python",
+    "payload": {
+        **INSTALL_REQUEST["payload"],
+        "authorization_id": "recovery-authorization-1",
+        "recovery_generation": 1,
+        "recovery_token_sha256": "f" * 64,
+    },
+    "request_id": "recover-base-python-generation-1",
+}
+RECOVERY_AUTHORIZATION = fixture_publication_authorization(
+    RECOVERY_REQUEST, previous=INSTALL_AUTHORIZATION
+)
 CLOSURE_INSTALL_REQUEST = {
     **INSTALL_REQUEST,
     "operation": "install_closure",
@@ -3716,7 +4266,9 @@ def test_successful_install_finishes_independent_publication_validation(tmp_path
         protected / "journals" / f"{operation_token}.jsonl"
     ).read_bytes()
     records = decode_exact_publication_journal(
-        journal, install_request=INSTALL_REQUEST
+        journal,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
     )
     assert tuple(record["phase"] for record in records) == (
         "INITIAL", "PREPARED", "RENAME_PENDING", "FINAL_RENAMED",
@@ -3724,6 +4276,23 @@ def test_successful_install_finishes_independent_publication_validation(tmp_path
     )
     assert records[0]["final_tree_sha256"] is None
     assert records[1]["final_tree_sha256"] == snapshot.final_tree_sha256
+    assert [record["observed_root_mode"] for record in records] == [
+        0o700, 0o555, 0o555, 0o555, 0o555,
+    ]
+    assert all(
+        record["staging_identity"] == records[0]["staging_identity"]
+        for record in records
+    )
+    assert all(
+        record["actor_authorization_sha256"]
+        == INSTALL_AUTHORIZATION["authorization_sha256"]
+        for record in records
+    )
+    assert records[0]["actor_authorization_sequence"] == 1
+    assert records[0]["actor_previous_authorization_sha256"] is None
+    assert records[0]["actor_owner_transition"] == (
+        INSTALL_AUTHORIZATION["owner_transition"]
+    )
     install_response = _fixture_response_bytes(
         tmp_path, INSTALL_REQUEST["request_id"]
     )
@@ -3773,7 +4342,9 @@ def test_recovery_appends_history_and_preserves_install_receipt(tmp_path) -> Non
     journal_path = protected / "journals" / f"{operation_token}.jsonl"
     install_prefix = journal_path.read_bytes()
     install_records = decode_exact_publication_journal(
-        install_prefix, install_request=INSTALL_REQUEST
+        install_prefix,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
     )
     receipt_path = (
         protected
@@ -3794,11 +4365,16 @@ def test_recovery_appends_history_and_preserves_install_receipt(tmp_path) -> Non
     requests = service.request_bytes()
     assert requests[0] == INSTALL_BYTES
     recovery_request = json.loads(requests[1])
+    recovery_authorization = fixture_publication_authorization(
+        recovery_request, previous=INSTALL_AUTHORIZATION
+    )
     complete_journal = journal_path.read_bytes()
     records = decode_exact_publication_journal(
         complete_journal,
         install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
         recovery_requests=(recovery_request,),
+        recovery_authorizations=(recovery_authorization,),
     )
     assert complete_journal.startswith(install_prefix)
     assert complete_journal[:len(install_prefix)] == install_prefix
@@ -3806,6 +4382,18 @@ def test_recovery_appends_history_and_preserves_install_receipt(tmp_path) -> Non
         "INITIAL", "PREPARED", "RENAME_PENDING", "FINAL_RENAMED",
         "RECEIPT_CREATED", "RECOVERY_STARTED",
         "RECOVERY_PUBLICATION_VALIDATED", "RECOVERY_RESPONSE_CREATED",
+    )
+    assert all(
+        record["actor_authorization_sha256"]
+        == recovery_authorization["authorization_sha256"]
+        for record in records[5:]
+    )
+    assert records[5]["actor_authorization_sequence"] == 2
+    assert records[5]["actor_previous_authorization_sha256"] == (
+        INSTALL_AUTHORIZATION["authorization_sha256"]
+    )
+    assert records[5]["actor_owner_transition"] == (
+        recovery_authorization["owner_transition"]
     )
     recovery_response = _fixture_response_bytes(
         tmp_path, recovery_request["request_id"]
@@ -3820,6 +4408,462 @@ def test_recovery_appends_history_and_preserves_install_receipt(tmp_path) -> Non
     assert receipt_sha256 == records[-1]["receipt_sha256"]
     service.stop()
     service.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize("durable_phase", INSTALL_PUBLICATION_PHASES)
+def test_service_exit_after_each_durable_phase_leaves_exact_legal_prefix(
+    durable_phase: str, tmp_path
+) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("INSTALLED",),
+        publication_crash_after=durable_phase,
+    )
+    manager = InstallerOrchestrator.restart(root, service.socket_path)
+    with pytest.raises(Exception, match="UNCERTAIN|EOF"):
+        manager.begin_install()
+    manager.close_after_uncertain_transport()
+    service.wait(timeout=5.0)
+    token = INSTALL_REQUEST["payload"]["operation_token_sha256"]
+    protected = tmp_path / "protected-installer"
+    journal = protected / "journals" / f"{token}.jsonl"
+    crash_prefix = journal.read_bytes()
+    records = decode_exact_publication_journal(
+        crash_prefix,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+    )
+    stop = INSTALL_PUBLICATION_PHASES.index(durable_phase) + 1
+    assert [record["phase"] for record in records] == list(
+        INSTALL_PUBLICATION_PHASES[:stop]
+    )
+    staged = protected / "published" / f".staging-{token}"
+    receipt: Path | None = None
+    if durable_phase in {"INITIAL", "PREPARED", "RENAME_PENDING"}:
+        assert staged.is_dir()
+        expected_mode = 0o700 if durable_phase == "INITIAL" else 0o555
+        assert stat.S_IMODE(staged.stat().st_mode) == expected_mode
+    else:
+        assert not staged.exists()
+        published = (
+            protected / "published" / records[-1]["final_tree_sha256"]
+        )
+        assert published.is_dir()
+        receipt = (
+            protected / "receipts" / f"{records[-1]['final_tree_sha256']}.json"
+        )
+        assert receipt.exists() is (durable_phase == "RECEIPT_CREATED")
+    receipt_before = (
+        receipt.read_bytes() if receipt is not None and receipt.exists() else None
+    )
+    receipt_inode_before = (
+        receipt.stat().st_ino
+        if receipt is not None and receipt.exists() else None
+    )
+    recovery_service = ForkedInstallerService.start(
+        tmp_path / "recovery-service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("RECOVERED",),
+        resume_install_request=INSTALL_REQUEST,
+        resume_install_authorization=INSTALL_AUTHORIZATION,
+    )
+    restarted = InstallerOrchestrator.restart(
+        root, recovery_service.socket_path
+    )
+    restarted.drive_to_terminal()
+    recovery_request = json.loads(recovery_service.request_bytes()[0])
+    recovery_authorization = fixture_publication_authorization(
+        recovery_request, previous=INSTALL_AUTHORIZATION
+    )
+    complete = journal.read_bytes()
+    recovered = decode_exact_publication_journal(
+        complete,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+        recovery_requests=(recovery_request,),
+        recovery_authorizations=(recovery_authorization,),
+    )
+    assert complete.startswith(crash_prefix)
+    assert all(
+        record["actor_authorization_sha256"]
+        == recovery_authorization["authorization_sha256"]
+        for record in recovered[stop:]
+    )
+    final_receipt = (
+        protected
+        / "receipts"
+        / f"{recovered[-1]['final_tree_sha256']}.json"
+    )
+    assert final_receipt.is_file()
+    if receipt_before is not None:
+        assert final_receipt.read_bytes() == receipt_before
+        assert final_receipt.stat().st_ino == receipt_inode_before
+    recovery_service.stop()
+    recovery_service.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    "recovery_crash_phase",
+    (
+        "RECOVERY_STARTED", "PREPARED", "RENAME_PENDING",
+        "FINAL_RENAMED", "RECEIPT_CREATED",
+        "RECOVERY_PUBLICATION_VALIDATED", "RECOVERY_RESPONSE_CREATED",
+    ),
+)
+def test_same_recovery_generation_resumes_each_partial_recovery_prefix(
+    recovery_crash_phase: str, tmp_path
+) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    install_service = ForkedInstallerService.start(
+        tmp_path / "install-service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("INSTALLED",),
+        publication_crash_after="INITIAL",
+    )
+    first = InstallerOrchestrator.restart(root, install_service.socket_path)
+    with pytest.raises(Exception, match="UNCERTAIN|EOF"):
+        first.begin_install()
+    first.close_after_uncertain_transport()
+    install_service.wait(timeout=5.0)
+
+    crashing_recovery = ForkedInstallerService.start(
+        tmp_path / "crashing-recovery-service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("RECOVERED",),
+        publication_crash_after=recovery_crash_phase,
+        resume_install_request=INSTALL_REQUEST,
+        resume_install_authorization=INSTALL_AUTHORIZATION,
+    )
+    second = InstallerOrchestrator.restart(
+        root, crashing_recovery.socket_path
+    )
+    with pytest.raises(Exception, match="UNCERTAIN|EOF"):
+        second.drive_to_terminal()
+    second.close_after_uncertain_transport()
+    crashing_recovery.wait(timeout=5.0)
+    recovery_bytes = crashing_recovery.request_bytes()[0]
+    recovery_request = json.loads(recovery_bytes)
+    recovery_authorization = fixture_publication_authorization(
+        recovery_request, previous=INSTALL_AUTHORIZATION
+    )
+    token = INSTALL_REQUEST["payload"]["operation_token_sha256"]
+    journal = (
+        tmp_path / "protected-installer" / "journals" / f"{token}.jsonl"
+    )
+    recovery_prefix = journal.read_bytes()
+    prefix_records = decode_exact_publication_journal(
+        recovery_prefix,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+        recovery_requests=(recovery_request,),
+        recovery_authorizations=(recovery_authorization,),
+    )
+    assert prefix_records[-1]["phase"] == recovery_crash_phase
+
+    replay_service = ForkedInstallerService.start(
+        tmp_path / "replay-service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("RECOVERED",),
+        resume_install_request=INSTALL_REQUEST,
+        resume_install_authorization=INSTALL_AUTHORIZATION,
+        resume_recovery_requests=(recovery_request,),
+        resume_recovery_authorizations=(recovery_authorization,),
+    )
+    restarted = InstallerOrchestrator.restart(root, replay_service.socket_path)
+    restarted.drive_to_terminal()
+    assert replay_service.request_bytes() == [recovery_bytes]
+    completed = journal.read_bytes()
+    completed_records = decode_exact_publication_journal(
+        completed,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+        recovery_requests=(recovery_request,),
+        recovery_authorizations=(recovery_authorization,),
+    )
+    assert completed.startswith(recovery_prefix)
+    assert completed_records[-1]["phase"] == "RECOVERY_RESPONSE_CREATED"
+    assert all(
+        record["actor_authorization_sha256"]
+        == recovery_authorization["authorization_sha256"]
+        for record in completed_records
+        if record["phase"] != "INITIAL"
+    )
+    replay_service.stop()
+    replay_service.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    "durable_phase", INSTALL_PUBLICATION_PHASES
+)
+def test_every_durable_install_prefix_resumes_under_recovery_authorization(
+    durable_phase: str, tmp_path
+) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("INSTALLED",),
+    )
+    InstallerOrchestrator.restart(root, service.socket_path).begin_install()
+    protected = tmp_path / "protected-installer"
+    token = INSTALL_REQUEST["payload"]["operation_token_sha256"]
+    source_journal = protected / "journals" / f"{token}.jsonl"
+    full = source_journal.read_bytes()
+    full_records = decode_exact_publication_journal(
+        full,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+    )
+    stop = INSTALL_PUBLICATION_PHASES.index(durable_phase) + 1
+    encoded_records = full[:-1].split(b"\n")
+    prefix = b"\n".join(encoded_records[:stop]) + b"\n"
+    scenario = tmp_path / f"crash-after-{durable_phase.lower()}.jsonl"
+    ForkedInstallerService._persist_journal_candidate(
+        scenario, existing=b"", candidate=prefix
+    )
+    receipt_path = (
+        protected
+        / "receipts"
+        / f"{full_records[-1]['final_tree_sha256']}.json"
+    )
+    receipt_before = receipt_path.read_bytes()
+    receipt_inode = receipt_path.stat().st_ino
+    publication = {
+        "completion_sha256": full_records[-1]["completion_sha256"],
+        "component_hashes": full_records[-1]["component_hashes"],
+        "final_tree_sha256": full_records[-1]["final_tree_sha256"],
+        "root_identity": full_records[-1]["root_identity"],
+        "source_parent_identity": {
+            **full_records[0]["source_parent_identity"], "mode": 0o700,
+        },
+        "staging_identity": full_records[-1]["root_identity"],
+    }
+    current = scenario.read_bytes()
+    candidate = append_publication_phase(
+        current,
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+        recovery_requests=(),
+        recovery_authorizations=(),
+        actor_request=RECOVERY_REQUEST,
+        actor_authorization=RECOVERY_AUTHORIZATION,
+        phase="RECOVERY_STARTED",
+        publication=publication,
+        observed_root_mode=0o555 if stop >= 2 else 0o700,
+        receipt_sha256=(
+            full_records[-1]["receipt_sha256"] if stop == 5 else None
+        ),
+    )
+    ForkedInstallerService._persist_journal_candidate(
+        scenario, existing=current, candidate=candidate
+    )
+    current = candidate
+    for phase in INSTALL_PUBLICATION_PHASES[stop:]:
+        candidate = append_publication_phase(
+            current,
+            install_request=INSTALL_REQUEST,
+            install_authorization=INSTALL_AUTHORIZATION,
+            recovery_requests=(RECOVERY_REQUEST,),
+            recovery_authorizations=(RECOVERY_AUTHORIZATION,),
+            actor_request=RECOVERY_REQUEST,
+            actor_authorization=RECOVERY_AUTHORIZATION,
+            phase=phase,
+            publication=publication,
+            observed_root_mode=0o555,
+            receipt_sha256=(
+                full_records[-1]["receipt_sha256"]
+                if phase == "RECEIPT_CREATED" else None
+            ),
+        )
+        ForkedInstallerService._persist_journal_candidate(
+            scenario, existing=current, candidate=candidate
+        )
+        current = candidate
+    for phase in (
+        "RECOVERY_PUBLICATION_VALIDATED", "RECOVERY_RESPONSE_CREATED",
+    ):
+        response = b'{"status":"RECOVERED"}'
+        candidate = append_publication_phase(
+            current,
+            install_request=INSTALL_REQUEST,
+            install_authorization=INSTALL_AUTHORIZATION,
+            recovery_requests=(RECOVERY_REQUEST,),
+            recovery_authorizations=(RECOVERY_AUTHORIZATION,),
+            actor_request=RECOVERY_REQUEST,
+            actor_authorization=RECOVERY_AUTHORIZATION,
+            phase=phase,
+            publication=publication,
+            observed_root_mode=0o555,
+            receipt_sha256=full_records[-1]["receipt_sha256"],
+            terminal_response=(
+                response if phase == "RECOVERY_RESPONSE_CREATED" else None
+            ),
+        )
+        ForkedInstallerService._persist_journal_candidate(
+            scenario, existing=current, candidate=candidate
+        )
+        current = candidate
+    recovered = decode_exact_publication_journal(
+        scenario.read_bytes(),
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+        recovery_requests=(RECOVERY_REQUEST,),
+        recovery_authorizations=(RECOVERY_AUTHORIZATION,),
+    )
+    assert scenario.read_bytes().startswith(prefix)
+    assert [record["phase"] for record in recovered[:stop]] == list(
+        INSTALL_PUBLICATION_PHASES[:stop]
+    )
+    assert all(
+        record["actor_authorization_sha256"]
+        == RECOVERY_AUTHORIZATION["authorization_sha256"]
+        for record in recovered[stop:]
+    )
+    assert receipt_path.read_bytes() == receipt_before
+    assert receipt_path.stat().st_ino == receipt_inode
+    service.stop()
+    service.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "actor_authorization_sha256", "actor_authorization_sequence",
+        "actor_previous_authorization_sha256", "actor_owner_transition",
+        "actor_owner_transition_sha256",
+    ),
+)
+def test_each_journal_authorization_binding_rejects_one_field_mutation(
+    field: str,
+) -> None:
+    publication = {
+        "source_parent_identity": {
+            "device": 1, "inode": 2, "mount_id": 3,
+            "mode": 0o700, "uid": os.getuid(), "gid": os.getgid(),
+        },
+        "staging_identity": {
+            "device": 1, "inode": 4, "mount_id": 3,
+            "mode": 0o700, "uid": os.getuid(), "gid": os.getgid(),
+        },
+    }
+    initial = append_publication_phase(
+        b"",
+        install_request=INSTALL_REQUEST,
+        install_authorization=INSTALL_AUTHORIZATION,
+        recovery_requests=(),
+        recovery_authorizations=(),
+        actor_request=INSTALL_REQUEST,
+        actor_authorization=INSTALL_AUTHORIZATION,
+        phase="INITIAL",
+        publication=publication,
+        observed_root_mode=0o700,
+    )
+    record = json.loads(initial)
+    if field == "actor_authorization_sequence":
+        record[field] += 1
+    elif field == "actor_previous_authorization_sha256":
+        record[field] = "9" * 64
+    elif field == "actor_owner_transition":
+        record[field] = {
+            **record[field], "to_pending_action": "forged_operation",
+        }
+    else:
+        record[field] = "9" * 64
+    tampered = json.dumps(
+        record, sort_keys=True, separators=(",", ":")
+    ).encode() + b"\n"
+    with pytest.raises(
+        RuntimeError, match="PUBLICATION_JOURNAL_AUTHORIZATION_PROVENANCE"
+    ):
+        decode_exact_publication_journal(
+            tampered,
+            install_request=INSTALL_REQUEST,
+            install_authorization=INSTALL_AUTHORIZATION,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    (
+        ("authorization_sha256", "PUBLICATION_AUTHORIZATION_DIGEST"),
+        ("authorization_sequence", "PUBLICATION_AUTHORIZATION_SEQUENCE"),
+        ("previous_authorization_sha256", "PUBLICATION_AUTHORIZATION_PREVIOUS"),
+        ("owner_transition_schema", "PUBLICATION_AUTHORIZATION_TRANSITION_SCHEMA"),
+        ("owner_transition_source", "PUBLICATION_AUTHORIZATION_TRANSITION_SOURCE"),
+        ("owner_transition_target", "PUBLICATION_AUTHORIZATION_TRANSITION_TARGET"),
+    ),
+)
+def test_authorization_codec_rejects_each_provenance_mutation(
+    field: str, expected: str,
+) -> None:
+    authorization = json.loads(json.dumps(INSTALL_AUTHORIZATION))
+    if field == "authorization_sha256":
+        authorization[field] = "A" * 64
+    elif field == "authorization_sequence":
+        authorization[field] = True
+    elif field == "previous_authorization_sha256":
+        authorization[field] = "9" * 64
+    elif field == "owner_transition_schema":
+        authorization["owner_transition"].pop("from_pending_action")
+    elif field == "owner_transition_source":
+        authorization["owner_transition"]["from_authorization_sequence"] = 9
+    else:
+        authorization["owner_transition"]["to_pending_action"] = "forged"
+    publication = {
+        "source_parent_identity": {
+            "device": 1, "inode": 2, "mount_id": 3,
+            "mode": 0o700, "uid": os.getuid(), "gid": os.getgid(),
+        },
+        "staging_identity": {
+            "device": 1, "inode": 4, "mount_id": 3,
+            "mode": 0o700, "uid": os.getuid(), "gid": os.getgid(),
+        },
+    }
+    with pytest.raises(RuntimeError, match=expected):
+        append_publication_phase(
+            b"",
+            install_request=INSTALL_REQUEST,
+            install_authorization=authorization,
+            recovery_requests=(),
+            recovery_authorizations=(),
+            actor_request=INSTALL_REQUEST,
+            actor_authorization=authorization,
+            phase="INITIAL",
+            publication=publication,
+            observed_root_mode=0o700,
+        )
 
 
 @pytest.mark.parametrize(
@@ -4442,11 +5486,15 @@ def test_live_persistence_failure_retains_both_locks_until_reconciled(
     service.wait(timeout=5.0)
 ```
 
-`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child and receives each production length-prefixed canonical six-field request with exactly one construction-lock FD via `recvmsg(MSG_CMSG_CLOEXEC)`. Before recording or acting, it validates the exact `fd_roles`, FD count/CLOEXEC/device/inode/mode, and the fact that an independently opened construction-lock descriptor cannot acquire the already-held lock. It appends the exact received bytes, explicit request ID, and validation evidence to fsynced files. For post-acquisition results it materializes a real protected journal, receipt, mode-`0555` published root, component manifests, and completion record, then sends an operation-specific frame that echoes the request ID plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. To keep this non-root kernel test executable, its hidden staging basename and digest basename share one fixture-only parent, permitting a mode-`0555` same-parent rename; native Step 6 tests separately exercise the production source-parent/destination-parent FD pair and `RENAME_NOREPLACE`. The fixture imports and calls production `encode_publication_journal`, `append_recovery_publication_journal`, and `encode_publication_receipt`; it does not assemble any protected schema itself. The immutable receipt is derived only from the original install request and binds its profile, authorization, owner/operation tokens, construction attempt, source, final/component/completion hashes, and root identity. The journal begins with the hash-chained install-bound `INITIAL`, `PREPARED`, `RENAME_PENDING`, `FINAL_RENAMED`, and `RECEIPT_CREATED` prefix. Each recovery appends—never replaces—that prefix with `RECOVERY_STARTED`, `RECOVERY_PUBLICATION_VALIDATED`, and `RECOVERY_RESPONSE_CREATED`, binding the recovery authorization/generation/token while retaining the install fields and receipt digest. The final record of every install or recovery group contains the SHA-256 of the exact canonical response bytes that are sent afterward. The native Rust codecs must pass byte-for-byte golden parity against these Python codecs before this fixture is accepted.
+`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child and receives each production length-prefixed canonical six-field request with exactly one construction-lock FD via `recvmsg(MSG_CMSG_CLOEXEC)`. Before recording or acting, it validates the exact `fd_roles`, FD count/CLOEXEC/device/inode/mode, and the fact that an independently opened construction-lock descriptor cannot acquire the already-held lock. It appends the exact received bytes, explicit request ID, and validation evidence to fsynced files. For post-acquisition results it materializes a real protected journal, receipt, mode-`0555` published root, component manifests, and completion record, then sends an operation-specific frame that echoes the request ID plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. To keep this non-root kernel test executable, its hidden staging basename and digest basename share one fixture-only parent, permitting a mode-`0555` same-parent rename; native Step 6 tests separately exercise the production source-parent/destination-parent FD pair and `RENAME_NOREPLACE`.
+
+The fixture calls only the production `append_publication_phase`, `decode_exact_publication_journal`, and `encode_publication_receipt` codecs. It creates and fsyncs `INITIAL` while the staging inode is mode `0700`, performs and fsyncs normalization, appends `PREPARED` with that same stable device/inode/mount identity and observed mode `0555`, appends/fsyncs `RENAME_PENDING` before rename, appends/fsyncs `FINAL_RENAMED` after the parent fsyncs, creates/fsyncs the install-implied receipt, and appends/fsyncs `RECEIPT_CREATED` with the exact response digest before sending. It never synthesizes the complete journal after publication. Every record binds the creation-time authorization sequence and digest, the prior authorization-entry digest, and the exact before/after owner-record transition; the fixture helper produces the same canonical authorization entry bytes as `DiskAuthorizationStore`, while the production service obtains and independently validates those values from the protected owner record.
+
+The decoder accepts `INITIAL` and every legal contiguous durable install prefix. Recovery appends `RECOVERY_STARTED` to that exact inode, then appends only the missing action records (`PREPARED`, `RENAME_PENDING`, `FINAL_RENAMED`, and/or `RECEIPT_CREATED`) under the recovery actor before `RECOVERY_PUBLICATION_VALIDATED` and `RECOVERY_RESPONSE_CREATED`. A service crash may leave a legal prefix at any one of those records, including within an active recovery group; replay resumes the same recovery authorization from the derived next phase. Original prefix bytes never change. If receipt creation was already durable, recovery preserves its bytes, digest, and inode; if only `FINAL_RENAMED` was durable, the service reconstructs the byte-identical install-implied receipt before appending its recovery-attributed `RECEIPT_CREATED`. The final response record binds the exact canonical response sent afterward. Native Rust codecs and state transitions must pass byte-for-byte golden parity against these Python codecs.
 
 `INSTALLED` is the only successful service status for an install operation; it carries `BASE_COMPLETE` for base Python or `COMPLETE` for a closure and all final fields. `RECOVERED` is the corresponding post-publication recovery status. Neither status directly terminalizes manager state. The fixture can independently mutate each response field or protected object after construction, so the manager tests exercise the production codec and publication validators rather than successful sentinels. Journal/receipt corruption is permitted only inside the test fixture: the helper changes its own mode-`0444` file to `0600`, writes and fsyncs the corrupt bytes, restores `0444`, fsyncs again, and fsyncs the parent. Production code has no chmod or write path for protected evidence.
 
-Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, creates/fsyncs the canonical install publication journal and receipt and drops the byte-identical second install response, then appends the generation-2 recovery group and returns the exact `RECOVERED` response whose digest was fsynced first. It records exact response bytes in request-ID-hashed fixture files so tests can compare them with protected terminal-response digests. Parameterized scripts additionally exercise immediate `INSTALLED`, zero-FD `INSTALLER_TRANSACTION_BUSY` followed by byte-identical retry, and `NO_JOURNAL_NO_MUTATION` followed by byte-identical replay ending in `INSTALLED`. A broken response socket never advances authorization state; request generation and the fsynced service journal determine the response. Test-only shutdown signals the owned child only after the manager verifies terminal state; there is no unauthenticated stop request. `InstallerOrchestrator` uses the production `sendmsg` session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after authenticated request delivery, actual terminal-frame-plus-handoff receipt, or any manager-side publication validation boundary. A fresh orchestrator reopens only the fsynced prefix, performs an authenticated wire operation only if one remains required, and cannot mark terminal until the protected journal, receipt, and published root have been independently validated and every mirror plus `COMPLETE` has been separately fsynced. Assertions prove the install prefix remains a byte-for-byte prefix after recovery; receipt bytes, SHA-256, and inode never change; actual install replays are byte-identical; all generations are inside `payload`; every accepted request carried the stable construction-lock FD; and zero-FD busy replies create no recovery generation. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
+Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, creates/fsyncs the canonical install publication journal and receipt and drops the byte-identical second install response, then appends the generation-2 recovery group and returns the exact `RECOVERED` response whose digest was fsynced first. It records exact response bytes in request-ID-hashed fixture files so tests can compare them with protected terminal-response digests. Parameterized scripts additionally exercise immediate `INSTALLED`, zero-FD `INSTALLER_TRANSACTION_BUSY` followed by byte-identical retry, and `NO_JOURNAL_NO_MUTATION` followed by byte-identical replay ending in `INSTALLED`. A phase-crash mode calls `_exit(87)` immediately after each per-record fsync; a replacement service process receives the same protected roots plus the immutable install request/authorization, handles the real authenticated recovery request, derives the next action from the disk journal, and completes the missing filesystem mutations and records. A broken response socket never advances authorization state; request generation and the fsynced service journal determine the response. Test-only shutdown signals the owned child only after the manager verifies terminal state; there is no unauthenticated stop request. `InstallerOrchestrator` uses the production `sendmsg` session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after every service publication phase, authenticated request delivery, actual terminal-frame-plus-handoff receipt, or manager-side publication validation boundary. A fresh orchestrator reopens only the fsynced prefix, performs an authenticated wire operation only if one remains required, and cannot mark terminal until the protected journal, receipt, and published root have been independently validated and every mirror plus `COMPLETE` has been separately fsynced. Assertions prove the install prefix remains a byte-for-byte prefix after recovery; existing receipt bytes, SHA-256, and inode never change; missing receipts are reconstructed from install fields; actual install replays are byte-identical; all generations are inside `payload`; every accepted request carried the stable construction-lock FD; and zero-FD busy replies create no recovery generation. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
 
 - [ ] **Step 2: Write failing systemd/config exactness tests**
 
@@ -4552,12 +5600,26 @@ PUBLICATION_RECEIPT_KEYS = {
     "recovery_generation", "recovery_token_sha256", "final_tree_sha256",
     "component_hashes", "completion_sha256", "root_identity",
 }
+STABLE_OBJECT_IDENTITY_KEYS = {"device", "inode", "mount_id", "uid", "gid"}
+OWNER_TRANSITION_KEYS = {
+    "from_authorization_id", "from_authorization_sequence",
+    "from_owner_record_sha256", "from_pending_action",
+    "to_authorization_id", "to_authorization_sequence",
+    "to_owner_record_sha256", "to_pending_action",
+}
+PUBLICATION_AUTHORIZATION_KEYS = {
+    "authorization_id", "authorization_sequence", "authorization_sha256",
+    "previous_authorization_sha256", "owner_transition",
+}
 PUBLICATION_JOURNAL_ENTRY_KEYS = PUBLICATION_RECEIPT_KEYS | {
     "sequence", "phase", "previous_entry_sha256", "receipt_sha256",
-    "source_parent_identity", "staging_identity",
+    "source_parent_identity", "staging_identity", "observed_root_mode",
     "actor_operation", "actor_request_id", "actor_request_sha256",
     "actor_authorization_id", "actor_recovery_generation",
     "actor_recovery_token_sha256", "terminal_response_sha256",
+    "actor_authorization_sha256", "actor_authorization_sequence",
+    "actor_previous_authorization_sha256", "actor_owner_transition",
+    "actor_owner_transition_sha256",
 }
 INSTALL_PUBLICATION_PHASES = (
     "INITIAL", "PREPARED", "RENAME_PENDING", "FINAL_RENAMED",
@@ -4567,6 +5629,7 @@ RECOVERY_PUBLICATION_PHASES = (
     "RECOVERY_STARTED", "RECOVERY_PUBLICATION_VALIDATED",
     "RECOVERY_RESPONSE_CREATED",
 )
+PUBLICATION_ACTION_PHASES = INSTALL_PUBLICATION_PHASES[1:]
 
 
 def _require_sha256(value: object, *, code: str) -> str:
@@ -4590,6 +5653,24 @@ def _validate_publication_identity(value: object, *, code: str) -> None:
         if type(value[key]) is not int or value[key] <= 0:
             raise RuntimeError(code)
     for key in ("mode", "uid", "gid"):
+        if type(value[key]) is not int or value[key] < 0:
+            raise RuntimeError(code)
+
+
+def _stable_publication_identity(
+    value: Mapping[str, object],
+) -> dict[str, object]:
+    _validate_publication_identity(value, code="PUBLICATION_ROOT_IDENTITY")
+    return {key: value[key] for key in STABLE_OBJECT_IDENTITY_KEYS}
+
+
+def _validate_stable_identity(value: object, *, code: str) -> None:
+    if type(value) is not dict or set(value) != STABLE_OBJECT_IDENTITY_KEYS:
+        raise RuntimeError(code)
+    for key in ("device", "inode", "mount_id"):
+        if type(value[key]) is not int or value[key] <= 0:
+            raise RuntimeError(code)
+    for key in ("uid", "gid"):
         if type(value[key]) is not int or value[key] < 0:
             raise RuntimeError(code)
 
@@ -4627,13 +5708,95 @@ def _install_publication_fields(
     }
 
 
-def _journal_actor_fields(request: Mapping[str, object]) -> dict[str, object]:
+def _validate_publication_authorization(
+    authorization: Mapping[str, object],
+    *,
+    request: Mapping[str, object],
+    previous_authorization: Mapping[str, object] | None,
+) -> None:
+    if type(authorization) is not dict or set(authorization) != (
+        PUBLICATION_AUTHORIZATION_KEYS
+    ):
+        raise RuntimeError("PUBLICATION_AUTHORIZATION_SCHEMA")
+    payload = request["payload"]
+    if type(payload) is not dict:
+        raise RuntimeError("PUBLICATION_AUTHORIZATION_REQUEST")
+    if authorization["authorization_id"] != payload["authorization_id"]:
+        raise RuntimeError("PUBLICATION_AUTHORIZATION_ID")
+    _require_sha256(
+        authorization["authorization_sha256"],
+        code="PUBLICATION_AUTHORIZATION_DIGEST",
+    )
+    sequence = authorization["authorization_sequence"]
+    if type(sequence) is not int or sequence <= 0:
+        raise RuntimeError("PUBLICATION_AUTHORIZATION_SEQUENCE")
+    previous_digest = authorization["previous_authorization_sha256"]
+    if previous_authorization is None:
+        if previous_digest is not None:
+            raise RuntimeError("PUBLICATION_AUTHORIZATION_PREVIOUS")
+    else:
+        if (
+            previous_digest != previous_authorization["authorization_sha256"]
+            or sequence != previous_authorization["authorization_sequence"] + 1
+        ):
+            raise RuntimeError("PUBLICATION_AUTHORIZATION_PREVIOUS")
+    transition = authorization["owner_transition"]
+    if type(transition) is not dict or set(transition) != OWNER_TRANSITION_KEYS:
+        raise RuntimeError("PUBLICATION_AUTHORIZATION_TRANSITION_SCHEMA")
+    for key in ("from_owner_record_sha256", "to_owner_record_sha256"):
+        _require_sha256(
+            transition[key], code="PUBLICATION_AUTHORIZATION_TRANSITION_DIGEST"
+        )
+    for key in ("from_authorization_sequence", "to_authorization_sequence"):
+        if type(transition[key]) is not int or transition[key] < 0:
+            raise RuntimeError("PUBLICATION_AUTHORIZATION_TRANSITION_SEQUENCE")
+    if (
+        transition["to_authorization_id"] != authorization["authorization_id"]
+        or transition["to_authorization_sequence"] != sequence
+        or transition["to_pending_action"] != request["operation"]
+    ):
+        raise RuntimeError("PUBLICATION_AUTHORIZATION_TRANSITION_TARGET")
+    if previous_authorization is None:
+        expected_previous_id = None
+        expected_previous_sequence = sequence - 1
+    else:
+        expected_previous_id = previous_authorization["authorization_id"]
+        expected_previous_sequence = previous_authorization[
+            "authorization_sequence"
+        ]
+    if (
+        transition["from_authorization_id"] != expected_previous_id
+        or transition["from_authorization_sequence"]
+        != expected_previous_sequence
+        or type(transition["from_pending_action"]) is not str
+    ):
+        raise RuntimeError("PUBLICATION_AUTHORIZATION_TRANSITION_SOURCE")
+
+
+def _journal_actor_fields(
+    request: Mapping[str, object],
+    authorization: Mapping[str, object],
+) -> dict[str, object]:
     payload = request["payload"]
     if type(payload) is not dict:
         raise RuntimeError("PUBLICATION_ACTOR_PAYLOAD")
+    transition = authorization["owner_transition"]
     return {
         "actor_authorization_id": payload["authorization_id"],
+        "actor_authorization_sequence": authorization[
+            "authorization_sequence"
+        ],
+        "actor_authorization_sha256": authorization[
+            "authorization_sha256"
+        ],
         "actor_operation": request["operation"],
+        "actor_owner_transition": transition,
+        "actor_owner_transition_sha256": hashlib.sha256(
+            _canonical_json(transition)
+        ).hexdigest(),
+        "actor_previous_authorization_sha256": authorization[
+            "previous_authorization_sha256"
+        ],
         "actor_recovery_generation": payload["recovery_generation"],
         "actor_recovery_token_sha256": payload["recovery_token_sha256"],
         "actor_request_id": request["request_id"],
@@ -4738,171 +5901,213 @@ def _publication_result_fields(
     }
 
 
-def _encode_publication_records(
-    *,
-    install_request: Mapping[str, object],
-    actor_request: Mapping[str, object],
-    publication: Mapping[str, object],
-    phases: Sequence[str],
-    first_sequence: int,
-    previous_entry_sha256: str | None,
-    terminal_response: bytes,
-    initial_prefix: bool,
-) -> tuple[bytes, ...]:
-    common = {
-        **_install_publication_fields(install_request),
-        **_journal_actor_fields(actor_request),
-        "source_parent_identity": publication["source_parent_identity"],
-        "staging_identity": publication["staging_identity"],
-    }
-    result = _publication_result_fields(publication)
-    response_sha256 = hashlib.sha256(terminal_response).hexdigest()
-    previous = previous_entry_sha256
-    records: list[bytes] = []
-    for offset, phase in enumerate(phases):
-        sequence = first_sequence + offset
-        initial = initial_prefix and phase == "INITIAL"
-        receipt_created = (
-            phase == "RECEIPT_CREATED"
-            or not initial_prefix
+def _expected_next_publication_phase(
+    records: Sequence[Mapping[str, object]],
+) -> str | None:
+    install_count = sum(
+        record["phase"] in INSTALL_PUBLICATION_PHASES for record in records
+    )
+    active_recovery = False
+    recovery_validated = False
+    for record in records:
+        if record["phase"] == "RECOVERY_STARTED":
+            active_recovery = True
+            recovery_validated = False
+        elif record["phase"] == "RECOVERY_PUBLICATION_VALIDATED":
+            recovery_validated = True
+        elif record["phase"] == "RECOVERY_RESPONSE_CREATED":
+            active_recovery = False
+            recovery_validated = False
+    if not records:
+        return "INITIAL"
+    if active_recovery:
+        if install_count < len(INSTALL_PUBLICATION_PHASES):
+            return INSTALL_PUBLICATION_PHASES[install_count]
+        return (
+            "RECOVERY_RESPONSE_CREATED"
+            if recovery_validated
+            else "RECOVERY_PUBLICATION_VALIDATED"
         )
-        terminal = phase in {
-            "RECEIPT_CREATED", "RECOVERY_RESPONSE_CREATED",
-        }
-        record = {
-            **common,
-            "completion_sha256": None if initial else result["completion_sha256"],
-            "component_hashes": None if initial else result["component_hashes"],
-            "final_tree_sha256": None if initial else result["final_tree_sha256"],
-            "phase": phase,
-            "previous_entry_sha256": previous,
-            "receipt_sha256": publication["receipt_sha256"]
-            if receipt_created else None,
-            "root_identity": None if initial else result["root_identity"],
-            "sequence": sequence,
-            "terminal_response_sha256": response_sha256 if terminal else None,
-        }
-        encoded = _canonical_json(record)
-        records.append(encoded)
-        previous = hashlib.sha256(encoded).hexdigest()
-    return tuple(records)
+    if install_count < len(INSTALL_PUBLICATION_PHASES):
+        return INSTALL_PUBLICATION_PHASES[install_count]
+    return None
 
 
-def encode_publication_journal(
-    *,
-    install_request: Mapping[str, object],
-    publication: Mapping[str, object],
-    terminal_response: bytes,
-) -> bytes:
-    records = _encode_publication_records(
-        install_request=install_request,
-        actor_request=install_request,
-        publication=publication,
-        phases=INSTALL_PUBLICATION_PHASES,
-        first_sequence=1,
-        previous_entry_sha256=None,
-        terminal_response=terminal_response,
-        initial_prefix=True,
-    )
-    payload = b"\n".join(records) + b"\n"
-    decode_exact_publication_journal(
-        payload, install_request=install_request
-    )
-    return payload
-
-
-def append_recovery_publication_journal(
+def append_publication_phase(
     existing: bytes,
     *,
     install_request: Mapping[str, object],
-    prior_recovery_requests: Sequence[Mapping[str, object]],
-    recovery_request: Mapping[str, object],
+    install_authorization: Mapping[str, object],
+    recovery_requests: Sequence[Mapping[str, object]],
+    recovery_authorizations: Sequence[Mapping[str, object]],
+    actor_request: Mapping[str, object],
+    actor_authorization: Mapping[str, object],
+    phase: str,
     publication: Mapping[str, object],
-    terminal_response: bytes,
+    observed_root_mode: int,
+    receipt_sha256: str | None = None,
+    terminal_response: bytes | None = None,
 ) -> bytes:
-    decode_exact_publication_journal(
+    records = decode_exact_publication_journal(
         existing,
         install_request=install_request,
-        recovery_requests=prior_recovery_requests,
+        install_authorization=install_authorization,
+        recovery_requests=recovery_requests,
+        recovery_authorizations=recovery_authorizations,
+        allow_empty=True,
     )
-    _validate_recovery_request_for_install(
-        recovery_request, install_request=install_request
+    expected_phase = _expected_next_publication_phase(records)
+    if phase == "RECOVERY_STARTED":
+        if records and records[-1]["phase"] == "RECOVERY_RESPONSE_CREATED":
+            pass
+        elif (
+            expected_phase is not None
+            and expected_phase not in PUBLICATION_ACTION_PHASES
+        ):
+            raise RuntimeError("PUBLICATION_RECOVERY_START_PHASE")
+    elif phase != expected_phase:
+        raise RuntimeError("PUBLICATION_JOURNAL_NEXT_PHASE")
+    if actor_request is install_request:
+        _validate_publication_authorization(
+            actor_authorization,
+            request=actor_request,
+            previous_authorization=None,
+        )
+    else:
+        _validate_recovery_request_for_install(
+            actor_request, install_request=install_request
+        )
+        actor_id = actor_request["request_id"]
+        known_ids = [request["request_id"] for request in recovery_requests]
+        if actor_id in known_ids:
+            actor_index = known_ids.index(actor_id)
+            if actor_authorization != recovery_authorizations[actor_index]:
+                raise RuntimeError("PUBLICATION_RECOVERY_AUTHORIZATION_DRIFT")
+            previous_authorization = (
+                install_authorization
+                if actor_index == 0
+                else recovery_authorizations[actor_index - 1]
+            )
+        else:
+            previous_authorization = (
+                recovery_authorizations[-1]
+                if recovery_authorizations
+                else install_authorization
+            )
+        _validate_publication_authorization(
+            actor_authorization,
+            request=actor_request,
+            previous_authorization=previous_authorization,
+        )
+    prepared = any(record["phase"] == "PREPARED" for record in records) or (
+        phase == "PREPARED"
     )
-    encoded_records = existing[:-1].split(b"\n")
-    suffix = _encode_publication_records(
-        install_request=install_request,
-        actor_request=recovery_request,
-        publication=publication,
-        phases=RECOVERY_PUBLICATION_PHASES,
-        first_sequence=len(encoded_records) + 1,
-        previous_entry_sha256=hashlib.sha256(encoded_records[-1]).hexdigest(),
-        terminal_response=terminal_response,
-        initial_prefix=False,
+    receipt_created = any(
+        record["phase"] == "RECEIPT_CREATED" for record in records
+    ) or phase == "RECEIPT_CREATED"
+    result = _publication_result_fields(publication) if prepared else {
+        "completion_sha256": None,
+        "component_hashes": None,
+        "final_tree_sha256": None,
+        "root_identity": None,
+    }
+    install_terminal = phase == "RECEIPT_CREATED" and actor_request is install_request
+    recovery_terminal = phase == "RECOVERY_RESPONSE_CREATED"
+    if (install_terminal or recovery_terminal) != (terminal_response is not None):
+        raise RuntimeError("PUBLICATION_JOURNAL_RESPONSE_PHASE")
+    if receipt_created != (receipt_sha256 is not None):
+        raise RuntimeError("PUBLICATION_JOURNAL_RECEIPT_PHASE")
+    stable_staging = _stable_publication_identity(
+        publication["staging_identity"]
     )
-    payload = existing + b"\n".join(suffix) + b"\n"
+    record = {
+        **_install_publication_fields(install_request),
+        **_journal_actor_fields(actor_request, actor_authorization),
+        **result,
+        "observed_root_mode": observed_root_mode,
+        "phase": phase,
+        "previous_entry_sha256": (
+            hashlib.sha256(existing[:-1].split(b"\n")[-1]).hexdigest()
+            if records else None
+        ),
+        "receipt_sha256": receipt_sha256,
+        "root_identity": result["root_identity"],
+        "sequence": len(records) + 1,
+        "source_parent_identity": _stable_publication_identity(
+            publication["source_parent_identity"]
+        ),
+        "staging_identity": stable_staging,
+        "terminal_response_sha256": (
+            hashlib.sha256(terminal_response).hexdigest()
+            if terminal_response is not None else None
+        ),
+    }
+    encoded = _canonical_json(record)
+    candidate = existing + encoded + b"\n"
+    next_recovery_requests = tuple(recovery_requests)
+    next_recovery_authorizations = tuple(recovery_authorizations)
+    if phase == "RECOVERY_STARTED":
+        next_recovery_requests += (actor_request,)
+        next_recovery_authorizations += (actor_authorization,)
     decode_exact_publication_journal(
-        payload,
+        candidate,
         install_request=install_request,
-        recovery_requests=(*prior_recovery_requests, recovery_request),
+        install_authorization=install_authorization,
+        recovery_requests=next_recovery_requests,
+        recovery_authorizations=next_recovery_authorizations,
     )
-    return payload
+    return candidate
 
 
 def decode_exact_publication_journal(
     payload: bytes,
     *,
     install_request: Mapping[str, object],
+    install_authorization: Mapping[str, object],
     recovery_requests: Sequence[Mapping[str, object]] = (),
+    recovery_authorizations: Sequence[Mapping[str, object]] = (),
+    allow_empty: bool = False,
 ) -> tuple[dict[str, object], ...]:
+    if payload == b"" and allow_empty:
+        return ()
     if not payload.endswith(b"\n"):
         raise RuntimeError("PUBLICATION_JOURNAL_TERMINATOR")
     encoded_records = payload[:-1].split(b"\n")
-    expected_length = len(INSTALL_PUBLICATION_PHASES) + (
-        len(RECOVERY_PUBLICATION_PHASES) * len(recovery_requests)
+    if not encoded_records:
+        raise RuntimeError("PUBLICATION_JOURNAL_EMPTY")
+    if len(recovery_requests) != len(recovery_authorizations):
+        raise RuntimeError("PUBLICATION_RECOVERY_AUTHORIZATION_COUNT")
+    _validate_publication_authorization(
+        install_authorization,
+        request=install_request,
+        previous_authorization=None,
     )
-    if len(encoded_records) != expected_length:
-        raise RuntimeError("PUBLICATION_JOURNAL_LENGTH")
-    expected_install = _install_publication_fields(install_request)
-    seen_request_ids = {install_request["request_id"]}
-    last_recovery_generation = 0
-    for recovery_request in recovery_requests:
-        _validate_recovery_request_for_install(
-            recovery_request, install_request=install_request
-        )
-        recovery_payload = recovery_request["payload"]
-        recovery_generation = recovery_payload["recovery_generation"]
-        if (
-            recovery_generation <= last_recovery_generation
-            or recovery_request["request_id"] in seen_request_ids
-        ):
-            raise RuntimeError("PUBLICATION_RECOVERY_ORDER")
-        seen_request_ids.add(recovery_request["request_id"])
-        last_recovery_generation = recovery_generation
-    expected_groups = [
-        (INSTALL_PUBLICATION_PHASES, install_request),
-        *(
-            (RECOVERY_PUBLICATION_PHASES, recovery_request)
-            for recovery_request in recovery_requests
-        ),
-    ]
-    previous = None
-    records: list[dict[str, object]] = []
-    bound: dict[str, object] | None = None
-    source_bound: tuple[object, object] | None = None
-    receipt_bound: str | None = None
-    expected_records = (
-        (phase, actor)
-        for phases, actor in expected_groups
-        for phase in phases
-    )
-    for sequence, ((phase, actor), encoded) in enumerate(
-        zip(expected_records, encoded_records, strict=True), 1
+    previous_authorization = install_authorization
+    for request, authorization in zip(
+        recovery_requests, recovery_authorizations, strict=True
     ):
-        if actor is not install_request:
-            _validate_recovery_request_for_install(
-                actor, install_request=install_request
-            )
-        expected_actor = _journal_actor_fields(actor)
+        _validate_recovery_request_for_install(
+            request, install_request=install_request
+        )
+        _validate_publication_authorization(
+            authorization,
+            request=request,
+            previous_authorization=previous_authorization,
+        )
+        previous_authorization = authorization
+    expected_install = _install_publication_fields(install_request)
+    previous_entry = None
+    records: list[dict[str, object]] = []
+    install_count = 0
+    active_recovery_index: int | None = None
+    encountered_recoveries = 0
+    recovery_validated = False
+    prepared = False
+    receipt_created = False
+    result_bound: dict[str, object] | None = None
+    identity_bound: tuple[object, object] | None = None
+    receipt_bound: str | None = None
+    for sequence, encoded in enumerate(encoded_records, 1):
         record = json.loads(encoded)
         if (
             type(record) is not dict
@@ -4910,75 +6115,121 @@ def decode_exact_publication_journal(
             or _canonical_json(record) != encoded
         ):
             raise RuntimeError("PUBLICATION_JOURNAL_SCHEMA")
+        phase = record["phase"]
+        if sequence == 1 and phase != "INITIAL":
+            raise RuntimeError("PUBLICATION_JOURNAL_INITIAL_PHASE")
+        if phase == "RECOVERY_STARTED":
+            if active_recovery_index is not None:
+                raise RuntimeError("PUBLICATION_RECOVERY_NESTED")
+            if encountered_recoveries >= len(recovery_requests):
+                raise RuntimeError("PUBLICATION_RECOVERY_UNDECLARED")
+            active_recovery_index = encountered_recoveries
+            encountered_recoveries += 1
+            recovery_validated = False
+        elif active_recovery_index is None:
+            expected = INSTALL_PUBLICATION_PHASES[install_count]
+            if phase != expected:
+                raise RuntimeError("PUBLICATION_INSTALL_PREFIX")
+            install_count += 1
+        elif install_count < len(INSTALL_PUBLICATION_PHASES):
+            expected = INSTALL_PUBLICATION_PHASES[install_count]
+            if phase != expected:
+                raise RuntimeError("PUBLICATION_RECOVERY_ACTION_ORDER")
+            install_count += 1
+        elif not recovery_validated:
+            if phase != "RECOVERY_PUBLICATION_VALIDATED":
+                raise RuntimeError("PUBLICATION_RECOVERY_VALIDATE_ORDER")
+            recovery_validated = True
+        else:
+            if phase != "RECOVERY_RESPONSE_CREATED":
+                raise RuntimeError("PUBLICATION_RECOVERY_RESPONSE_ORDER")
+            active_recovery_index = None
+            recovery_validated = False
+        if active_recovery_index is None and phase != "RECOVERY_RESPONSE_CREATED":
+            actor_request = install_request
+            actor_authorization = install_authorization
+        else:
+            actor_index = (
+                encountered_recoveries - 1
+                if phase == "RECOVERY_RESPONSE_CREATED"
+                else active_recovery_index
+            )
+            if actor_index is None:
+                raise RuntimeError("PUBLICATION_RECOVERY_ACTOR")
+            actor_request = recovery_requests[actor_index]
+            actor_authorization = recovery_authorizations[actor_index]
+        expected_actor = _journal_actor_fields(
+            actor_request, actor_authorization
+        )
         if (
             record["sequence"] != sequence
-            or record["phase"] != phase
-            or record["previous_entry_sha256"] != previous
+            or record["previous_entry_sha256"] != previous_entry
             or any(record[key] != expected_install[key] for key in expected_install)
-            or any(record[key] != expected_actor[key] for key in expected_actor)
         ):
             raise RuntimeError("PUBLICATION_JOURNAL_CHAIN")
+        if any(record[key] != expected_actor[key] for key in expected_actor):
+            raise RuntimeError("PUBLICATION_JOURNAL_AUTHORIZATION_PROVENANCE")
         for key in ("source_parent_identity", "staging_identity"):
-            _validate_publication_identity(
-                record[key], code="PUBLICATION_JOURNAL_SOURCE_IDENTITY"
+            _validate_stable_identity(
+                record[key], code="PUBLICATION_JOURNAL_STABLE_IDENTITY"
             )
-        current_source = (
+        identities = (
             record["source_parent_identity"], record["staging_identity"]
         )
-        if source_bound is None:
-            source_bound = current_source
-        elif current_source != source_bound:
-            raise RuntimeError("PUBLICATION_JOURNAL_SOURCE_IDENTITY_DRIFT")
+        if identity_bound is None:
+            identity_bound = identities
+        elif identities != identity_bound:
+            raise RuntimeError("PUBLICATION_JOURNAL_IDENTITY_DRIFT")
+        if phase == "PREPARED":
+            prepared = True
+        if phase == "RECEIPT_CREATED":
+            receipt_created = True
+        expected_mode = 0o555 if prepared else 0o700
+        if record["observed_root_mode"] != expected_mode:
+            raise RuntimeError("PUBLICATION_JOURNAL_PHASE_MODE")
         result_keys = (
             "completion_sha256", "component_hashes", "final_tree_sha256",
             "root_identity",
         )
-        if phase == "INITIAL":
-            if any(record[key] is not None for key in result_keys) or (
-                record["receipt_sha256"] is not None
-                or record["terminal_response_sha256"] is not None
-            ):
-                raise RuntimeError("PUBLICATION_JOURNAL_INITIAL_RESULT")
+        if not prepared:
+            if any(record[key] is not None for key in result_keys):
+                raise RuntimeError("PUBLICATION_JOURNAL_EARLY_RESULT")
         else:
             current = {key: record[key] for key in result_keys}
-            if bound is None:
-                bound = current
-                receipt_probe = {
-                    **expected_install,
-                    **current,
-                }
+            if result_bound is None:
+                result_bound = current
                 decode_exact_publication_receipt(
-                    _canonical_json(receipt_probe),
+                    _canonical_json({**expected_install, **current}),
                     install_request=install_request,
                 )
-            elif current != bound:
+            elif current != result_bound:
                 raise RuntimeError("PUBLICATION_JOURNAL_RESULT_DRIFT")
-            receipt_expected = phase == "RECEIPT_CREATED" or phase.startswith(
-                "RECOVERY_"
+        if receipt_created:
+            receipt = _require_sha256(
+                record["receipt_sha256"],
+                code="PUBLICATION_JOURNAL_RECEIPT_DIGEST",
             )
-            if receipt_expected:
-                receipt = _require_sha256(
-                    record["receipt_sha256"],
-                    code="PUBLICATION_JOURNAL_RECEIPT_DIGEST",
-                )
-                if receipt_bound is None:
-                    receipt_bound = receipt
-                elif receipt != receipt_bound:
-                    raise RuntimeError("PUBLICATION_JOURNAL_RECEIPT_DRIFT")
-            elif record["receipt_sha256"] is not None:
-                raise RuntimeError("PUBLICATION_JOURNAL_EARLY_RECEIPT")
-            terminal_expected = phase in {
-                "RECEIPT_CREATED", "RECOVERY_RESPONSE_CREATED",
-            }
-            if terminal_expected:
-                _require_sha256(
-                    record["terminal_response_sha256"],
-                    code="PUBLICATION_JOURNAL_RESPONSE_DIGEST",
-                )
-            elif record["terminal_response_sha256"] is not None:
-                raise RuntimeError("PUBLICATION_JOURNAL_EARLY_RESPONSE")
+            if receipt_bound is None:
+                receipt_bound = receipt
+            elif receipt != receipt_bound:
+                raise RuntimeError("PUBLICATION_JOURNAL_RECEIPT_DRIFT")
+        elif record["receipt_sha256"] is not None:
+            raise RuntimeError("PUBLICATION_JOURNAL_EARLY_RECEIPT")
+        terminal_expected = (
+            phase == "RECOVERY_RESPONSE_CREATED"
+            or (phase == "RECEIPT_CREATED" and actor_request is install_request)
+        )
+        if terminal_expected:
+            _require_sha256(
+                record["terminal_response_sha256"],
+                code="PUBLICATION_JOURNAL_RESPONSE_DIGEST",
+            )
+        elif record["terminal_response_sha256"] is not None:
+            raise RuntimeError("PUBLICATION_JOURNAL_EARLY_RESPONSE")
         records.append(record)
-        previous = hashlib.sha256(encoded).hexdigest()
+        previous_entry = hashlib.sha256(encoded).hexdigest()
+    if encountered_recoveries != len(recovery_requests):
+        raise RuntimeError("PUBLICATION_RECOVERY_UNUSED_AUTHORIZATION")
     return tuple(records)
 
 
@@ -5895,7 +7146,7 @@ The preliminary owner snapshot is never reused after acquiring the transaction l
 
 The service never calls `LOCK_UN`. Every install/recover instance opens a distinct file description for the exact configured transaction-lock inode. The mutation child receives only the validated token staging bind mount and result pipe, has no source/destination parent, receipt, journal, socket, or sibling-token FD, and may not call rename. The parent performs the one FD-relative rename with retained source-parent/destination-parent FDs and derived basenames. The child drops all capabilities before final read-back; the parent drops all setup/metadata capabilities before the terminal response.
 
-Base-Python journals are keyed by `<intake-sha256>.<operation-token-sha256>.jsonl`; closure journals by `<closure-id>.<operation-token-sha256>.jsonl`. Before `PREPARED`, the only legal final digest is null and recovery removes only the exact token-owned staging inode after `STAGING_REMOVE_PENDING`; at or after `PREPARED`, every record must carry the first bound non-null digest. A post-publication recovery opens the existing install-token journal, validates the complete immutable install prefix, validates or reconstructs the install-implied receipt byte-for-byte, and appends its recovery-specific hash-chained records to that same inode. It never creates a recovery-keyed replacement journal or recovery-derived receipt. Root journals, completion metadata, and receipts are never within payload hashes.
+Base-Python journals are keyed by `<intake-sha256>.<operation-token-sha256>.jsonl`; closure journals by `<closure-id>.<operation-token-sha256>.jsonl`. Before `PREPARED`, the only legal final digest is null, the stable staging identity excludes mode, and each record carries the actual phase-observed mode. At or after `PREPARED`, every record must carry the first bound non-null digest and observed mode `0555`. Recovery opens the existing install-token journal, accepts only a legal contiguous durable prefix, derives the next filesystem action from its last phase, and appends missing action records under the active recovery authorization to the same inode. Every install and recovery record binds the expected authorization digest/sequence, previous authorization-entry digest, and exact owner-record transition. Recovery validates or reconstructs the install-implied receipt byte-for-byte and never creates a recovery-keyed replacement journal or recovery-derived receipt. Root journals, completion metadata, and receipts are never within payload hashes.
 
 - [ ] **Step 6: Add native crash/race tests**
 
