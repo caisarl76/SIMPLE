@@ -4,12 +4,16 @@ src/simple/cli/eval_decoupled_wbc.py
 src/simple/envs/video_writer.py
 src/simple/envs/wrappers/video_recorder.py
 src/simple/eval_runtime/__init__.py
+src/simple/eval_runtime/canonical.py
 src/simple/eval_runtime/contracts.py
+src/simple/eval_runtime/processes.py
 src/simple/eval_runtime/profile.py
 src/simple/scenes/hssd.py
 src/simple/utils.py
 tests/eval_runtime/__init__.py
 tests/eval_runtime/conftest.py
 tests/eval_runtime/fakes.py
+tests/eval_runtime/test_canonical.py
 tests/eval_runtime/test_contracts.py
+tests/eval_runtime/test_processes.py
 tests/eval_runtime/test_profile.py
