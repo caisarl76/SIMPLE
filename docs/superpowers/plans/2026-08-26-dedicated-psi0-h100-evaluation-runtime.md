@@ -1451,6 +1451,15 @@ class ForkedInstallerService:
                 publication=publication,
                 fault=fault,
             )
+            if wire_status in {
+                "INSTALLED", "NO_JOURNAL_NO_MUTATION",
+                "ABORTED_BEFORE_PREPARED", "RECOVERED",
+            }:
+                ForkedInstallerService._record_terminal_response(
+                    transaction_lock.parent,
+                    request_id=request["request_id"],
+                    payload=payload,
+                )
             if wire_status == "INSTALLED":
                 ForkedInstallerService._write_install_publication_journal(
                     publication,
@@ -1488,13 +1497,9 @@ class ForkedInstallerService:
                     terminal_response=payload,
                 )
             if wire_status in {
-                "INSTALLED", "ABORTED_BEFORE_PREPARED", "RECOVERED",
+                "INSTALLED", "NO_JOURNAL_NO_MUTATION",
+                "ABORTED_BEFORE_PREPARED", "RECOVERED",
             }:
-                ForkedInstallerService._record_terminal_response(
-                    transaction_lock.parent,
-                    request_id=request["request_id"],
-                    payload=payload,
-                )
                 if fault in {
                     "protected_journal", "protected_receipt",
                     "protected_root_mode", "protected_component",
@@ -1655,13 +1660,15 @@ class ForkedInstallerService:
         staging_parent = published_parent
         receipts = protected / "receipts"
         journals = protected / "journals"
+        responses = protected / "response-artifacts"
         for directory in (
             protected, published_parent, staging_parent, receipts, journals,
+            responses,
         ):
             directory.mkdir(mode=0o700, exist_ok=True)
         receipt_parent_identity = (
             ForkedInstallerService._ensure_fixture_installer_config(
-                control_parent, receipts=receipts
+                control_parent, receipts=receipts, responses=responses
             )
         )
         component_hashes = {
@@ -2589,12 +2596,18 @@ class ForkedInstallerService:
     def _record_terminal_response(
         control_parent: Path, *, request_id: str, payload: bytes
     ) -> None:
-        responses = control_parent / "fixture-response-bytes"
-        responses.mkdir(mode=0o700, exist_ok=True)
+        responses = control_parent / "protected-installer" / "response-artifacts"
+        responses.mkdir(mode=0o700, parents=True, exist_ok=True)
         basename = hashlib.sha256(request_id.encode()).hexdigest()
         path = responses / f"{basename}.bin"
         if path.exists():
-            if path.read_bytes() != payload:
+            existing = path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(existing.st_mode)
+                or existing.st_nlink != 1
+                or stat.S_IMODE(existing.st_mode) != 0o444
+                or path.read_bytes() != payload
+            ):
                 raise RuntimeError("INSTALLER_TEST_RESPONSE_REPLAY_DRIFT")
             return
         fd = os.open(
@@ -2605,6 +2618,7 @@ class ForkedInstallerService:
         try:
             if os.write(fd, payload) != len(payload):
                 raise RuntimeError("INSTALLER_TEST_RESPONSE_SHORT_WRITE")
+            os.fchmod(fd, 0o444)
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -2629,7 +2643,7 @@ class ForkedInstallerService:
 
     @staticmethod
     def _ensure_fixture_installer_config(
-        control_parent: Path, *, receipts: Path
+        control_parent: Path, *, receipts: Path, responses: Path
     ) -> dict[str, int]:
         protected = control_parent / "protected-installer"
         config = protected / "installer-config.json"
@@ -2639,6 +2653,9 @@ class ForkedInstallerService:
                 "input_gid": os.getgid(),
                 "input_uid": os.getuid(),
                 "receipt_parent_identity": identity,
+                "response_parent_identity": (
+                    ForkedInstallerService._path_identity(responses)
+                ),
                 "schema_version": 1,
             },
             sort_keys=True,
@@ -2674,7 +2691,7 @@ class ForkedInstallerService:
         value = json.loads(config.read_bytes())
         if type(value) is not dict or set(value) != {
             "input_gid", "input_uid", "receipt_parent_identity",
-            "schema_version",
+            "response_parent_identity", "schema_version",
         } or value["schema_version"] != 1:
             raise RuntimeError("INSTALLER_TEST_CONFIG_SCHEMA")
         return value
@@ -4979,7 +4996,7 @@ def test_manager_fsyncs_transition_before_closing_handoff(
     fcntl.flock(handoff_fd, fcntl.LOCK_EX)
     real_close = os.close
     monkeypatch.setattr(os, "close", lambda fd: order.append(f"close:{fd}"))
-    reply = InstallerReply("INSTALLED", {}, None, "a" * 64, handoff_fd)
+    reply = InstallerReply("INSTALLED", {}, None, "a" * 64, handoff_fd, b"{}")
     apply_locked_reply(RecordingHistory(order), reply, expected_lock=expected)
     assert order == [
         "install_authorization",
@@ -5014,7 +5031,7 @@ def test_failed_transition_retains_handoff_and_blocks_waiter(
     handoff_fd = os.open(lock, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     fcntl.flock(handoff_fd, fcntl.LOCK_EX)
     history = RecordingHistory([], fail_at=(transition, edge))
-    reply = InstallerReply("INSTALLED", {}, None, "a" * 64, handoff_fd)
+    reply = InstallerReply("INSTALLED", {}, None, "a" * 64, handoff_fd, b"{}")
     with pytest.raises(HandoffPersistenceUncertain) as captured:
         apply_locked_reply(history, reply, expected_lock=expected)
     assert captured.value.handoff_fd == handoff_fd
@@ -5233,8 +5250,11 @@ from simple.eval_runtime.installer_client import (
     encode_owner_transition_entry,
     encode_pending_publication_authorization,
     encode_publication_authorization,
+    read_protected_response_artifact,
+    validate_protected_publication_contract,
     validate_owner_transition_against_records,
     validate_owner_transition_entry,
+    validate_owner_history_for_service,
 )
 from simple.eval_runtime.installer_manager import (
     DiskAuthorizationStore,
@@ -5388,6 +5408,8 @@ LIVE_PERSISTENCE_BOUNDARIES = (
 )
 PUBLICATION_VALIDATION_BOUNDARIES = (
     "after_handoff_close",
+    "before_protected_response_artifact_validation",
+    "after_protected_response_artifact_validation",
     "before_protected_journal_validation", "after_protected_journal_validation",
     "before_protected_receipt_validation", "after_protected_receipt_validation",
     "before_final_renamed_mirror", "after_final_renamed_owner_replace",
@@ -5448,7 +5470,8 @@ for prefix, before_state, after_state in FRESH_ATTEMPT_TRANSITIONS:
 def _fixture_response_bytes(control_parent: Path, request_id: str) -> bytes:
     basename = hashlib.sha256(request_id.encode()).hexdigest()
     return (
-        control_parent / "fixture-response-bytes" / f"{basename}.bin"
+        control_parent / "protected-installer" / "response-artifacts"
+        / f"{basename}.bin"
     ).read_bytes()
 
 
@@ -5538,6 +5561,22 @@ def test_successful_install_finishes_independent_publication_validation(tmp_path
     install_response = _fixture_response_bytes(
         tmp_path, INSTALL_REQUEST["request_id"]
     )
+    response_parent = protected / "response-artifacts"
+    response_parent_fd = os.open(
+        response_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    )
+    try:
+        assert read_protected_response_artifact(
+            response_parent_fd,
+            request_id=INSTALL_REQUEST["request_id"],
+            expected_parent_identity=ForkedInstallerService._path_identity(
+                response_parent
+            ),
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+        ) == install_response
+    finally:
+        os.close(response_parent_fd)
     assert records[-1]["terminal_response_sha256"] == hashlib.sha256(
         install_response
     ).hexdigest()
@@ -5554,6 +5593,48 @@ def test_successful_install_finishes_independent_publication_validation(tmp_path
     assert receipt["operation_token_sha256"] == operation_token
     assert receipt["component_hashes"] == snapshot.component_hashes
     assert hashlib.sha256(receipt_bytes).hexdigest() == snapshot.receipt_sha256
+    owner = json.loads(manager.store.read_owner_record_bytes())
+    contract = {
+        "journal_payload": journal,
+        "receipt_payload": receipt_bytes,
+        "response_artifacts": {
+            INSTALL_REQUEST["request_id"]: install_response,
+        },
+        "install_request": INSTALL_REQUEST,
+        "install_authorization": INSTALL_AUTHORIZATION,
+        "recovery_requests": (),
+        "recovery_authorizations": (),
+        "recovery_results": (),
+        "owner_transition_history": INSTALL_OWNER_TRANSITIONS,
+        "current_owner_record": owner,
+    }
+    assert validate_protected_publication_contract(**contract) == records
+
+    forged_response = json.loads(install_response)
+    forged_response["payload"]["component_hashes"]["base_python"] = "9" * 64
+    forged_response_bytes = json.dumps(
+        forged_response, sort_keys=True, separators=(",", ":")
+    ).encode()
+    forged_lines = journal[:-1].split(b"\n")
+    forged_terminal = json.loads(forged_lines[-1])
+    forged_terminal["terminal_response_sha256"] = hashlib.sha256(
+        forged_response_bytes
+    ).hexdigest()
+    forged_lines[-1] = json.dumps(
+        forged_terminal, sort_keys=True, separators=(",", ":")
+    ).encode()
+    with pytest.raises(
+        RuntimeError, match="PROTECTED_RESPONSE_RECEIPT_BINDING"
+    ):
+        validate_protected_publication_contract(
+            **{
+                **contract,
+                "journal_payload": b"\n".join(forged_lines) + b"\n",
+                "response_artifacts": {
+                    INSTALL_REQUEST["request_id"]: forged_response_bytes,
+                },
+            }
+        )
     service.stop()
     service.wait(timeout=5.0)
 
@@ -5652,6 +5733,47 @@ def test_recovery_appends_history_and_preserves_install_receipt(tmp_path) -> Non
     receipt_sha256 = hashlib.sha256(receipt_before).hexdigest()
     assert receipt_sha256 == records[4]["receipt_sha256"]
     assert receipt_sha256 == records[-1]["receipt_sha256"]
+    owner = json.loads(restarted.store.read_owner_record_bytes())
+    response_artifacts = {
+        INSTALL_REQUEST["request_id"]: install_response,
+        recovery_request["request_id"]: recovery_response,
+    }
+    contract = {
+        "journal_payload": complete_journal,
+        "receipt_payload": receipt_before,
+        "response_artifacts": response_artifacts,
+        "install_request": INSTALL_REQUEST,
+        "install_authorization": INSTALL_AUTHORIZATION,
+        "recovery_requests": (recovery_request,),
+        "recovery_authorizations": (recovery_authorization,),
+        "recovery_results": tuple(owner["recovery_results"]),
+        "owner_transition_history": RECOVERY_OWNER_TRANSITIONS,
+        "current_owner_record": owner,
+    }
+    assert validate_protected_publication_contract(**contract) == records
+
+    tampered_results = json.loads(json.dumps(owner["recovery_results"]))
+    tampered_results[-1]["terminal_response_sha256"] = "0" * 64
+    result_body = {
+        key: value
+        for key, value in tampered_results[-1].items()
+        if key != "result_sha256"
+    }
+    tampered_results[-1]["result_sha256"] = hashlib.sha256(
+        json.dumps(result_body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    tampered_owner = json.loads(json.dumps(owner))
+    tampered_owner["recovery_results"] = tampered_results
+    with pytest.raises(
+        RuntimeError, match="PROTECTED_RESPONSE_RESULT_BINDING"
+    ):
+        validate_protected_publication_contract(
+            **{
+                **contract,
+                "recovery_results": tuple(tampered_results),
+                "current_owner_record": tampered_owner,
+            }
+        )
     service.stop()
     service.wait(timeout=5.0)
 
@@ -7238,16 +7360,98 @@ def _initial_journal_after_owner_gap(
     )
 
 
-def test_owner_transition_history_allows_only_explicit_phase_heartbeat_gap() -> None:
+def test_owner_transition_history_allows_heartbeat_gap() -> None:
     journal = _initial_journal_after_owner_gap(
         {
-            "phase": "HSSD_NORMALIZED",
-            "pending_action": "prepare-recovery",
             "heartbeat_monotonic_ns": 2,
             "heartbeat_wall_ns": 2,
         }
     )
     assert journal.endswith(b"\n")
+
+
+def test_owner_transition_history_allows_exact_busy_diagnostic_gap() -> None:
+    journal = _initial_journal_after_owner_gap(
+        {
+            "heartbeat_monotonic_ns": 2,
+            "heartbeat_wall_ns": 2,
+            "last_preacquisition_status": "INSTALLER_TRANSACTION_BUSY",
+        }
+    )
+    assert journal.endswith(b"\n")
+
+
+def test_owner_transition_history_allows_same_kind_forward_phase_gap() -> None:
+    journal = _initial_journal_after_owner_gap(
+        {
+            "phase": "BASE_METADATA_NORMALIZED",
+            "heartbeat_monotonic_ns": 2,
+            "heartbeat_wall_ns": 2,
+        }
+    )
+    assert journal.endswith(b"\n")
+
+
+def test_owner_transition_history_rejects_cross_kind_phase_gap() -> None:
+    with pytest.raises(
+        RuntimeError, match="PUBLICATION_OWNER_TRANSITION_PHASE_KIND"
+    ):
+        _initial_journal_after_owner_gap(
+            {
+                "phase": "HSSD_NORMALIZED",
+                "heartbeat_monotonic_ns": 2,
+                "heartbeat_wall_ns": 2,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("cleanup_required", False),
+        ("pending_action", "prepare-recovery"),
+        ("pending_local_transition", "VALIDATE_PUBLICATION"),
+        ("response_uncertain", True),
+    ),
+)
+def test_owner_transition_history_rejects_unowned_lifecycle_gap(
+    field: str, value: object
+) -> None:
+    with pytest.raises(
+        RuntimeError, match="PUBLICATION_OWNER_TRANSITION_RECORD_CHAIN"
+    ):
+        _initial_journal_after_owner_gap({field: value})
+
+
+def test_service_history_accepts_only_final_heartbeat_tail() -> None:
+    current = json.loads(INSTALL_OWNER_RECORD)
+    current["heartbeat_monotonic_ns"] = 2
+    current["heartbeat_wall_ns"] = 2
+    transitions = validate_owner_history_for_service(
+        INSTALL_OWNER_TRANSITIONS,
+        current_owner_record=current,
+    )
+    assert transitions[-1] == INSTALL_TRANSITION_ENTRY["transition"]
+
+
+def test_service_history_accepts_same_kind_phase_in_final_tail() -> None:
+    current = json.loads(INSTALL_OWNER_RECORD)
+    current["phase"] = "BASE_METADATA_NORMALIZED"
+    transitions = validate_owner_history_for_service(
+        INSTALL_OWNER_TRANSITIONS,
+        current_owner_record=current,
+    )
+    assert transitions[-1] == INSTALL_TRANSITION_ENTRY["transition"]
+
+
+def test_service_history_rejects_unowned_cleanup_in_final_tail() -> None:
+    current = json.loads(INSTALL_OWNER_RECORD)
+    current["cleanup_required"] = False
+    with pytest.raises(RuntimeError, match="PUBLICATION_OWNER_SERVICE_TAIL"):
+        validate_owner_history_for_service(
+            INSTALL_OWNER_TRANSITIONS,
+            current_owner_record=current,
+        )
 
 
 def test_owner_transition_history_rejects_security_identity_gap() -> None:
@@ -8090,7 +8294,7 @@ The decoder accepts `INITIAL` and every legal contiguous durable install prefix,
 
 `INSTALLED` is the only successful service status for an install operation; it carries `BASE_COMPLETE` for base Python or `COMPLETE` for a closure and all final fields. `RECOVERED` is the corresponding post-publication recovery status. Neither status directly terminalizes manager state. The fixture can independently mutate each response field or protected object after construction, so the manager tests exercise the production codec and publication validators rather than successful sentinels. Journal/receipt corruption is permitted only inside the test fixture: the helper changes its own mode-`0444` file to `0600`, writes and fsyncs the corrupt bytes, restores `0444`, fsyncs again, and fsyncs the parent. Production code has no chmod or write path for protected evidence.
 
-Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, retains generation 1 in the immutable authorization history, appends the independent install-reactivation owner transition, creates/fsyncs the canonical install publication journal and receipt and drops the byte-identical second install response, then creates generation 2 whose authorization digest links to generation 1 while its activation transition links to the intervening reactivation transition. The owner authorization sequence is strictly monotonic across all four transitions—install 1, recovery generation 1, install reactivation, and recovery generation 2—so the sentinel requires `[1, 2, 3, 4]`; reactivation never reuses the install authorization's creation-time sequence. It appends only generation 2 as a publication actor and returns the exact `RECOVERED` response whose digest was fsynced first. The service and manager pass the complete authorization and owner-transition histories to the shared decoder; histories may contain no-journal authorizations and transitions that never appear as journal actors, but omitting or changing any such entry breaks its independent canonical chain. It records exact response bytes in request-ID-hashed fixture files so tests can compare them with protected terminal-response digests. Parameterized scripts additionally exercise immediate `INSTALLED`, zero-FD `INSTALLER_TRANSACTION_BUSY` followed by byte-identical retry, `INITIAL`-only abort followed by a genuinely fresh attempt/token, and `NO_JOURNAL_NO_MUTATION` followed by byte-identical replay ending in `INSTALLED`. A phase-crash mode calls `_exit(87)` immediately after each per-record fsync and also immediately after receipt fsync but before `RECEIPT_CREATED`; a replacement service process receives the same protected roots plus the immutable install request/authorization, handles the real authenticated recovery request, derives the next action from the disk journal, and completes the missing filesystem mutations and records. A broken response socket never advances authorization state; request generation and the fsynced service journal determine the response. Test-only shutdown signals the owned child only after the manager verifies terminal state; there is no unauthenticated stop request. `InstallerOrchestrator` uses the production `sendmsg` session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after every service publication phase, authenticated request delivery, actual terminal-frame-plus-handoff receipt, or manager-side publication validation boundary. A fresh orchestrator reopens only the fsynced prefix, performs an authenticated wire operation only if one remains required, and cannot mark terminal until the protected journal, receipt, and published root have been independently validated and every mirror plus `COMPLETE` has been separately fsynced. Assertions prove the install prefix remains a byte-for-byte prefix after recovery; existing receipt bytes, SHA-256, and inode never change; missing receipts are reconstructed from install fields; actual install replays are byte-identical; all generations are inside `payload`; every accepted request carried the stable construction-lock FD; and zero-FD busy replies create no recovery generation. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
+Its default state machine drops the first install response, returns the same `NO_JOURNAL_NO_MUTATION` result for every replay of recovery generation 1 until the manager persists it, retains generation 1 in the immutable authorization history, appends the independent install-reactivation owner transition, creates/fsyncs the canonical install publication journal and receipt and drops the byte-identical second install response, then creates generation 2 whose authorization digest links to generation 1 while its activation transition links to the intervening reactivation transition. The owner authorization sequence is strictly monotonic across all four transitions—install 1, recovery generation 1, install reactivation, and recovery generation 2—so the sentinel requires `[1, 2, 3, 4]`; reactivation never reuses the install authorization's creation-time sequence. It appends only generation 2 as a publication actor and returns the exact `RECOVERED` response whose digest was fsynced first. The service and manager pass the complete authorization, result, owner-transition, response-artifact, and current-owner evidence to the shared protected-publication validator; histories may contain no-journal authorizations and transitions that never appear as journal actors, but omitting or changing any such entry breaks its independent canonical chain. It records exact response bytes in request-ID-hashed, mode-`0444` protected fixture artifacts before journal terminal records or sends, including `NO_JOURNAL_NO_MUTATION`. Parameterized scripts additionally exercise immediate `INSTALLED`, zero-FD `INSTALLER_TRANSACTION_BUSY` followed by byte-identical retry, `INITIAL`-only abort followed by a genuinely fresh attempt/token, and `NO_JOURNAL_NO_MUTATION` followed by byte-identical replay ending in `INSTALLED`. A phase-crash mode calls `_exit(87)` immediately after each per-record fsync and also immediately after receipt or response-artifact fsync but before its binding journal append; a replacement service process receives the same protected roots plus the immutable install request/authorization, handles the real authenticated recovery request, derives the next action from disk, and completes the missing filesystem mutations and records. A broken response socket never advances authorization state; request generation plus the fsynced service journal and response artifact determine the response. Test-only shutdown signals the owned child only after the manager verifies terminal state; there is no unauthenticated stop request. `InstallerOrchestrator` uses the production `sendmsg` session sender and `recv_installer_reply`; no test calls a persist method with a prebuilt reply. The parameterized child can therefore exit before or after every service publication phase, authenticated request delivery, actual terminal-frame-plus-handoff receipt, or manager-side publication validation boundary. A fresh orchestrator reopens only the fsynced prefix, performs an authenticated wire operation only if one remains required, and cannot mark terminal until the protected journal, receipt, response artifacts, recovery-result chain, current owner, and published root have been jointly validated and every mirror plus `COMPLETE` has been separately fsynced. Assertions prove the install prefix remains a byte-for-byte prefix after recovery; existing receipt and response-artifact bytes, SHA-256, and inode never change; missing receipts and response artifacts are reconstructed only from install-bound fields; actual install replays are byte-identical; all generations are inside `payload`; every accepted request carried the stable construction-lock FD; and zero-FD busy replies create no recovery generation. `RecoveryHarness` remains only a pure hash-chain unit test. Native tests in Step 6 cover every service-side phase barrier. None calls systemd or requires root.
 
 - [ ] **Step 2: Write failing systemd/config exactness tests**
 
@@ -8122,7 +8326,11 @@ def test_installer_config_contains_all_stable_lock_identities() -> None:
         "base_lock_basename", "base_lock_device", "base_lock_inode", "base_lock_mount_id",
         "transaction_lock_basename", "transaction_lock_device", "transaction_lock_inode",
         "transaction_lock_mount_id", "transaction_lock_uid", "transaction_lock_gid",
-        "transaction_lock_mode", "mode_policy_version", "request_limit_bytes",
+        "transaction_lock_mode", "protected_response_root",
+        "response_parent_device", "response_parent_inode",
+        "response_parent_mount_id", "response_parent_uid",
+        "response_parent_gid", "response_parent_mode",
+        "mode_policy_version", "request_limit_bytes",
     }
     assert set(config) == expected
 ```
@@ -8247,11 +8455,23 @@ RECOVERY_RESULT_KEYS = {
 OWNER_TRANSITION_ENTRY_KEYS = {
     "transition", "from_owner_record", "to_owner_record",
 }
-OWNER_TRANSITION_GAP_MUTABLE_KEYS = {
-    "phase", "cleanup_required", "pending_action", "pending_local_transition",
-    "heartbeat_monotonic_ns", "heartbeat_wall_ns", "last_error",
-    "transport_uncertain", "response_uncertain", "last_preacquisition_status",
-    "locked_response_records",
+OWNER_HEARTBEAT_KEYS = {
+    "heartbeat_monotonic_ns", "heartbeat_wall_ns",
+}
+OWNER_PREACQUISITION_GAP_KEYS = {
+    *OWNER_HEARTBEAT_KEYS, "last_preacquisition_status",
+}
+OWNER_PHASE_GAP_KEYS = {*OWNER_HEARTBEAT_KEYS, "phase"}
+OWNER_PHASES_BY_KIND = {
+    "base_python": (
+        "BASE_ALLOCATED", "BASE_COPIED", "BASE_METADATA_NORMALIZED",
+        "BASE_FINAL_RENAMED", "BASE_RECEIPT_CREATED", "BASE_COMPLETE",
+    ),
+    "closure": (
+        "ALLOCATED", "SOURCE", "EPISODE_DATA", "VENV", "TASK_DATA_COPY",
+        "HSSD_NORMALIZED", "PAYLOAD_READY", "INSTALLING", "FINAL_RENAMED",
+        "RECEIPT_CREATED", "COMPLETE",
+    ),
 }
 PUBLICATION_JOURNAL_ENTRY_KEYS = PUBLICATION_RECEIPT_KEYS | {
     "sequence", "phase", "previous_entry_sha256", "receipt_sha256",
@@ -9061,35 +9281,89 @@ def _validate_owner_authorization_histories(
         raise RuntimeError("PUBLICATION_OWNER_RECOVERY_RESULT_PREFIX")
 
 
-def _owner_transition_gap_projection(
-    owner: Mapping[str, object],
-) -> dict[str, object]:
-    return {
-        key: owner[key]
-        for key in OWNER_RECORD_KEYS - OWNER_TRANSITION_GAP_MUTABLE_KEYS
-    }
+def _changed_owner_keys(
+    previous: Mapping[str, object], current: Mapping[str, object]
+) -> set[str]:
+    return {key for key in OWNER_RECORD_KEYS if previous[key] != current[key]}
+
+
+def _validate_owner_heartbeat_order(
+    previous_after: Mapping[str, object],
+    current_before: Mapping[str, object],
+) -> None:
+    for key in ("heartbeat_monotonic_ns", "heartbeat_wall_ns"):
+        if current_before[key] < previous_after[key]:
+            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_HEARTBEAT_ORDER")
 
 
 def _validate_permitted_owner_transition_gap(
     previous_after: Mapping[str, object],
     current_before: Mapping[str, object],
-) -> None:
-    if _owner_transition_gap_projection(
-        previous_after
-    ) != _owner_transition_gap_projection(current_before):
-        raise RuntimeError("PUBLICATION_OWNER_TRANSITION_RECORD_CHAIN")
-    for key in ("heartbeat_monotonic_ns", "heartbeat_wall_ns"):
-        if current_before[key] < previous_after[key]:
-            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_HEARTBEAT_ORDER")
-    previous_locked = previous_after["locked_response_records"]
-    current_locked = current_before["locked_response_records"]
-    if current_locked[: len(previous_locked)] != previous_locked:
-        raise RuntimeError("PUBLICATION_OWNER_TRANSITION_DIAGNOSTIC_PREFIX")
+) -> str:
+    """Validate one omitted owner replacement by its exact reason.
+
+    Authorization-transition history may omit the high-rate heartbeat replacement,
+    a same-kind forward-only phase replacement, and the bounded zero-FD
+    transaction-busy diagnostic. Cleanup, pending action, uncertainty, response,
+    result, and publication-mirror changes are never projections: their owning
+    state machine must persist and validate them explicitly.
+    """
+    changed = _changed_owner_keys(previous_after, current_before)
+    if changed <= OWNER_HEARTBEAT_KEYS:
+        _validate_owner_heartbeat_order(previous_after, current_before)
+        return "heartbeat"
+    if changed <= OWNER_PHASE_GAP_KEYS and "phase" in changed:
+        kind = previous_after["construction_kind"]
+        if current_before["construction_kind"] != kind:
+            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_PHASE_KIND")
+        phases = OWNER_PHASES_BY_KIND.get(str(kind), ())
+        try:
+            previous_index = phases.index(str(previous_after["phase"]))
+            current_index = phases.index(str(current_before["phase"]))
+        except ValueError as error:
+            raise RuntimeError(
+                "PUBLICATION_OWNER_TRANSITION_PHASE_KIND"
+            ) from error
+        if current_index <= previous_index:
+            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_PHASE_ORDER")
+        _validate_owner_heartbeat_order(previous_after, current_before)
+        return "phase_progress"
+    if changed <= OWNER_PREACQUISITION_GAP_KEYS and (
+        "last_preacquisition_status" in changed
+    ):
+        if current_before["last_preacquisition_status"] != (
+            "INSTALLER_TRANSACTION_BUSY"
+        ):
+            raise RuntimeError("PUBLICATION_OWNER_TRANSITION_DIAGNOSTIC_VALUE")
+        _validate_owner_heartbeat_order(previous_after, current_before)
+        return "preacquisition_busy"
+    raise RuntimeError("PUBLICATION_OWNER_TRANSITION_RECORD_CHAIN")
+
+
+def validate_owner_history_for_service(
+    entries: Sequence[Mapping[str, object]],
+    *,
+    current_owner_record: Mapping[str, object],
+) -> tuple[dict[str, object], ...]:
+    """Bind service authorization to history plus one classified owner tail."""
+    transitions, last_target = _validate_owner_transition_history(
+        entries, include_last_target=True
+    )
+    current = _validate_owner_record_mapping(current_owner_record)
+    try:
+        _validate_permitted_owner_transition_gap(last_target, current)
+    except RuntimeError as error:
+        raise RuntimeError("PUBLICATION_OWNER_SERVICE_TAIL") from error
+    return transitions
 
 
 def _validate_owner_transition_history(
     entries: Sequence[Mapping[str, object]],
-) -> tuple[dict[str, object], ...]:
+    *,
+    include_last_target: bool = False,
+) -> tuple[dict[str, object], ...] | tuple[
+    tuple[dict[str, object], ...], dict[str, object]
+]:
     previous: Mapping[str, object] | None = None
     previous_after: Mapping[str, object] | None = None
     transitions: list[dict[str, object]] = []
@@ -9148,7 +9422,10 @@ def _validate_owner_transition_history(
         previous = transition
         previous_after = validated_entry["to_owner_record"]
         transitions.append(transition)
-    return tuple(transitions)
+    if previous_after is None:
+        raise RuntimeError("PUBLICATION_OWNER_TRANSITION_HISTORY_REQUIRED")
+    validated = tuple(transitions)
+    return (validated, dict(previous_after)) if include_last_target else validated
 
 
 def _validate_publication_identity(value: object, *, code: str) -> None:
@@ -9858,6 +10135,232 @@ def decode_exact_publication_journal(
     return tuple(records)
 
 
+def _fd_mount_id(fd: int) -> int:
+    with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as stream:
+        for line in stream:
+            if line.startswith("mnt_id:"):
+                return int(line.split(":", 1)[1])
+    raise RuntimeError("PROTECTED_RESPONSE_MOUNT_ID")
+
+
+def read_protected_response_artifact(
+    parent_fd: int,
+    *,
+    request_id: str,
+    expected_parent_identity: Mapping[str, object],
+    expected_uid: int,
+    expected_gid: int,
+) -> bytes:
+    """Read one root-created response artifact through its pinned parent FD."""
+    _validate_publication_identity(
+        expected_parent_identity, code="PROTECTED_RESPONSE_PARENT_IDENTITY"
+    )
+    parent_status = os.fstat(parent_fd)
+    observed_parent = {
+        "device": parent_status.st_dev,
+        "inode": parent_status.st_ino,
+        "mount_id": _fd_mount_id(parent_fd),
+        "mode": stat.S_IMODE(parent_status.st_mode),
+        "uid": parent_status.st_uid,
+        "gid": parent_status.st_gid,
+    }
+    if observed_parent != expected_parent_identity:
+        raise RuntimeError("PROTECTED_RESPONSE_PARENT_IDENTITY")
+    basename = f"{hashlib.sha256(request_id.encode()).hexdigest()}.bin"
+    fd = os.open(
+        basename,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        before = os.fstat(fd)
+        before_identity = (
+            before.st_dev, before.st_ino, _fd_mount_id(fd), before.st_mode,
+            before.st_uid, before.st_gid, before.st_nlink, before.st_size,
+        )
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != expected_uid
+            or before.st_gid != expected_gid
+            or stat.S_IMODE(before.st_mode) != 0o444
+            or _fd_mount_id(fd) != expected_parent_identity["mount_id"]
+        ):
+            raise RuntimeError("PROTECTED_RESPONSE_FILE_IDENTITY")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65_536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        response_bytes = b"".join(chunks)
+        after = os.fstat(fd)
+        after_identity = (
+            after.st_dev, after.st_ino, _fd_mount_id(fd), after.st_mode,
+            after.st_uid, after.st_gid, after.st_nlink, after.st_size,
+        )
+        if after_identity != before_identity:
+            raise RuntimeError("PROTECTED_RESPONSE_FILE_CHANGED")
+    finally:
+        os.close(fd)
+    decode_exact_response_payload(response_bytes, request_id=request_id)
+    return response_bytes
+
+
+def validate_durable_installer_response(
+    *,
+    response_bytes: bytes,
+    request: Mapping[str, object],
+    recovery_authorization: Mapping[str, object] | None = None,
+    recovery_result: Mapping[str, object] | None = None,
+) -> "DecodedInstallerResponse":
+    """Shared byte-level validator for receive, restart, and publication paths."""
+    request_id = request["request_id"]
+    if type(request_id) is not str or not request_id:
+        raise RuntimeError("PROTECTED_RESPONSE_REQUEST_ID")
+    response = decode_exact_response_payload(
+        response_bytes, request_id=request_id
+    )
+    reply = InstallerReply(
+        response.status,
+        response.payload,
+        response.error,
+        response.sha256,
+        -1,
+        response.encoded,
+    )
+    validate_reply_for_request(reply, request)
+    if (recovery_authorization is None) != (recovery_result is None):
+        raise RuntimeError("PROTECTED_RESPONSE_RESULT_PAIR")
+    if recovery_result is not None and recovery_authorization is not None:
+        if set(recovery_result) != RECOVERY_RESULT_KEYS:
+            raise RuntimeError("PROTECTED_RESPONSE_RESULT_SCHEMA")
+        expected = {
+            "recovery_generation": recovery_authorization[
+                "recovery_generation"
+            ],
+            "authorization_sha256": recovery_authorization[
+                "authorization_sha256"
+            ],
+            "request_sha256": recovery_authorization["request_sha256"],
+            "terminal_response_sha256": response.sha256,
+            "terminal_phase": response.payload["terminal_phase"],
+        }
+        if any(recovery_result[key] != value for key, value in expected.items()):
+            raise RuntimeError("PROTECTED_RESPONSE_RESULT_BINDING")
+        _require_sha256(
+            recovery_result["result_sha256"],
+            code="PROTECTED_RESPONSE_RESULT_DIGEST",
+        )
+        if recovery_result["result_sha256"] != hashlib.sha256(
+            _canonical_json(_result_digest_document(recovery_result))
+        ).hexdigest():
+            raise RuntimeError("PROTECTED_RESPONSE_RESULT_DIGEST")
+    return response
+
+
+def validate_protected_publication_contract(
+    *,
+    journal_payload: bytes,
+    receipt_payload: bytes,
+    response_artifacts: Mapping[str, bytes],
+    install_request: Mapping[str, object],
+    install_authorization: Mapping[str, object],
+    recovery_requests: Sequence[Mapping[str, object]],
+    recovery_authorizations: Sequence[Mapping[str, object]],
+    recovery_results: Sequence[Mapping[str, object]],
+    owner_transition_history: Sequence[Mapping[str, object]],
+    current_owner_record: Mapping[str, object],
+) -> tuple[dict[str, object], ...]:
+    """Validate journal, exact response bytes, results, receipt, and owner."""
+    owner = _validate_owner_record_mapping(current_owner_record)
+    if (
+        owner["install_authorization"] != install_authorization
+        or owner["recovery_authorizations"] != list(recovery_authorizations)
+        or owner["recovery_results"] != list(recovery_results)
+    ):
+        raise RuntimeError("PROTECTED_RESPONSE_OWNER_HISTORY")
+    records = decode_exact_publication_journal(
+        journal_payload,
+        install_request=install_request,
+        install_authorization=install_authorization,
+        recovery_requests=recovery_requests,
+        recovery_authorizations=recovery_authorizations,
+        owner_transition_history=owner_transition_history,
+    )
+    receipt = decode_exact_publication_receipt(
+        receipt_payload, install_request=install_request
+    )
+    request_by_id = {
+        request["request_id"]: request
+        for request in (install_request, *recovery_requests)
+    }
+    authorization_by_generation = {
+        authorization["recovery_generation"]: authorization
+        for authorization in recovery_authorizations
+    }
+    result_by_generation = {
+        result["recovery_generation"]: result for result in recovery_results
+    }
+    terminal_records = [
+        record for record in records
+        if record["terminal_response_sha256"] is not None
+    ]
+    if not terminal_records:
+        raise RuntimeError("PROTECTED_RESPONSE_MISSING")
+    terminal_request_ids = {
+        str(record["actor_request_id"]) for record in terminal_records
+    }
+    if set(response_artifacts) != terminal_request_ids:
+        raise RuntimeError("PROTECTED_RESPONSE_ARTIFACT_SET")
+    latest_response: DecodedInstallerResponse | None = None
+    for record in terminal_records:
+        request_id = record["actor_request_id"]
+        if request_id not in request_by_id or request_id not in response_artifacts:
+            raise RuntimeError("PROTECTED_RESPONSE_MISSING")
+        request = request_by_id[request_id]
+        generation = request["payload"]["recovery_generation"]
+        authorization = (
+            None if generation is None
+            else authorization_by_generation.get(generation)
+        )
+        result = None if generation is None else result_by_generation.get(generation)
+        response = validate_durable_installer_response(
+            response_bytes=response_artifacts[request_id],
+            request=request,
+            recovery_authorization=authorization,
+            recovery_result=result,
+        )
+        if response.sha256 != record["terminal_response_sha256"]:
+            raise RuntimeError("PROTECTED_RESPONSE_JOURNAL_BINDING")
+        if response.status in {"INSTALLED", "RECOVERED"}:
+            expected_result = {
+                "completion_sha256": receipt["completion_sha256"],
+                "component_hashes": receipt["component_hashes"],
+                "final_tree_sha256": receipt["final_tree_sha256"],
+                "receipt_sha256": hashlib.sha256(receipt_payload).hexdigest(),
+                "root_identity": receipt["root_identity"],
+            }
+            if any(
+                response.payload[key] != value
+                for key, value in expected_result.items()
+            ):
+                raise RuntimeError("PROTECTED_RESPONSE_RECEIPT_BINDING")
+        latest_response = response
+    assert latest_response is not None
+    if owner["terminal_response_status"] != latest_response.status:
+        raise RuntimeError("PROTECTED_RESPONSE_OWNER_STATUS")
+    if latest_response.status in {"INSTALLED", "RECOVERED"} and (
+        owner["component_hashes"] != latest_response.payload["component_hashes"]
+        or owner["final_tree_sha256"]
+        != latest_response.payload["final_tree_sha256"]
+        or owner["receipt_sha256"]
+        != latest_response.payload["receipt_sha256"]
+    ):
+        raise RuntimeError("PROTECTED_RESPONSE_OWNER_RESULT")
+    return records
+
+
 def decode_exact_installer_request(request_bytes: bytes) -> dict[str, object]:
     request = json.loads(request_bytes)
     if type(request) is not dict or set(request) != INSTALLER_REQUEST_KEYS:
@@ -10177,6 +10680,7 @@ class InstallerReply:
     error: Mapping[str, object] | None
     response_sha256: str
     handoff_fd: int
+    response_bytes: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -10185,6 +10689,7 @@ class PreAcquisitionReply:
     payload: Mapping[str, object]
     error: Mapping[str, object]
     response_sha256: str
+    response_bytes: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -10193,6 +10698,7 @@ class DecodedInstallerResponse:
     payload: Mapping[str, object]
     error: Mapping[str, object] | None
     sha256: str
+    encoded: bytes
 
 
 class HandoffPersistenceUncertain(RuntimeError):
@@ -10301,7 +10807,7 @@ def decode_exact_response_payload(payload: bytes, *, request_id: str) -> Decoded
         raise RuntimeError("HANDOFF_RESPONSE_NONCANONICAL")
     return DecodedInstallerResponse(
         data["status"], data["payload"], data["error"],
-        hashlib.sha256(payload).hexdigest(),
+        hashlib.sha256(payload).hexdigest(), payload,
     )
 
 
@@ -10359,13 +10865,13 @@ def recv_installer_reply(
         if received is None:
             preacquisition = PreAcquisitionReply(
                 response.status, response.payload, response.error,
-                response.sha256,
+                response.sha256, response.encoded,
             )
             validate_preacquisition_reply_for_request(preacquisition, request)
             return preacquisition
         return InstallerReply(
             response.status, response.payload, response.error,
-            response.sha256, received,
+            response.sha256, received, response.encoded,
         )
     except BaseException as error:
         if received is None:
@@ -10452,6 +10958,60 @@ Add the concrete manager owner; `apply_locked_reply` becomes its small success-p
 ```python
 # src/simple/eval_runtime/installer_manager.py
 # ruff: noqa: F821
+class ProtectedResponseValidationMixin:
+    """Concrete protected-response seam used by DiskAuthorizationStore."""
+
+    protected_response_parent_fd: int
+    protected_response_parent_identity: Mapping[str, object]
+    protected_response_uid: int
+    protected_response_gid: int
+
+    def _read_response_artifact(self, request_id: str) -> bytes:
+        return read_protected_response_artifact(
+            self.protected_response_parent_fd,
+            request_id=request_id,
+            expected_parent_identity=self.protected_response_parent_identity,
+            expected_uid=self.protected_response_uid,
+            expected_gid=self.protected_response_gid,
+        )
+
+    def validate_received_response_artifact(
+        self,
+        decision: "WireDecision",
+        *,
+        response_bytes: bytes,
+        response_sha256: str,
+        fault_hook: Callable[[str], None] | None = None,
+    ) -> None:
+        request = decode_exact_installer_request(decision.request_bytes)
+        if fault_hook is not None:
+            fault_hook("before_protected_response_artifact_validation")
+        persisted = self._read_response_artifact(str(request["request_id"]))
+        if (
+            persisted != response_bytes
+            or hashlib.sha256(persisted).hexdigest() != response_sha256
+        ):
+            raise RuntimeError("PROTECTED_RESPONSE_WIRE_BINDING")
+        validate_durable_installer_response(
+            response_bytes=persisted,
+            request=request,
+        )
+        if fault_hook is not None:
+            fault_hook("after_protected_response_artifact_validation")
+
+    def read_response_artifacts(
+        self, requests: Sequence[Mapping[str, object]]
+    ) -> dict[str, bytes]:
+        return {
+            str(request["request_id"]): self._read_response_artifact(
+                str(request["request_id"])
+            )
+            for request in requests
+        }
+
+
+# The production declaration is:
+# class DiskAuthorizationStore(ProtectedResponseValidationMixin): ...
 @dataclass(frozen=True, slots=True)
 class WireDecision:
     request_bytes: bytes
@@ -10516,6 +11076,12 @@ class InstallerManagerOwnership:
             raise RuntimeError("HANDOFF_OWNER_STATE")
         self.store.validate_locked_handoff(reply.handoff_fd)
         try:
+            self.store.validate_received_response_artifact(
+                decision,
+                response_bytes=reply.response_bytes,
+                response_sha256=reply.response_sha256,
+                fault_hook=fault_hook,
+            )
             self.store.commit_received_result(
                 decision,
                 reply,
@@ -10579,6 +11145,11 @@ class InstallerManagerOwnership:
         self.store.validate_locked_construction_fd(self._construction_lock_fd)
         self.store.validate_locked_handoff(retained.handoff_fd)
         if retained.reply is not None:
+            self.store.validate_received_response_artifact(
+                retained.decision,
+                response_bytes=retained.reply.response_bytes,
+                response_sha256=retained.reply.response_sha256,
+            )
             self.store.reconcile_exact_reply(retained.decision, retained.reply)
         else:
             self.store.reconcile_locked_response_uncertain(
@@ -10849,15 +11420,15 @@ class InstallerOrchestrator:
             session.close()
 ```
 
-`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, an independent append-only owner-transition JSONL, append-only locked-response uncertainty records, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. `OWNER_RECORD_KEYS` is the exact persisted schema, not a reduced authorization view: it includes the complete construction identity and attempt state, both tokens, owner process identity, paths, phase and pending state, cleanup and uncertainty state, immutable install authorization, complete recovery authorization/result histories, active reference and `active_authorization_sha256`, authorization sequence, protected-validation mirrors, component/final/receipt identities, diagnostics, and terminal state. Install and recovery authorizations use distinct exact schemas. Both persist operation, complete construction identity/attempt/token fields, canonical request digest, sequence, authorization digest, and owner transition; recovery additionally persists generation, fresh recovery-token digest, reason, and `previous_entry_sha256`, which is null for generation 1 and otherwise hashes the complete preceding canonical recovery-authorization entry—not the install authorization and not its inner authorization digest. Recovery results have their own canonical `result_sha256`, form a contiguous generation prefix, bind the corresponding authorization/request, and hash-link only to the preceding result. `read_owner_record_bytes()` reopens the current owner path with no-follow/beneath semantics, requires a canonical regular-file record, and returns the exact bytes whose decoded object is also exposed by `validated_snapshot`; every `owner_transition_history` entry has exactly the nested `{transition, from_owner_record, to_owner_record}` representation in memory, JSONL, manager snapshots, and privileged-decoder input. `OwnerTransitionEntry.from_mapping()` and `.as_mapping()` are the only object/mapping conversion seam; flattened transition fields are forbidden.
+`DiskAuthorizationStore` is not an in-memory adapter. It exclusively creates canonical `install-request.bin`, append-only authorization/result JSONL, an independent append-only owner-transition JSONL, append-only locked-response uncertainty records, and an atomically replaced `owner-record.json` beneath a mode-`0700` manager root; every record and replacement is fsynced with its parent before its reference becomes active. The privileged installer separately creates `<protected-response-root>/<sha256(request_id)>.bin` with `O_CREAT|O_EXCL`, writes the exact canonical response bytes, changes the file to mode `0444`, fsyncs it and its configured parent, and only then appends a terminal journal record or returns a no-journal result. Existing response artifacts may be adopted only when a no-follow reopen proves configured parent mount identity, regular-file type, link count one, configured UID/GID, mode `0444`, stable metadata, exact request ID, canonical bytes, and byte identity with the response about to be sent. They are never overwritten or deleted by retry/recovery. `validate_received_response_artifact()` opens that fixed parent and calls `read_protected_response_artifact`; it requires the received wire bytes and digest to match the artifact before any recovery-result or owner-response transition is appended. `OWNER_RECORD_KEYS` is the exact persisted schema, not a reduced authorization view: it includes the complete construction identity and attempt state, both tokens, owner process identity, paths, phase and pending state, cleanup and uncertainty state, immutable install authorization, complete recovery authorization/result histories, active reference and `active_authorization_sha256`, authorization sequence, protected-validation mirrors, component/final/receipt identities, diagnostics, and terminal state. Install and recovery authorizations use distinct exact schemas. Both persist operation, complete construction identity/attempt/token fields, canonical request digest, sequence, authorization digest, and owner transition; recovery additionally persists generation, fresh recovery-token digest, reason, and `previous_entry_sha256`, which is null for generation 1 and otherwise hashes the complete preceding canonical recovery-authorization entry—not the install authorization and not its inner authorization digest. Recovery results have their own canonical `result_sha256`, form a contiguous generation prefix, bind the corresponding authorization/request and protected response artifact digest, and hash-link only to the preceding result. `read_owner_record_bytes()` reopens the current owner path with no-follow/beneath semantics, requires a canonical regular-file record, and returns the exact bytes whose decoded object is also exposed by `validated_snapshot`; every `owner_transition_history` entry has exactly the nested `{transition, from_owner_record, to_owner_record}` representation in memory, JSONL, manager snapshots, and privileged-decoder input. `OwnerTransitionEntry.from_mapping()` and `.as_mapping()` are the only object/mapping conversion seam; flattened transition fields are forbidden.
 
-Authorization construction is explicitly acyclic. For a newly created authorization, the transition intent hashes the exact prior canonical owner-record bytes plus the complete intended target owner record with only the new authorization's own `authorization_sha256`, its embedded `owner_transition`, and the top-level `active_authorization_sha256` neutralized to null. Every other security-relevant field remains in that projection. The authorization digest then binds the transition intent and exact request digest; only afterward is the same target record encoded with the new authorization and identical digest at both the active object and top-level active-digest field. Reactivation creates no authorization, so its projection is the complete intended target record without neutralization. The append-only transition evidence stores the exact canonical before/after owner objects beside the intent, and `validate_owner_transition_against_records` must recompute the prior full-record digest, target projection digest, full field-for-field owner delta, active authorization object and digest, active IDs/sequences/actions, authorization digest, and transition chain from those persisted bytes. Consecutive authorization entries need not have byte-identical boundary records because separately fsynced construction-phase, heartbeat, and bounded diagnostic replacements may intervene. `_owner_transition_gap_projection` therefore removes only the exact `OWNER_TRANSITION_GAP_MUTABLE_KEYS` lifecycle/diagnostic fields and requires every construction identity/path/attempt, owner/operation token, owner process identity, install/recovery authorization and result history, active reference/digest, authorization sequence, and protected publication field to remain byte-identical across the gap. Heartbeats must be nondecreasing and locked-response diagnostics append-only. Transition SHA/sequence and source authorization ID/sequence chains remain exact; pending action is validated against each entry's own full record rather than the prior entry. A target full-owner digest is never an authorization input. The durable store, installer service, and tests all call the same owner-record, projection, authorization, and transition encoders and validators; fixtures may not invent owner hashes or reduced owner objects. Tests bootstrap the real `DiskAuthorizationStore`, pass its actual nested transition entries through the privileged decoder, accept a coherently rehashed heartbeat/phase/pending-action gap, and reject heartbeat rollback, a coherently rehashed security-identity gap, plus independent construction-state, token, cleanup, history, active-reference, and active-digest mutations.
+Authorization construction is explicitly acyclic. For a newly created authorization, the transition intent hashes the exact prior canonical owner-record bytes plus the complete intended target owner record with only the new authorization's own `authorization_sha256`, its embedded `owner_transition`, and the top-level `active_authorization_sha256` neutralized to null. Every other security-relevant field remains in that projection. The authorization digest then binds the transition intent and exact request digest; only afterward is the same target record encoded with the new authorization and identical digest at both the active object and top-level active-digest field. Reactivation creates no authorization, so its projection is the complete intended target record without neutralization. The append-only transition evidence stores the exact canonical before/after owner objects beside the intent, and `validate_owner_transition_against_records` must recompute the prior full-record digest, target projection digest, full field-for-field owner delta, active authorization object and digest, active IDs/sequences/actions, authorization digest, and transition chain from those persisted bytes. Consecutive authorization entries may differ only through one of three explicitly validated omitted-update reasons: nondecreasing heartbeat fields; a phase-only, forward-only transition within the phase table for the unchanged construction kind; or heartbeat fields plus the exact zero-FD `INSTALLER_TRANSACTION_BUSY` diagnostic. `_validate_permitted_owner_transition_gap` compares every owner key and classifies one of those reasons. Cross-kind or backward phases fail explicitly, while state, attempt, cleanup, pending, uncertainty, error, locked-response, authorization/result/history, active-reference, publication-mirror, identity, path, and token changes remain forbidden. Those other lifecycle and response-result transitions are validated by their owning durable state machines and may not hide in an authorization-history gap. Before a privileged service uses the history, `validate_owner_history_for_service` runs the same classifier from the final transition target to the independently reopened current owner. This explicitly accepts a legal later heartbeat—and, when present, only the same narrowly validated phase or busy-diagnostic tail—rather than requiring stale byte equality. Transition SHA/sequence and source authorization ID/sequence chains remain exact. A target full-owner digest is never an authorization input. The durable store, installer service, and tests all call the same owner-record, authorization, transition, gap-reason, and service-tail validators; fixtures may not invent owner hashes or reduced owner objects. Tests bootstrap the real `DiskAuthorizationStore`, pass its actual nested transition entries through the privileged decoder, accept heartbeat, same-kind phase, and exact busy-diagnostic gaps, accept final service heartbeat and same-kind phase tails, and reject heartbeat rollback, cross-kind `BASE_COPIED -> HSSD_NORMALIZED`, cleanup/pending/uncertainty gaps, a cleanup service tail, plus independent security-field mutations.
 
-The root manifest pins the construction- and transaction-lock device/inode/mount identities, the configured protected journal/receipt/publication roots, and the original install digest. The store calls only `encode_installer_request` for install and recovery documents. Every generated wire document therefore has exactly the six top-level request keys, keeps construction-attempt and recovery-generation fields inside the exact operation payload, and records an explicit request ID that byte-identical replay preserves. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks, passing its still-locked construction FD to `UnixInstallerSession`; the session derives response matching from the explicit request ID rather than the body digest. After the privileged service acquires its root transaction lock and reopens the current owner record, it opens the token-derived authorization, result, and transition JSONL files beneath the fixed configured manager-control parent with no-follow/beneath semantics. It accepts only full transition entries containing canonical before/after owner objects, requires the last target bytes to equal the independently reopened current owner bytes, and calls the same reason-specific full-record delta validator used by the manager; a caller-supplied transition dictionary is never an authorization input. The store likewise opens protected evidence read-only and calls only `decode_exact_publication_journal` and `decode_exact_publication_receipt`, passing the immutable original install request plus the complete exact fsynced authorization, result, transition-entry, and canonical owner-record histories. The decoder resolves journal actors by request ID; it permits earlier no-journal authorizations and the intervening install-reactivation transition to be absent as journal actors while still requiring every immutable history entry and chain link to validate against its persisted before/after owner bytes. It rehashes the fsynced wire response bytes and requires the digest to equal the terminal-response digest in the final record for that same install or recovery request before checking every response field against the independently decoded journal/receipt/root values. The response digest is excluded from the receipt, so constructing the response after receipt creation and binding its digest into the final journal record creates no hash cycle.
+The root manifest pins the construction- and transaction-lock device/inode/mount identities, the configured protected journal/receipt/publication/response-artifact parent identities, the response-artifact UID/GID/mode policy, and the original install digest. The store calls only `encode_installer_request` for install and recovery documents. Every generated wire document therefore has exactly the six top-level request keys, keeps construction-attempt and recovery-generation fields inside the exact operation payload, and records an explicit request ID that byte-identical replay preserves. `prepare_next_wire_request` places the authorization-append and active-reference fault hooks around their actual durable operations and returns a `WireDecision` containing the exact bytes that the session will send. `InstallerOrchestrator._exchange` alone owns the request-delivery and terminal-frame-plus-handoff hooks, passing its still-locked construction FD to `UnixInstallerSession`; the session retains the exact response bytes alongside their digest. After the privileged service acquires its root transaction lock and reopens the current owner record, it opens the token-derived authorization, result, and transition JSONL files beneath the fixed configured manager-control parent with no-follow/beneath semantics. It accepts only full transition entries containing canonical before/after owner objects and calls `validate_owner_history_for_service`, which authenticates the complete history and reason-classified final tail—including a legal later heartbeat—to the independently reopened current owner; a caller-supplied transition dictionary is never an authorization input. The store opens protected evidence read-only and calls only `validate_protected_publication_contract`, passing the immutable original install request, complete exact authorization/result/transition histories, canonical current owner, journal and receipt bytes, and every request-ID-addressed response artifact referenced by a terminal record. That shared wrapper calls the structural journal/receipt decoders, the response codec, the canonical recovery-result validator, and owner-history validator; it rehashes exact response bytes, binds each digest to its terminal journal record and recovery result, checks final response fields against the receipt/root values, and binds the latest status to the current owner. Direct low-level journal decoding cannot authorize a publication mirror. The response digest is excluded from the receipt, so constructing and fsyncing the response artifact after receipt creation and binding its digest into the final journal record creates no hash cycle.
 
 `persist_received_reply` places result-append and handoff-close hooks around every valid `INSTALLED`, null-recovery, or `RECOVERED` reply. A final-result response (`INSTALLED` or `RECOVERED`) durably records the wire response and clears the active service authorization, but deliberately leaves the owner phase at `INSTALLING` (or `BASE_METADATA_NORMALIZED`), sets `pending_local_transition="VALIDATE_PUBLICATION"`, keeps `cleanup_required=true`, and is nonterminal. `ABORTED_BEFORE_PREPARED` durably records only the received result and sets `pending_local_transition="MIRROR_ABORTED_ATTEMPT"`. Four restartable transitions then run separately: (1) validate the exact `INITIAL → RECOVERY_STARTED → STAGING_REMOVE_PENDING → ABORTED_BEFORE_PREPARED` journal with null result fields, fsync `attempt_status="aborted-before-prepared"`, clear the old active authorization, and set `ALLOCATE_FRESH_BASE_ATTEMPT`; (2) increment the attempt, generate a fresh operation token, fsync `attempt_status="active"`, `phase="BASE_ALLOCATED"`, and `REBUILD_FRESH_BASE`; (3) resume the normal write-ahead base-copy operation and separately fsync `phase="BASE_COPIED"` plus `ACTIVATE_FRESH_INSTALL`; and only then (4) create/fsync the new immutable install authorization, empty recovery histories, active install reference, and exact fresh install request. No method performs two of these owner-record replacements. Each method and `fsync_owner_and_parent` accepts a transition-specific fault-hook prefix and exposes eight ordered boundaries: before the transition, before/after atomic owner replacement, before/after owner-file fsync, before/after parent-directory fsync, and after the transition. Fork/`_exit` tests cover all 32 boundaries, reopen the real store, require exactly the prior or new canonical state appropriate to that boundary, and then finish from disk without fabricating an intermediate object.
 
-`advance_publication_validation()` is driven only by the last fsynced owner phase and performs exactly one durable owner-phase transition per call. From `INSTALLING`/`BASE_METADATA_NORMALIZED`, it no-follow opens the token-derived protected journal and receipt, validates the complete journal sequence/hash chain, separately rehashes the persisted response against its recorded digest, and validates the exact receipt schema/digest/tokens/final/component/completion hashes/root identity. It then atomically mirrors `FINAL_RENAMED`/`BASE_FINAL_RENAMED` and separately fsyncs owner and parent. From that fsynced phase it repeats both protected validations, atomically mirrors `RECEIPT_CREATED`/`BASE_RECEIPT_CREATED`, and separately fsyncs owner and parent. From that fsynced phase it repeats both protected validations, no-follow reopens the configured digest-derived published root, validates its device/inode/mount/UID/GID/mode, component manifests, completion metadata, and receipt binding, then atomically enters `COMPLETE`/`BASE_COMPLETE`, sets `cleanup_required=false`, clears the pending transition, and separately fsyncs owner and parent. Validation-only progress is never stored, so a crash at any validation hook simply repeats the validation from the last durable phase instead of skipping or looping on an unrecorded substep. Every invocation refuses extra paths, suffix records, symlinks, or values learned only from the wire. No service request is resent once the valid final-result response is fsynced.
+`advance_publication_validation()` is driven only by the last fsynced owner phase and performs exactly one durable owner-phase transition per call. From `INSTALLING`/`BASE_METADATA_NORMALIZED`, it no-follow opens the token-derived protected journal, receipt, and configured response-artifact parent, reads every terminal response through `read_protected_response_artifact`, and calls `validate_protected_publication_contract` with the complete recovery-result history and freshly reopened current owner. Only that wrapper may authorize a mirror. It then atomically mirrors `FINAL_RENAMED`/`BASE_FINAL_RENAMED` and separately fsyncs owner and parent. From that fsynced phase it repeats the whole shared contract, atomically mirrors `RECEIPT_CREATED`/`BASE_RECEIPT_CREATED`, and separately fsyncs owner and parent. From that fsynced phase it repeats the whole shared contract, no-follow reopens the configured digest-derived published root, validates its device/inode/mount/UID/GID/mode, component manifests, completion metadata, and receipt binding, then atomically enters `COMPLETE`/`BASE_COMPLETE`, sets `cleanup_required=false`, clears the pending transition, and separately fsyncs owner and parent. Validation-only progress is never stored, so a crash at any validation hook simply repeats the validation from the last durable phase instead of skipping or looping on an unrecorded substep. Every invocation refuses extra paths, response artifacts, suffix records, symlinks, or values learned only from the wire. No service request is resent once the valid final-result response and matching protected artifact are fsynced.
 
 `commit_locked_response_uncertain` records the bounded error code and received-prefix digest while the valid transaction-lock OFD is still held: an install decision appends and activates the next recovery generation, while a recovery decision retains that exact active generation and request bytes. Both paths replace and fsync the owner record and parent before the OFD closes. Missing, extra, intervened, or wrong-identity descriptors cannot authorize this response-driven transition and instead use `record_transport_uncertain` under only the stable construction lock. A strictly decoded `INSTALLER_TRANSACTION_BUSY` is different: it has zero FDs, exact retryable error semantics, and all mutation-result fields null. `record_preacquisition_failure` appends only an fsynced diagnostic; it does not change the active authorization/reference, request bytes, phase, pending action, construction attempt, recovery histories, or cleanup state. A retry must send byte-identical bytes.
 
@@ -10889,7 +11460,8 @@ exclusively create/open root journal ->
 append/fsync pending -> fork confined mutation child -> validate PREPARED ->
 append/fsync PREPARED -> parent renameat2(RENAME_NOREPLACE) -> fsync parents ->
 append FINAL_RENAMED -> exclusive byte-identical receipt create/adopt and fsync ->
-construct the exact canonical INSTALLED/RECOVERED response bytes -> append/fsync
+construct the exact canonical INSTALLED/RECOVERED response bytes -> exclusive
+request-ID-addressed response-artifact create/adopt and fsync -> append/fsync
 RECEIPT_CREATED or RECOVERY_RESPONSE_CREATED with those bytes' SHA-256 ->
 send those exact bytes plus duplicated still-locked FD -> close service FD
 ```
@@ -10902,6 +11474,8 @@ Base-Python journals are keyed by `<intake-sha256>.<operation-token-sha256>.json
 
 Before `PREPARED`, staging cleanup is implemented only by a confined descriptor walk rooted at the already validated staging FD. The native service enumerates each directory through that FD, opens child directories with no-follow/beneath restrictions, rejects a mount-ID change, unlinks non-directories with `unlinkat`, removes emptied child directories with `unlinkat(..., AT_REMOVEDIR)`, and fsyncs every changed child directory. It then removes the exact token basename through the retained staging-parent FD, emits the `after_exact_staging_rmdir` crash barrier before any parent fsync, fsyncs that already-open configured parent, and emits `after_staging_parent_fsync` before appending `STAGING_REMOVED`. Restart from durable `STAGING_REMOVE_PENDING` accepts either the exact revalidated staging inode or its absence under the unchanged configured parent identity; it repeats/finishes the parent fsync before advancing. It never constructs a child pathname, traverses `..`, or enumerates/removes any sibling. Partial nested content, symlinks, and a staging-local final-looking completion file are removable; fork/`_exit` tests at both new barriers prove restart completion while an unrelated sibling's bytes and inode remain unchanged.
 
+Response artifacts use the same no-follow parent-FD discipline as receipts. The configured response parent is disjoint from payload hashes and writable only by the native installer. The basename is exactly `sha256(request_id).bin`; creation uses `O_CREAT|O_EXCL`, complete-write checking, `fchmod(0444)`, file fsync, then parent fsync before the terminal journal append or send. Recovery from a crash after artifact fsync but before terminal-journal append must adopt only the exact canonical bytes implied by the request plus protected receipt/publication state. A different inode at the same basename, wrong parent identity, symlink, non-regular file, link count other than one, wrong UID/GID/mode, byte drift, or request-ID mismatch is terminal corruption. `NO_JOURNAL_NO_MUTATION` means no publication-journal or payload mutation; its root-owned response evidence is still created in this disjoint response-evidence root and bound by the manager's recovery-result chain.
+
 Receipt adoption uses the configured `input_uid`/`input_gid` and configured receipt-parent device/inode/mount/UID/GID/mode identity, not the service's ambient identity or a mount ID learned from the candidate path. Before appending any recovery record—even when the existing journal already ends in `RECEIPT_CREATED`—the service no-follow opens and validates the configured parent FD, derives the receipt basename from the install-bound digest, and opens the entry through that FD. It requires a regular file, link count exactly one, owner/group equal to configuration, mode `0444`, the configured parent mount ID, exact length and canonical bytes, and stable device/inode/mount/type/link/owner/mode/size before and after reading. Immediately before the recovery append it closes and performs one final no-follow reopen through the same configured parent, requiring the same inode and bytes; successful recovery repeats this final reopen before constructing its response. Only `ENOENT` at a journal phase that legally precedes receipt creation permits `O_CREAT|O_EXCL`; a symlink, directory, hard link, wrong owner/group/mode, cross-mount object, byte mismatch, metadata drift, or changed parent identity blocks recovery without replacement or journal append.
 
 - [ ] **Step 6: Add native crash/race tests**
@@ -10912,7 +11486,8 @@ In Rust unit/integration tests inject a barrier or `_exit(99)` at:
 before journal O_EXCL; after journal create; before mutation child PREPARED;
 after PREPARED; before/after RENAME_PENDING; after rename; after FINAL_RENAMED;
 before/after receipt O_EXCL; after receipt fsync; before/after canonical response
-construction; before terminal-response-digest append; after its journal fsync;
+construction; before/after response-artifact O_EXCL; after response-artifact fsync;
+before terminal-response-digest append; after its journal fsync;
 after RECEIPT_CREATED/RECOVERY_RESPONSE_CREATED; before sendmsg; after sendmsg;
 after exact pre-PREPARED staging rmdir; after staging-parent fsync;
 before local FD close; during shutdown
@@ -10920,7 +11495,7 @@ before local FD close; during shutdown
 
 For each point assert a restart produces either no final path or one manifest-valid immutable final path with exactly one byte-identical receipt. Drive every case through the six-field canonical request transport with one already-locked construction FD. Add one-mutation-at-a-time rejection cases for missing/extra/wrong FDs, ancillary truncation, wrong `fd_roles`, generation fields outside `payload`, noncanonical JSON, an echoed request-ID mismatch, a valid-lowercase-but-incorrect authorization digest, and deletion/change of any immutable owner-transition entry; every rejection must precede journal access or the next mutation. Persist the full actual `DiskAuthorizationStore` owner objects before and after each transition, recompute the acyclic complete-target projection and authorization digest from those bytes, assert `after.active_authorization_sha256` equals the activated authorization's recomputed digest, and independently mutate construction attempt, owner/operation tokens, phase, cleanup state, recovery authorizations/results, active reference, and active digest. The history matrix must separately reject gapped and reordered recovery authorization generations, install/recovery cross-kind entries, broken canonical-authorization links, non-prefix/gapped results, reordered results, and broken previous-result or own-result digests. It must also build coherently rehashed transitions whose before/after objects change exactly one forbidden token, path, phase, cleanup, or history field; generic hashes must pass and reason-specific owner-delta validation must reject them. Add the mandatory generation-1 no-journal → identical install replay → post-journal uncertainty → generation-2 recovery sentinel and assert generation 1 plus the intervening install-reactivation transition remain in the independently verified histories even though neither is a publication-journal actor. Add the `INITIAL`-only recovery matrix at `RECOVERY_STARTED`, `STAGING_REMOVE_PENDING`, after the exact staging-root `rmdir`, after its parent fsync, and `ABORTED_BEFORE_PREPARED`; seed nested partial/final-looking files plus symlinks and prove restart removes only the target while preserving an unrelated sibling's bytes and inode. After abort, fork/`_exit` before the transition, before/after owner replacement, before/after owner-file fsync, before/after parent-directory fsync, and after the transition for each of old-attempt abort, fresh `BASE_ALLOCATED`, fresh `BASE_COPIED`, and new install authorization. Add the receipt-fsync-before-journal-append boundary and require recovery to adopt only a byte-identical receipt while preserving bytes, hash, inode, owner, mode, regular-file type, and link count. Starting from a journal already complete through `RECEIPT_CREATED`, independently mutate configured parent mount identity and receipt UID/GID, mode, type, and link count; each case must fail before `RECOVERY_STARTED`, preserve the journal bytes, and perform no replacement. Run two concurrent installers and two concurrent recoverers; require one mutation winner and zero signals/deletions by losers.
 
-Exercise every response codec independently. Post-acquisition cases mutate exactly one of: outer key set; request identity; operation/authorization/token/generation echo; lowercase 64-hex final/completion/receipt digest; exact base or closure component-key set; component digest; root device/inode/mount/UID/GID integer type (with Boolean explicitly rejected); root mode; success `error=null`; status/operation; terminal phase; and null-result final fields. Each carries the valid locked handoff and must enter the durable locked-response uncertainty path before any publication mirror. Pre-acquisition cases send zero FDs and mutate exactly one of status, error key set, code, strict Boolean `retryable`, echo, null final fields, or terminal phase; only the exact busy document is returned as `PreAcquisitionReply`, and every invalid variant enters stable-lock transport uncertainty. Separately mutate the protected journal sequence/chain/terminal-response digest, receipt schema/hash/content, published-root identity/mode, component bytes/manifests, and completion metadata after a wire-valid response. Each must fail before the first affected owner mirror, retain `cleanup_required=true`, and never enter `COMPLETE`. Recovery tests snapshot the install journal prefix and receipt bytes/hash/inode before issuing recovery, then prove all four are unchanged after the recovery suffix and exact response digest are fsynced.
+Exercise every response codec independently. Post-acquisition cases mutate exactly one of: outer key set; request identity; operation/authorization/token/generation echo; lowercase 64-hex final/completion/receipt digest; exact base or closure component-key set; component digest; root device/inode/mount/UID/GID integer type (with Boolean explicitly rejected); root mode; success `error=null`; status/operation; terminal phase; and null-result final fields. Each carries the valid locked handoff and must enter the durable locked-response uncertainty path before any publication mirror. Pre-acquisition cases send zero FDs and mutate exactly one of status, error key set, code, strict Boolean `retryable`, echo, null final fields, or terminal phase; only the exact busy document is returned as `PreAcquisitionReply`, and every invalid variant enters stable-lock transport uncertainty. Separately mutate the protected response parent identity and response-artifact UID/GID, mode, type, link count, inode stability, request-ID basename, canonical bytes, journal terminal digest, receipt schema/hash/content, published-root identity/mode, component bytes/manifests, and completion metadata after a wire-valid response. Add two coherent-tamper sentinels: (1) rewrite valid canonical response bytes and the journal's terminal digest together, rehashing any affected journal suffix, while leaving the independently protected receipt unchanged; (2) rewrite the latest recovery result's terminal-response digest and its own/result-chain digests plus the current owner history while leaving the response artifact and journal unchanged. Both generic chains must be internally valid and `validate_protected_publication_contract` must reject them before the first owner mirror. Every corruption retains `cleanup_required=true` and never enters `COMPLETE`. Recovery tests snapshot the install journal prefix, receipt bytes/hash/inode, and install response-artifact bytes/hash/inode before issuing recovery, then prove all six are unchanged after the recovery suffix and exact response digest are fsynced.
 
 Add a production-service owner-record race: instance A reads owner generation 1 and pauses before the transaction lock; the manager atomically installs generation 2; instance B queues; A acquires first, reopens the current owner path, and must return `AUTHORIZATION_STALE` without journal or mutation; B then reopens generation 2 and is the sole journal/mutation winner. Assert the service never authorizes from the preliminary FD or its cached bytes.
 
