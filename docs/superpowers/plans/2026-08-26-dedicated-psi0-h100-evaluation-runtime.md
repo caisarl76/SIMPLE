@@ -1398,7 +1398,37 @@ class ForkedInstallerService:
                 if wire_status == "INSTALLED":
                     if request != install_request:
                         raise RuntimeError("INSTALLER_TEST_INSTALL_REQUEST_DRIFT")
-                    if publication is None:
+                    journal = (
+                        transaction_lock.parent / "protected-installer"
+                        / "journals"
+                        / f"{request['payload']['operation_token_sha256']}.jsonl"
+                    )
+                    try:
+                        journal.lstat()
+                    except FileNotFoundError:
+                        journal_present = False
+                    else:
+                        journal_present = True
+                    if journal_present:
+                        (
+                            publication,
+                            replayed_install_response,
+                        ) = (
+                            ForkedInstallerService._replay_existing_install_publication(
+                                transaction_lock.parent,
+                                install_request=install_request,
+                                install_authorization=install_authorization,
+                                recovery_requests=prior_recovery_requests,
+                                recovery_authorizations=(
+                                    prior_recovery_authorizations
+                                ),
+                                owner_transition_history=(
+                                    owner_transition_history
+                                ),
+                            )
+                        )
+                        replayed_install_publication = True
+                    elif publication is None:
                         component_names = (
                             ("base_python",)
                             if request["operation"].endswith("base_python")
@@ -1407,46 +1437,21 @@ class ForkedInstallerService:
                                 "hssd_normalization_results", "runtime_identity",
                             )
                         )
-                        journal = (
-                            transaction_lock.parent / "protected-installer"
-                            / "journals"
-                            / f"{request['payload']['operation_token_sha256']}.jsonl"
+                        publication = (
+                            ForkedInstallerService._materialize_protected_publication(
+                                transaction_lock.parent,
+                                install_request=install_request,
+                                install_authorization=install_authorization,
+                                component_names=component_names,
+                                recovery_requests=prior_recovery_requests,
+                                recovery_authorizations=(
+                                    prior_recovery_authorizations
+                                ),
+                                owner_transition_history=(
+                                    owner_transition_history
+                                ),
+                            )
                         )
-                        if journal.exists():
-                            (
-                                publication,
-                                replayed_install_response,
-                            ) = (
-                                ForkedInstallerService._replay_existing_install_publication(
-                                    transaction_lock.parent,
-                                    install_request=install_request,
-                                    install_authorization=install_authorization,
-                                    recovery_requests=prior_recovery_requests,
-                                    recovery_authorizations=(
-                                        prior_recovery_authorizations
-                                    ),
-                                    owner_transition_history=(
-                                        owner_transition_history
-                                    ),
-                                )
-                            )
-                            replayed_install_publication = True
-                        else:
-                            publication = (
-                                ForkedInstallerService._materialize_protected_publication(
-                                    transaction_lock.parent,
-                                    install_request=install_request,
-                                    install_authorization=install_authorization,
-                                    component_names=component_names,
-                                    recovery_requests=prior_recovery_requests,
-                                    recovery_authorizations=(
-                                        prior_recovery_authorizations
-                                    ),
-                                    owner_transition_history=(
-                                        owner_transition_history
-                                    ),
-                                )
-                            )
                 elif publication is None:
                     publication = (
                         ForkedInstallerService._resume_protected_publication(
@@ -5984,6 +5989,8 @@ from simple.eval_runtime.installer_client import (
     INSTALL_PUBLICATION_PHASES,
     OWNER_TRANSITION_ENTRY_KEYS,
     RECOVERY_AUTHORIZATION_KEYS,
+    TransportUncertain,
+    UnixInstallerSession,
     append_publication_phase,
     decode_exact_response_directory_journal,
     decode_owner_transition_transaction_journal,
@@ -6334,6 +6341,54 @@ def test_install_replay_returns_exact_stored_bytes_without_mutation(tmp_path) ->
     assert _snapshot_protected_installer_tree(tmp_path) == protected_before
 
 
+def _corrupt_install_replay_response_evidence(
+    control_parent: Path, corruption: str
+) -> None:
+    token = INSTALL_REQUEST["payload"]["operation_token_sha256"]
+    operation = (
+        control_parent / "protected-installer" / "response-artifacts" / token
+    )
+    basename = hashlib.sha256(
+        INSTALL_REQUEST["request_id"].encode()
+    ).hexdigest()
+    artifact = operation / f"{basename}.bin"
+    directory_journal = (
+        control_parent / "protected-installer"
+        / "response-directory-journals" / f"{token}.jsonl"
+    )
+    if corruption == "missing":
+        artifact.unlink()
+        ForkedInstallerService._fsync_dir(operation)
+    elif corruption == "extra":
+        extra = operation / f"{'f' * 64}.bin"
+        extra.write_bytes(b"extra-protected-response")
+        extra.chmod(0o444)
+        with extra.open("rb") as stream:
+            os.fsync(stream.fileno())
+        ForkedInstallerService._fsync_dir(operation)
+    elif corruption == "mutated":
+        artifact.chmod(0o600)
+        artifact.write_bytes(b"mutated-protected-response")
+        with artifact.open("rb") as stream:
+            os.fsync(stream.fileno())
+        artifact.chmod(0o444)
+        with artifact.open("rb") as stream:
+            os.fsync(stream.fileno())
+        ForkedInstallerService._fsync_dir(operation)
+    elif corruption == "pending_only":
+        pending = directory_journal.read_bytes().splitlines(keepends=True)[0]
+        directory_journal.chmod(0o600)
+        directory_journal.write_bytes(pending)
+        with directory_journal.open("rb") as stream:
+            os.fsync(stream.fileno())
+        directory_journal.chmod(0o444)
+        with directory_journal.open("rb") as stream:
+            os.fsync(stream.fileno())
+        ForkedInstallerService._fsync_dir(directory_journal.parent)
+    else:
+        raise AssertionError(corruption)
+
+
 @pytest.mark.parametrize(
     "corruption, error",
     (
@@ -6359,47 +6414,7 @@ def test_install_replay_never_repairs_incomplete_response_evidence(
         transaction_lock=transaction,
     )
     _complete_install_replay_fixture(tmp_path)
-    token = INSTALL_REQUEST["payload"]["operation_token_sha256"]
-    operation = (
-        tmp_path / "protected-installer" / "response-artifacts" / token
-    )
-    basename = hashlib.sha256(
-        INSTALL_REQUEST["request_id"].encode()
-    ).hexdigest()
-    artifact = operation / f"{basename}.bin"
-    directory_journal = (
-        tmp_path / "protected-installer" / "response-directory-journals"
-        / f"{token}.jsonl"
-    )
-    if corruption == "missing":
-        artifact.unlink()
-        ForkedInstallerService._fsync_dir(operation)
-    elif corruption == "extra":
-        extra = operation / f"{'f' * 64}.bin"
-        extra.write_bytes(b"extra-protected-response")
-        extra.chmod(0o444)
-        with extra.open("rb") as stream:
-            os.fsync(stream.fileno())
-        ForkedInstallerService._fsync_dir(operation)
-    elif corruption == "mutated":
-        artifact.chmod(0o600)
-        artifact.write_bytes(b"mutated-protected-response")
-        with artifact.open("rb") as stream:
-            os.fsync(stream.fileno())
-        artifact.chmod(0o444)
-        with artifact.open("rb") as stream:
-            os.fsync(stream.fileno())
-        ForkedInstallerService._fsync_dir(operation)
-    else:
-        pending = directory_journal.read_bytes().splitlines(keepends=True)[0]
-        directory_journal.chmod(0o600)
-        directory_journal.write_bytes(pending)
-        with directory_journal.open("rb") as stream:
-            os.fsync(stream.fileno())
-        directory_journal.chmod(0o444)
-        with directory_journal.open("rb") as stream:
-            os.fsync(stream.fileno())
-        ForkedInstallerService._fsync_dir(directory_journal.parent)
+    _corrupt_install_replay_response_evidence(tmp_path, corruption)
     protected_before = _snapshot_protected_installer_tree(tmp_path)
     with pytest.raises(RuntimeError, match=error):
         ForkedInstallerService._replay_existing_install_publication(
@@ -6424,8 +6439,70 @@ def test_install_replay_never_repairs_incomplete_response_evidence(
         manager.begin_install()
     assert _snapshot_protected_installer_tree(tmp_path) == protected_before
     manager.close_after_uncertain_transport()
-    service.stop()
     service.wait(timeout=5.0)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("missing", "extra", "mutated", "pending_only"),
+)
+def test_same_live_service_duplicate_install_cannot_repair_replay_evidence(
+    corruption: str, tmp_path
+) -> None:
+    root = tmp_path / "manager-state"
+    construction = tmp_path / "construction.lock"
+    transaction = tmp_path / "transaction.lock"
+    DiskAuthorizationStore.bootstrap(
+        root,
+        install_request=INSTALL_BYTES,
+        construction_lock=construction,
+        transaction_lock=transaction,
+    )
+    service = ForkedInstallerService.start(
+        tmp_path / "same-live-service",
+        construction_lock=construction,
+        transaction_lock=transaction,
+        script=("INSTALLED", "INSTALLED"),
+        manager_state_root=root,
+    )
+    ownership = InstallerManagerOwnership.restart(root)
+    service_reaped = False
+    try:
+        first = UnixInstallerSession(
+            service.socket_path,
+            construction_lock_fd=ownership.construction_lock_fd,
+            expected_lock=ownership.store.transaction_lock_identity,
+        )
+        try:
+            first.send_request(INSTALL_BYTES)
+            first_reply = first.receive_reply()
+            assert first_reply.status == "INSTALLED"
+            os.close(first_reply.handoff_fd)
+        finally:
+            first.close()
+
+        _corrupt_install_replay_response_evidence(tmp_path, corruption)
+        protected_before = _snapshot_protected_installer_tree(tmp_path)
+        second = UnixInstallerSession(
+            service.socket_path,
+            construction_lock_fd=ownership.construction_lock_fd,
+            expected_lock=ownership.store.transaction_lock_identity,
+        )
+        try:
+            second.send_request(INSTALL_BYTES)
+            with pytest.raises(TransportUncertain):
+                second.receive_reply()
+        finally:
+            second.close()
+        service.wait(timeout=5.0)
+        service_reaped = True
+        assert _snapshot_protected_installer_tree(tmp_path) == protected_before
+        assert service.request_bytes() == [INSTALL_BYTES, INSTALL_BYTES]
+    finally:
+        ownership.close_without_handoff()
+        if not service_reaped:
+            service.stop()
+            service.wait(timeout=5.0)
 
 
 @pytest.mark.parametrize("boundary", RESPONSE_ARTIFACT_PUBLICATION_BOUNDARIES)
@@ -10399,7 +10476,7 @@ def test_live_persistence_failure_retains_both_locks_until_reconciled(
     service.wait(timeout=5.0)
 ```
 
-`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child and receives each production length-prefixed canonical six-field request with exactly one construction-lock FD via `recvmsg(MSG_CMSG_CLOEXEC)`. Before recording or acting, it validates the exact `fd_roles`, FD count/CLOEXEC/device/inode/mode, and the fact that an independently opened construction-lock descriptor cannot acquire the already-held lock. It appends the exact received bytes, explicit request ID, and validation evidence to fsynced files. For a first post-acquisition result it materializes a real protected journal, receipt, mode-`0555` published root, component manifests, and completion record, then sends an operation-specific frame that echoes the request ID plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. For a byte-identical replay whose install authorization remains active, it instead invokes the dedicated read-only replay decoder, requires the already-complete directory journal and request artifact, and sends the exact stored bytes without calling either response-operation creation or terminal-response publication. To keep this non-root kernel test executable, its hidden staging basename and digest basename share one fixture-only parent, permitting a mode-`0555` same-parent rename; native Step 6 tests separately exercise the production source-parent/destination-parent FD pair and `RENAME_NOREPLACE`.
+`ForkedInstallerService` is the simulator-free kernel test service defined in Task 0. It listens on a real Unix socket in a separate `fork` child and receives each production length-prefixed canonical six-field request with exactly one construction-lock FD via `recvmsg(MSG_CMSG_CLOEXEC)`. Before recording or acting, it validates the exact `fd_roles`, FD count/CLOEXEC/device/inode/mode, and the fact that an independently opened construction-lock descriptor cannot acquire the already-held lock. It appends the exact received bytes, explicit request ID, and validation evidence to fsynced files. For a first post-acquisition result it materializes a real protected journal, receipt, mode-`0555` published root, component manifests, and completion record, then sends an operation-specific frame that echoes the request ID plus the real transaction-lock OFD with `sendmsg(SCM_RIGHTS)`. On every install request it no-follow probes the durable install-token journal before consulting its process-local publication cache. If that journal exists, including as a foreign or partial entry, it must take the dedicated strict read-only replay branch; cached publication state can never select or bypass replay. A byte-identical replay whose install authorization remains active requires the already-complete directory journal and request artifact and sends the exact stored bytes without calling either response-operation creation or terminal-response publication. To keep this non-root kernel test executable, its hidden staging basename and digest basename share one fixture-only parent, permitting a mode-`0555` same-parent rename; native Step 6 tests separately exercise the production source-parent/destination-parent FD pair and `RENAME_NOREPLACE`.
 
 The fixture calls only the production `append_publication_phase`, `decode_exact_publication_journal`, and `encode_publication_receipt` codecs. It creates and fsyncs `INITIAL` while the staging inode is mode `0700`, performs and fsyncs normalization, appends `PREPARED` with that same stable device/inode/mount identity and observed mode `0555`, appends/fsyncs `RENAME_PENDING` before rename, appends/fsyncs `FINAL_RENAMED` after the parent fsyncs, creates/fsyncs the install-implied receipt, and appends/fsyncs `RECEIPT_CREATED` with the exact response digest before sending. It never synthesizes the complete journal after publication. Every record binds the creation-time authorization sequence and digest, the prior authorization-entry digest, and the exact before/after owner-record transition; the fixture helper produces the same canonical authorization entry bytes as `DiskAuthorizationStore`, while the production service obtains and independently validates those values from the protected owner record.
 
@@ -14723,7 +14800,7 @@ send those exact bytes plus duplicated still-locked FD -> close service FD
 
 The preliminary owner snapshot is never reused after acquiring the transaction lock. The fresh `openat2` result must be a regular file beneath the fixed control-root FD, match the current pathname's device/inode/mount identity, and pass the complete canonical-content authorization check. A test pauses instance A after its preliminary read, replaces the owner record through the manager's authorized atomic update, lets A acquire the transaction lock, and requires A to reject the stale token while instance B alone proceeds.
 
-An exact install request with an existing install-token journal branches before journal creation or mutation-child startup. The service accepts this branch only when the journal decodes to the complete install-only `INITIAL → PREPARED → RENAME_PENDING → FINAL_RENAMED → RECEIPT_CREATED` sequence under that same install authorization. Its replay-only validator uses pinned no-follow FDs to require the complete two-record response-directory journal, exact recorded response-root and operation identities, an exact one-entry artifact namespace, and the existing request-ID artifact's regular-file type, single link, configured UID/GID, mode, mount, stable size, canonical bytes, and journal-bound terminal digest. It then sends those exact stored bytes with the locked handoff. The replay branch cannot invoke the response-directory ensure/recovery helper, terminal-response recorder, or install-journal writer. It performs no staging creation, append, repair, chmod, rename, replacement, or changed-directory fsync, and requires the post-send snapshot to be identical. An absent install journal follows normal install; any nonempty incomplete or foreign install journal, incomplete response-directory journal, or missing/extra/mutated response artifact fails replay without changing protected evidence and can advance only through an authenticated recovery authorization.
+An exact install request with an existing install-token journal branches before the cached publication object, journal creation, response recorder, or mutation-child startup can be used. This journal-first decision is repeated for every request accepted by the same live service; the cache is an optimization only after durable state proves that no journal entry exists. The service accepts replay only when the journal decodes to the complete install-only `INITIAL → PREPARED → RENAME_PENDING → FINAL_RENAMED → RECEIPT_CREATED` sequence under that same install authorization. Its replay-only validator uses pinned no-follow FDs to require the complete two-record response-directory journal, exact recorded response-root and operation identities, an exact one-entry artifact namespace, and the existing request-ID artifact's regular-file type, single link, configured UID/GID, mode, mount, stable size, canonical bytes, and journal-bound terminal digest. It then sends those exact stored bytes with the locked handoff. The replay branch cannot invoke the response-directory ensure/recovery helper, terminal-response recorder, or install-journal writer. It performs no staging creation, append, repair, chmod, rename, replacement, or changed-directory fsync, and requires the post-send snapshot to be identical. An absent install journal follows normal install; any nonempty incomplete or foreign install journal, incomplete response-directory journal, or missing/extra/mutated response artifact fails replay without changing protected evidence and can advance only through an authenticated recovery authorization.
 
 The service never calls `LOCK_UN`. Every install/recover instance opens a distinct file description for the exact configured transaction-lock inode. The mutation child receives only the validated token staging bind mount and result pipe, has no source/destination parent, receipt, journal, socket, or sibling-token FD, and may not call rename. The parent performs the one FD-relative rename with retained source-parent/destination-parent FDs and derived basenames. The child drops all capabilities before final read-back; the parent drops all setup/metadata capabilities before the terminal response.
 
@@ -14756,7 +14833,7 @@ For each point assert a restart produces either no final path or one manifest-va
 
 Run the separate owner-transition transaction crash matrix at every PREPARED/history/owner/COMMITTED replace, file-fsync, and parent-fsync boundary. Execute the full 24-point fork/`_exit` matrix once for `activate_recovery_after_transport_uncertain_install` and once for `record_transport_uncertain_recovery_replay`. Execute the same 24 points with injected live persistence errors for `activate_recovery_after_locked_install_response` and `append_locked_recovery_response_audit`: before reconciliation, independent nonblocking contenders must prove that both the stable construction lock and handed-off transaction OFD remain held; only after the durable COMMITTED reconciliation may the transaction contender acquire, while the construction contender remains blocked until explicit uncertain shutdown. All restart cases enter through `InstallerManagerOwnership.restart()`, which acquires the stable construction lock before reconciling the exact PREPARED tail. They require no pending transaction, committed-history equality with the canonical transaction frames, current-owner equality with the final transition target, and continuation through a replacement service that receives only `manager_state_root`. When a pre-PREPARED manager-transaction crash leaves the install authorization active, the replacement sends the exact install request and takes the validation-only existing-install replay path; the complete protected tree snapshot must be byte/inode/mode identical afterward. The response-directory matrix independently renames the configured response root after each of PENDING, mkdir, root fsync, and CREATED, creates a fresh empty root at the old pathname, and requires identity rejection before any entry appears in the new root while the displaced root and directory journal remain byte/inode unchanged.
 
-The install-replay rejection matrix begins with a complete protected install, then independently removes the request artifact, adds a foreign artifact, mutates the canonical artifact bytes, or truncates the response-directory journal to durable `PENDING`. Each case first invokes the replay validator directly and then traverses the real replacement-service socket path. Both calls must fail before send/publication, and the entire protected-installer tree snapshot—including every relative name, inode, mode, file digest, and size—must equal the pre-call corrupt snapshot. No case may complete `CREATED`, recreate the missing artifact, remove the extra artifact, restore bytes, or call a protected-directory fsync.
+The install-replay rejection matrix begins with a complete protected install, then independently removes the request artifact, adds a foreign artifact, mutates the canonical artifact bytes, or truncates the response-directory journal to durable `PENDING`. Each case first invokes the replay validator directly and then traverses the real replacement-service socket path. A second four-case family sends two byte-identical install requests to one still-running service: the first creates the valid publication and leaves its publication object cached, evidence is then corrupted, and the second must nevertheless choose strict replay from the existing journal and fail closed. All calls must fail before send/publication, and the entire protected-installer tree snapshot—including every relative name, inode, mode, file digest, and size—must equal the pre-call corrupt snapshot. The same-service family also requires the request log to contain exactly the two byte-identical canonical requests. No case may complete `CREATED`, recreate the missing artifact, remove the extra artifact, restore bytes, or call a protected-directory fsync.
 
 Exercise every response codec independently. Post-acquisition cases mutate exactly one of: outer key set; request identity; operation/authorization/token/generation echo; lowercase 64-hex final/completion/receipt digest; exact base or closure component-key set; component digest; root device/inode/mount/UID/GID integer type (with Boolean explicitly rejected); root mode; success `error=null`; status/operation; terminal phase; and null-result final fields. Each carries the valid locked handoff and must enter the durable locked-response uncertainty path before any publication mirror. Pre-acquisition cases send zero FDs and mutate exactly one of status, error key set, code, strict Boolean `retryable`, echo, null final fields, or terminal phase; only the exact busy document is returned as `PreAcquisitionReply`, and every invalid variant enters stable-lock transport uncertainty. Separately mutate the protected response parent identity and response-artifact UID/GID, mode, type, link count, inode stability, request-ID basename, canonical bytes, journal terminal digest, receipt schema/hash/content, published-root identity/mode, component bytes/manifests, and completion metadata after a wire-valid response. Add two coherent-tamper sentinels: (1) rewrite valid canonical response bytes and the journal's terminal digest together, rehashing any affected journal suffix, while leaving the independently protected receipt unchanged; (2) rewrite the latest recovery result's terminal-response digest and its own/result-chain digests plus the current owner history while leaving the response artifact and journal unchanged. Both generic chains must be internally valid and `validate_protected_publication_contract` must reject them before the first owner mirror. Every corruption retains `cleanup_required=true` and never enters `COMPLETE`. Recovery tests snapshot the install journal prefix, receipt bytes/hash/inode, and install response-artifact bytes/hash/inode before issuing recovery, then prove all six are unchanged after the recovery suffix and exact response digest are fsynced.
 
