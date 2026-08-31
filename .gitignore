@@ -91,3 +91,4 @@ MUJOCO_LOG.TXT
 .runtime-state/
 .robo-nix/
 .worktrees/
+native/psi0_eval_runtime/target/

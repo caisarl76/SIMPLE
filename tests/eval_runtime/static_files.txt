@@ -15,5 +15,6 @@ tests/eval_runtime/conftest.py
 tests/eval_runtime/fakes.py
 tests/eval_runtime/test_canonical.py
 tests/eval_runtime/test_contracts.py
+tests/eval_runtime/test_native_build.py
 tests/eval_runtime/test_processes.py
 tests/eval_runtime/test_profile.py
