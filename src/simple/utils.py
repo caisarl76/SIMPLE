@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from importlib.resources import as_file
 from json import JSONEncoder
+from pathlib import Path
 
 import numpy as np
 from huggingface_hub import snapshot_download
@@ -37,7 +38,43 @@ def get_res_dir() -> str:
 
 
 def get_data_dir() -> str:
-    return res.files("simple").parent.parent / "data"  # type: ignore
+    configured = os.environ.get("SIMPLE_DATA_ROOT")
+    if configured:
+        if not os.path.isabs(configured):
+            raise RuntimeError(
+                "SIMPLE_DATA_ROOT must name an existing absolute directory"
+            )
+        configured_path = Path(configured)
+        if configured_path.is_symlink() or not configured_path.is_dir():
+            raise RuntimeError(
+                "SIMPLE_DATA_ROOT must name an existing absolute directory"
+            )
+        return os.path.realpath(configured)
+    return str(res.files("simple").parent.parent / "data")
+
+
+def _asset_download_allowed(auto_download: bool) -> bool:
+    return auto_download and os.environ.get("SIMPLE_ASSET_OFFLINE") != "1"
+
+
+def _resolve_data_target(data_dir: str, rel_path: str) -> Path:
+    relative = Path(rel_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise FileNotFoundError(f"Data path escapes SIMPLE_DATA_ROOT: {rel_path}")
+    root = Path(data_dir).resolve(strict=True)
+    target = root.joinpath(relative)
+    resolved = target.resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise FileNotFoundError(f"Data path escapes SIMPLE_DATA_ROOT: {rel_path}")
+    if target.exists() or target.is_symlink():
+        current = root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise FileNotFoundError(
+                    f"Data path contains a symbolic link: {rel_path}"
+                )
+    return target
 
 
 def _parse_zip_file_from_rel_path(rel_path: str) -> str:
@@ -64,18 +101,14 @@ def _parse_zip_file_from_rel_path(rel_path: str) -> str:
     pattern = r"^assets/graspnet/(.*)$"
     match = re.match(pattern, rel_path)
     if match:
-        return f"assets_graspnet.zip"
+        return "assets_graspnet.zip"
 
     pattern = r"^assets/([^/]+)/([^/]+)/.*\.(xml|usd)$"
 
     match = re.search(pattern, rel_path)
     if match:
         asset_category = match.group(1)
-        asset_name = match.group(2)
-        ext = match.group(3)
         return f"assets_{asset_category}.zip"
-
-
 
     pattern = r"^assets/([^/]+)/([^/]+)/([^/]+)/(.+)$"
 
@@ -112,37 +145,39 @@ def resolve_data_path(
     data_dir = get_data_dir()
     if not rel_path:
         return data_dir
-    with as_file(data_dir / rel_path) as res_path:
-        # assert res_path.exists(), f"Data not found: {res_path}"
-        if not res_path.exists():
-            if not auto_download:
-                raise FileNotFoundError(res_path)
+    res_path = _resolve_data_target(data_dir, str(rel_path))
+    if res_path.exists():
+        return str(res_path)
+    if not _asset_download_allowed(auto_download):
+        raise FileNotFoundError(res_path)
 
-            if create_if_not_exist:
-                os.makedirs(res_path, exist_ok=True)
-            else:
-                zip_file = _parse_zip_file_from_rel_path(rel_path)
-                zip_path = os.path.join(data_dir, zip_file)
-                snapshot_download(
-                    repo_id="USC-PSI-Lab/SIMPLE",
-                    allow_patterns=[zip_file],
-                    local_dir=data_dir,
-                    repo_type="dataset",
-                    token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN"),
-                )
+    if create_if_not_exist:
+        os.makedirs(res_path, exist_ok=True)
+        return str(res_path)
 
-                if not os.path.exists(zip_path):
-                    raise FileNotFoundError(
-                        f"Download did not materialize {zip_path} for {rel_path}"
-                    )
-                with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                    zip_ref.extractall(data_dir)
-                if os.path.exists(zip_path):
-                    os.remove(zip_path)
-                    print(f"Deleted {zip_path}")
-                return str(res_path)
+    zip_file = _parse_zip_file_from_rel_path(str(rel_path))
+    zip_path = os.path.join(data_dir, zip_file)
+    snapshot_download(
+        repo_id="USC-PSI-Lab/SIMPLE",
+        allow_patterns=[zip_file],
+        local_dir=data_dir,
+        repo_type="dataset",
+        token=os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN"),
+    )
 
-    return str(res_path)
+    if not os.path.exists(zip_path):
+        raise FileNotFoundError(
+            f"Download did not materialize {zip_path} for {rel_path}"
+        )
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(data_dir)
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+        print(f"Deleted {zip_path}")
+    materialized = _resolve_data_target(data_dir, str(rel_path))
+    if not materialized.exists():
+        raise FileNotFoundError(materialized)
+    return str(materialized)
 
 
 def is_ffmpeg_installed():
