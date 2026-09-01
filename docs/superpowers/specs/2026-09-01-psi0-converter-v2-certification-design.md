@@ -72,6 +72,8 @@ The converter is a fail-closed, staged pipeline:
 ```text
 converter/script attestation
           |
+stable kernel-released conversion lock
+          |
 source discovery and full preflight
           |
 canonical retained-index construction
@@ -127,6 +129,8 @@ For each episode, preflight must:
   vector;
 - require `observation.amo_policy_target_yaw` and
   `observation.amo_policy_turning_flag` to be float scalars;
+- require `task_index` to be an `int64` scalar column with the same row count as
+  the episode and one constant value throughout that episode;
 - reject `frame_count <= skip`;
 - construct `retained_indices = np.arange(skip, frame_count, downsample, dtype=np.int64)`;
 - require `retained_indices` to be nonempty and strictly increasing;
@@ -137,6 +141,21 @@ For each episode, preflight must:
 - require one video stream and an unambiguous finite positive FPS;
 - require the probed video frame count to equal the Parquet row count;
 - validate the codec, pixel format, dimensions, duration, frame rates, and complete audio-stream profile.
+
+Preflight also validates the metadata used after vector construction:
+
+- `meta/tasks.jsonl` contains unique nonnegative integer `task_index` values and
+  nonempty string `task` values;
+- every Parquet `task_index` has exactly one matching task row;
+- `meta/episodes.jsonl` contains unique nonnegative integer `episode_index`
+  values, positive integer `length` values, nonempty string-task lists, and a
+  string `environment_config` containing valid JSON;
+- every selected Parquet filename has exactly one metadata lookup by its source
+  episode index; positional list indexing is prohibited;
+- the metadata length equals the Parquet row count and its task list contains
+  the task text selected by the Parquet task index;
+- task remapping across roots is deterministic by ordered first occurrence of
+  the task text, and every emitted episode lookup is resolved during preflight.
 
 The probed media identity is a canonical JSON object containing at least:
 
@@ -236,6 +255,12 @@ Per-episode and global statistics are computed only from emitted rows, after can
 
 All accumulated arrays must have lengths equal to the emitted episode or dataset cardinality. Statistics are independently recomputable from final Parquet files and include the established mean, standard deviation, minimum, maximum, first percentile, and ninety-ninth percentile fields.
 
+Every statistics block emitted for an episode contains `count: [n]`. Every
+global statistics block contains `count: [total_frames]`. This applies to all
+blocks in `episodes_stats.jsonl`, `stats.json`, and `stats_psi0.json` regardless
+of scalar or vector width. `stats.json` and `stats_psi0.json` are written from
+the same canonical object and must be byte-for-byte identical.
+
 The JSON writer uses `allow_nan=False` for statistics. The same fail-closed setting is used for all JSON and JSONL output so invalid floating-point values cannot appear as nonstandard JSON tokens.
 
 ## Provenance contract
@@ -266,29 +291,130 @@ Dataset-level provenance includes:
 
 All SHA-256 values are lowercase 64-character hexadecimal strings. Canonical provenance JSON uses sorted keys, compact separators, UTF-8, and `allow_nan=False` when a digest is computed.
 
-## Staging and atomic publication
+## Staging, manifest, and atomic publication
 
-Only after all preflight checks pass, the converter creates a unique hidden staging directory beside the final destination. A sibling lock is acquired with exclusive creation so two converter instances cannot claim the same final name. Immediately after staging creation, it atomically writes and fsyncs `CONVERSION_STATUS.json` with state `in_progress` and the staging identity.
+### Crash-recoverable conversion lock
 
-All data, videos, metadata, statistics, provenance, and certification inputs are written beneath staging. Before publication, the converter:
+Before preflight or any staging mutation, the converter opens the stable sibling
+path `<parent>/.<final-name>.conversion.lock` with
+`O_CREAT|O_RDWR|O_CLOEXEC|O_NOFOLLOW` and mode `0600`. It validates a regular
+file owned by the current UID with mode `0600` and link count one, then acquires
+a nonblocking exclusive `flock` on that open file description. Contention exits
+nonzero without creating a staging directory.
 
-1. flushes and closes all file writers;
+The lock file may persist, but ownership is represented only by the kernel lock,
+not by file existence or file contents. Normal close, exception unwinding,
+process death, and `_exit` release it. The converter holds the locked file
+descriptor through publication and the terminal post-publication evidence
+write. A replacement process can acquire the same stable lock after a crash,
+inspect existing final and staging paths, and fail closed without deleting or
+adopting them.
+
+After lock acquisition, the converter rechecks that the canonical destination
+is absent and then creates a unique hidden staging directory beside it. It
+atomically writes and fsyncs `CONVERSION_STATUS.json` with state `in_progress`
+and the staging identity.
+
+### Payload manifest
+
+The staged payload manifest is `meta/conversion_manifest.json`. Its ordered
+entries cover every regular dataset file below `data/`, `videos/`, and `meta/`
+except the manifest itself. This includes every Parquet file, video, standard
+metadata file, statistics file, and dataset/episode provenance file. Each entry
+contains the POSIX relative path, byte size, and lowercase SHA-256. Entries are
+sorted bytewise by relative path.
+
+Exactly two canonical files are excluded from manifest membership:
+
+- `meta/conversion_manifest.json`, to avoid hashing itself;
+- root `CONVERSION_STATUS.json`, because it records the manifest digest and
+  publication state.
+
+The complete canonical dataset tree must equal the manifest entry paths plus
+those two reserved paths. Extra files, symlinks, devices, sockets, directories
+outside the declared layout, and multiply linked files are prohibited. The
+manifest is canonical UTF-8 JSON with sorted keys, compact separators, and
+`allow_nan=False`; `manifest_sha256` is the SHA-256 of those exact manifest
+bytes. The complete status record contains that digest, manifest byte size,
+entry count, aggregate covered-byte count, converter identity, and state
+`complete`.
+
+Post-publication certification evidence is never stored below the canonical
+dataset and is therefore not a manifest member.
+
+### Durable publication ordering
+
+Before publication, while retaining the conversion lock, the converter:
+
+1. flushes and closes every payload writer;
 2. validates the complete staged dataset;
-3. atomically replaces and fsyncs `CONVERSION_STATUS.json` with state
-   `complete` and the staged artifact-manifest digest;
-4. fsyncs relevant staging directories;
-5. rechecks that the canonical destination is absent;
-6. publishes with an atomic no-replace rename on the same filesystem;
-7. fsyncs the parent directory;
-8. releases the sibling lock.
+3. enumerates the exact payload membership and writes the canonical manifest;
+4. atomically replaces `CONVERSION_STATUS.json` with the complete record by
+   fsyncing its temporary regular file, renaming it, and fsyncing the staging
+   root;
+5. normalizes every canonical regular file to mode `0444` and every canonical
+   directory to mode `0555`;
+6. reopens every manifest-covered file, the manifest, and the complete status
+   with no-follow semantics and successfully calls `fsync` on each one;
+7. fsyncs every canonical directory bottom-up, ending with the staging root;
+8. revalidates exact membership, hashes, modes, file types, link counts, and the
+   complete record;
+9. rechecks that the canonical destination is absent;
+10. publishes with atomic `renameat2(RENAME_NOREPLACE)` on the same filesystem;
+11. fsyncs the destination parent directory.
 
-The Linux implementation uses `renameat2(RENAME_NOREPLACE)` and fails closed if an atomic no-replace publication cannot be guaranteed.
+Failure to open or fsync any generated Parquet, video, metadata, provenance,
+manifest, or status file aborts publication. Directory fsync alone is not
+sufficient. The implementation fails closed if atomic no-replace rename cannot
+be guaranteed.
 
-On a caught processing or validation failure, the canonical destination remains absent and `CONVERSION_STATUS.json` is atomically replaced with state `failed`, the phase, and the error, serialized with `allow_nan=False`. A process crash can leave a staging directory in `in_progress` or even `complete` state before publication; any such directory remains noncanonical and is never adopted automatically. A later run creates a new staging directory. The implementation plan will include an explicit operator command for inspecting and, with deliberate authorization, removing preserved staging artifacts.
+On a caught pre-publication failure, the canonical destination remains absent.
+When the staging root remains writable, `CONVERSION_STATUS.json` is atomically
+replaced with state `failed`, the phase, and error using `allow_nan=False`. A
+process crash can leave a staging directory in `in_progress` or even `complete`
+state; any such directory remains noncanonical and is never adopted or removed
+automatically. A later run creates a new staging directory only after acquiring
+the stable lock. The implementation plan defines an explicit inspection and
+authorized-removal command for preserved staging artifacts.
+
+### Immutable dataset and sibling certification evidence
+
+After the parent fsync, the canonical dataset is immutable: converter and
+certifier code open it read-only, never chmod or replace its contents, and
+revalidate its `0444` files, `0555` directories, exact membership, and hashes.
+
+Each post-publication certification attempt exclusively creates this sibling
+root while the conversion lock is still held:
+
+```text
+<parent>/.<final-name>.certification-<manifest-sha256>-<certificate-uuid>/
+```
+
+The evidence root records the manifest digest, complete-status digest, exact
+dataset root identity, certification environment, per-check results, and a
+terminal `PASS` or `FAIL` verdict. All evidence files and directories are
+fsynced before the evidence parent is fsynced. A process crash can leave a
+nonterminal evidence root; it is preserved and never treated as certification.
+A new attempt uses a new UUID and never overwrites prior evidence.
+
+A standalone certification retry must acquire and hold the same stable
+conversion lock before inspecting the canonical root or creating a new evidence
+root.
+
+If post-publication verification fails, the published dataset remains
+immutable and is classified `PUBLISHED_UNCERTIFIED`. The certifier writes and
+fsyncs a `FAIL` result when possible, returns nonzero, and does not delete,
+rename, repair, or certify the dataset. An environmental failure may be retried
+in a new evidence root. A data-integrity failure requires diagnosis and a new
+canonical output name; the existing output remains preserved evidence. The
+conversion lock is released only after the terminal evidence write and parent
+fsync, or automatically by the kernel if the process exits.
 
 ## Output certification
 
-Certification runs against the staged dataset before publication and again read-only after publication.
+Certification runs against the staged dataset before publication and again
+read-only after publication. Only a terminal sibling `PASS` evidence root bound
+to the exact manifest digest certifies the canonical output.
 
 It verifies:
 
@@ -299,6 +425,10 @@ It verifies:
 - timestamp formulas and float32 storage;
 - exactly one terminal flag per nonempty episode;
 - exact episode and global statistics recomputed from Parquet;
+- `count: [n]` in every episode block and `count: [total_frames]` in every
+  global block;
+- byte-for-byte equality and independent validation of `stats.json` and
+  `stats_psi0.json`;
 - exact video count;
 - per-episode video frame counts and media profiles;
 - one truthful dataset-wide `video_info`;
@@ -322,7 +452,15 @@ Dataset certification is also bound to an exact PSI0 checkout and Python environ
 - exact loader command and normalized arguments;
 - loader exit status and result digest.
 
-The production PSI0 offline loader must open the dataset without network access, enumerate every episode, load the first and last sample of every episode, validate the expected state/action/image shapes and dtypes, and iterate all tabular rows without an exception. The exact checkout, environment, and shell commands belong in the implementation plan.
+The production PSI0 offline loader must open the dataset without network access
+and call its production `dataset[i]` retrieval path for every integer index from
+zero through `total_frames - 1`. For every returned sample it validates the
+declared image, 32-D state, and 36-D action shapes and dtypes; every floating
+tensor or array must be finite. The ordered visited-index record must be exactly
+`0 .. total_frames-1`, with no gaps, duplicates, sampling shortcut, direct
+Parquet substitute, or first/last-only optimization. It also enumerates every
+episode and validates episode boundaries. The exact checkout, environment, and
+shell commands belong in the implementation plan.
 
 A certificate from a different PSI0 commit or environment does not certify this output.
 
@@ -338,7 +476,9 @@ Implementation follows test-driven development. New tests are written and observ
 - require aligned column lengths;
 - require continuous frame and global indices;
 - require float32 timestamp values equal to `frame_index / output_fps`;
-- require one final terminal flag.
+- require one final terminal flag;
+- reject missing, duplicate, malformed, length-mismatched, task-mismatched, or
+  position-only task/episode metadata lookups before staging;
 
 ### Schema, finite-value, and statistics tests
 
@@ -347,7 +487,11 @@ Implementation follows test-driven development. New tests are written and observ
 - mutate each emitted float column with NaN and infinity and require rejection;
 - assert JSON serialization rejects nonfinite statistics;
 - recompute episode and global statistics from retained rows;
-- distinguish retained-only statistics from the legacy all-source-row result.
+- distinguish retained-only statistics from the legacy all-source-row result;
+- require `count: [n]` in every episode block and
+  `count: [total_frames]` in every global block;
+- require canonical byte equality plus independent semantic validation of
+  `stats.json` and `stats_psi0.json`.
 
 ### Media tests
 
@@ -366,16 +510,29 @@ Implementation follows test-driven development. New tests are written and observ
 - accept committed script bytes and reject one-byte dirty changes;
 - validate every provenance field and digest;
 - prove that preflight failures create no output or staging path;
+- use real processes to prove lock contention creates no staging path and that
+  a holder terminated with `_exit` releases the stable lock for a new process;
 - inject failures during Parquet, video, metadata, and validation phases and
   require a `failed` staging-status record with no canonical output;
 - reject an existing final destination;
-- prove successful no-replace atomic publication and parent fsync behavior through injected filesystem adapters.
+- prove every manifest-covered file and both reserved files are fsynced before
+  bottom-up directory fsync, durable complete state, rename, and parent fsync;
+- prove exact manifest membership and reject missing, extra, symlinked,
+  hard-linked, mutated, or self-referential entries;
+- prove successful no-replace atomic publication through injected filesystem
+  adapters;
+- inject post-publication verification failures and require an immutable
+  `PUBLISHED_UNCERTIFIED` dataset plus a durable sibling `FAIL` root;
+- prove a new certification UUID never overwrites a prior failed or incomplete
+  evidence root.
 
 ### Integration certification tests
 
 - regenerate a multi-episode synthetic dataset and run the full validator;
 - run the exact official raw episode into the fresh `-v2` output only after converter commit;
-- run the exact pinned PSI0 offline loader and preserve its certificate.
+- run the exact pinned PSI0 offline loader through `dataset[i]` for every index,
+  assert the visited sequence is exactly `0 .. total_frames-1`, and preserve its
+  certificate.
 
 ## Files in implementation scope
 
@@ -411,8 +568,16 @@ The milestone is complete only when:
 - the raw input and existing processed output remain byte-for-byte untouched;
 - only the fresh `processed-psi0-bendpick-l0-v2` canonical destination is published;
 - every episode satisfies the exact row, schema, finite-value, media, and provenance contracts;
-- global metadata and statistics are recomputable from published artifacts;
+- task/episode metadata is completely resolved before staging and remains
+  consistent with every emitted record;
+- global metadata and statistics, including every required count, are
+  recomputable from published artifacts;
+- the immutable canonical tree exactly matches its payload manifest and two
+  reserved files;
 - the exact pinned PSI0 offline loader accepts the complete output;
+- the loader retrieves and validates every dataset index exactly once;
 - the certificate records exact source, converter, output, PSI0, and environment identities;
+- one exclusively created sibling evidence root records a terminal `PASS`
+  bound to the exact manifest digest;
 - no conversion failure leaves a partial canonical output;
 - no simulation, training, inference server, H100 workload, or real-robot process is started.
