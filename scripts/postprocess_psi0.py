@@ -108,6 +108,41 @@ class ConversionPlan:
     converter: ConverterIdentity
 
 
+@dataclass(frozen=True)
+class PublicationResult:
+    dataset_root: Path
+    manifest_sha256: str
+    complete_status_sha256: str
+    state: Literal["published", "publication_uncertain"]
+
+
+class PublicationUncertainError(RuntimeError):
+    def __init__(self, publication: PublicationResult) -> None:
+        super().__init__(
+            "publication rename completed but parent durability is uncertain"
+        )
+        self.publication = publication
+
+
+class PublishedBoundaryError(RuntimeError):
+    def __init__(self, publication: PublicationResult) -> None:
+        super().__init__("failure after durable publication")
+        self.publication = publication
+
+
+class PublicationStateError(RuntimeError):
+    def __init__(
+        self,
+        state: Literal[
+            "pre_completion_failed",
+            "completion_uncertain_unpublished",
+            "complete_unpublished",
+        ],
+    ) -> None:
+        super().__init__(state)
+        self.state = state
+
+
 REQUIRED_SOURCE_TYPES = {
     "observation.joint_qpos": pa.list_(pa.float32(), 43),
     "observation.amo_policy_command": pa.list_(pa.float32(), 9),
@@ -2241,6 +2276,204 @@ def atomic_write_new_bytes(path: Path, payload: bytes, mode: int = 0o644) -> Non
         os.close(parent_fd)
 
 
+def atomic_replace_status(
+    path: Path,
+    payload: bytes,
+    mode: int,
+    fault: Callable[[str], None],
+) -> None:
+    if path.name != _STATUS_RELATIVE_PATH:
+        raise ValueError("only CONVERSION_STATUS.json may be replaced")
+    parent_fd = _open_validated_directory(path.parent)
+    destination_name = _validated_basename(path, "conversion status")
+    temporary_name = os.fsencode(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    temporary_fd = None
+    destination_fd = None
+    temporary_exists = False
+    try:
+        destination_fd = os.open(
+            destination_name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        existing = _validate_descriptor_entry(
+            destination_fd,
+            parent_fd,
+            destination_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            mode,
+            dir_fd=parent_fd,
+        )
+        temporary_exists = True
+        created = _validate_descriptor_entry(
+            temporary_fd,
+            parent_fd,
+            temporary_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        temporary_identity = (created.st_dev, created.st_ino)
+        fault("after_complete_temp_creation")
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(temporary_fd, remaining)
+            if written <= 0:
+                raise OSError("conversion status write made no forward progress")
+            remaining = remaining[written:]
+        written_metadata = _validate_descriptor_entry(
+            temporary_fd,
+            parent_fd,
+            temporary_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (
+            written_metadata.st_dev,
+            written_metadata.st_ino,
+            written_metadata.st_size,
+        ) != (*temporary_identity, len(payload)):
+            raise RuntimeError("temporary conversion status identity changed")
+        fault("before_complete_temp_fsync")
+        os.fsync(temporary_fd)
+        fault("after_complete_temp_fsync")
+        if _sha256_descriptor(temporary_fd) != sha256_bytes(payload):
+            raise RuntimeError("temporary conversion status bytes changed")
+        _validate_descriptor_path(parent_fd, path.parent, expected_type="directory")
+        current = _validate_descriptor_entry(
+            destination_fd,
+            parent_fd,
+            destination_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (current.st_dev, current.st_ino) != (existing.st_dev, existing.st_ino):
+            raise RuntimeError("conversion status identity changed before replace")
+        os.replace(
+            temporary_name,
+            destination_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_exists = False
+        fault("after_complete_status_rename")
+        os.fsync(parent_fd)
+        visible_fd = os.open(
+            destination_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            visible = _validate_descriptor_entry(
+                visible_fd,
+                parent_fd,
+                destination_name,
+                expected_type="file",
+                require_single_link=True,
+            )
+            if visible.st_size != len(payload):
+                raise RuntimeError("conversion status size changed")
+            if _sha256_descriptor(visible_fd) != sha256_bytes(payload):
+                raise RuntimeError("conversion status digest changed")
+        finally:
+            os.close(visible_fd)
+        _validate_descriptor_path(parent_fd, path.parent, expected_type="directory")
+    finally:
+        if temporary_exists:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileNotFoundError:
+                pass
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
+        os.close(parent_fd)
+
+
+class PublicationFilesystem:
+    def fsync_file(self, path: Path) -> None:
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise RuntimeError(f"unsafe file for fsync: {path}")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def fsync_directory(self, path: Path) -> None:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def chmod(self, path: Path, mode: int) -> None:
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            before = os.fstat(fd)
+            if not (stat.S_ISREG(before.st_mode) or stat.S_ISDIR(before.st_mode)):
+                raise RuntimeError(f"unsafe chmod target: {path}")
+            if before.st_nlink != 1 and stat.S_ISREG(before.st_mode):
+                raise RuntimeError(f"multiply linked chmod target: {path}")
+            os.fchmod(fd, mode)
+            after = os.fstat(fd)
+            if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeError(f"chmod target identity changed: {path}")
+            reopened = os.open(
+                path,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                visible = os.fstat(reopened)
+                if (visible.st_dev, visible.st_ino) != (
+                    before.st_dev,
+                    before.st_ino,
+                ):
+                    raise RuntimeError(f"chmod pathname was replaced: {path}")
+                if stat.S_IMODE(visible.st_mode) != mode:
+                    raise RuntimeError(f"chmod mode did not persist: {path}")
+            finally:
+                os.close(reopened)
+        finally:
+            os.close(fd)
+
+    def atomic_write_new(self, path: Path, payload: bytes, mode: int) -> None:
+        atomic_write_new_bytes(path, payload, mode)
+
+    def atomic_replace_status(
+        self,
+        path: Path,
+        payload: bytes,
+        mode: int,
+        fault: Callable[[str], None],
+    ) -> None:
+        atomic_replace_status(path, payload, mode, fault)
+
+    def rename_noreplace(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> None:
+        rename_noreplace(
+            source,
+            destination,
+            expected_identity=expected_identity,
+        )
+
+
 def _canonical_jsonl_bytes(rows: list[dict[str, object]]) -> bytes:
     return b"".join(canonical_json_bytes(row) for row in rows)
 
@@ -3143,6 +3376,552 @@ def generate_staged_dataset(plan: ConversionPlan, staging: Path) -> None:
         _generate_staged_dataset(plan, tree)
     finally:
         tree.close()
+
+
+def _canonical_tree_paths(
+    root: Path,
+) -> tuple[list[tuple[str, Path]], list[tuple[str, Path]]]:
+    files: list[tuple[str, Path]] = []
+    directories: list[tuple[str, Path]] = [(".", root)]
+    for directory, directory_names, file_names in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        directory_names.sort(key=lambda value: value.encode("utf-8"))
+        file_names.sort(key=lambda value: value.encode("utf-8"))
+        for name in directory_names:
+            path = directory_path / name
+            metadata = path.lstat()
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError(f"unsafe canonical directory: {path}")
+            directories.append((path.relative_to(root).as_posix(), path))
+        for name in file_names:
+            path = directory_path / name
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise RuntimeError(f"unsafe canonical file: {path}")
+            files.append((path.relative_to(root).as_posix(), path))
+    files.sort(key=lambda item: item[0].encode("utf-8"))
+    directories.sort(
+        key=lambda item: (
+            -(0 if item[0] == "." else item[0].count("/") + 1),
+            item[0].encode("utf-8"),
+        )
+    )
+    return files, directories
+
+
+def _write_manifest_new(
+    path: Path,
+    payload: bytes,
+    filesystem: PublicationFilesystem,
+    fault: Callable[[str], None],
+) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o644,
+    )
+    temporary_exists = True
+    try:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("manifest write made no forward progress")
+            remaining = remaining[written:]
+        os.close(fd)
+        fd = -1
+        filesystem.fsync_file(temporary)
+        fault("after_manifest_file_fsync")
+        rename_noreplace(temporary, path)
+        temporary_exists = False
+        fault("after_manifest_rename")
+        filesystem.fsync_directory(path.parent)
+        fault("after_meta_fsync")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary_exists:
+            try:
+                temporary.unlink()
+                filesystem.fsync_directory(path.parent)
+            except FileNotFoundError:
+                pass
+
+
+def _complete_status_bytes(
+    staging: Path,
+    manifest: dict[str, object],
+    manifest_payload: bytes,
+    converter: ConverterIdentity,
+) -> bytes:
+    entries = manifest["entries"]
+    if not isinstance(entries, list):
+        raise ValueError("payload manifest entries must be a list")
+    covered_bytes = 0
+    for entry in entries:
+        if not isinstance(entry, dict) or type(entry.get("size")) is not int:
+            raise ValueError("payload manifest entry has invalid size")
+        covered_bytes += entry["size"]
+    metadata = staging.stat(follow_symlinks=False)
+    return canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "staging": {"st_dev": metadata.st_dev, "st_ino": metadata.st_ino},
+            "state": "complete",
+            "manifest_sha256": sha256_bytes(manifest_payload),
+            "manifest_size": len(manifest_payload),
+            "entry_count": len(entries),
+            "covered_bytes": covered_bytes,
+            "converter": asdict(converter),
+        }
+    )
+
+
+def _failed_status_bytes(staging: Path, error: BaseException) -> bytes:
+    metadata = staging.stat(follow_symlinks=False)
+    return canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "staging": {"st_dev": metadata.st_dev, "st_ino": metadata.st_ino},
+            "state": "failed",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+    )
+
+
+def _read_regular_file_bytes(path: Path, label: str) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise RuntimeError(f"unsafe {label}")
+        payload = b"".join(iter(lambda: os.read(fd, 1024 * 1024), b""))
+        after = os.fstat(fd)
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ) or after.st_nlink != 1:
+            raise RuntimeError(f"{label} identity changed")
+        if len(payload) != before.st_size:
+            raise RuntimeError(f"{label} size changed")
+    finally:
+        os.close(fd)
+    return payload
+
+
+def _read_canonical_json_file(
+    path: Path, label: str
+) -> tuple[dict[str, object], bytes]:
+    payload = _read_regular_file_bytes(path, label)
+    try:
+        value = json.loads(
+            payload,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {constant}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{label} is not strict JSON") from exc
+    if not isinstance(value, dict) or payload != canonical_json_bytes(value):
+        raise ValueError(f"{label} bytes are not canonical")
+    return value, payload
+
+
+def _validate_complete_status(
+    root: Path,
+    expected_payload: bytes | None = None,
+) -> tuple[dict[str, object], bytes]:
+    status, payload = _read_canonical_json_file(
+        root / _STATUS_RELATIVE_PATH,
+        "conversion status",
+    )
+    if status.get("state") != "complete":
+        raise RuntimeError("conversion status is not complete")
+    root_metadata = root.stat(follow_symlinks=False)
+    staging_identity = status.get("staging")
+    if not isinstance(staging_identity, dict) or (
+        staging_identity.get("st_dev"),
+        staging_identity.get("st_ino"),
+    ) != (root_metadata.st_dev, root_metadata.st_ino):
+        raise RuntimeError("complete status root identity differs")
+    manifest_path = root / _MANIFEST_RELATIVE_PATH
+    manifest_payload = _read_regular_file_bytes(manifest_path, "payload manifest")
+    manifest = validate_payload_manifest(root)
+    entries = manifest["entries"]
+    assert isinstance(entries, list)
+    expected_fields = {
+        "manifest_sha256": sha256_bytes(manifest_payload),
+        "manifest_size": len(manifest_payload),
+        "entry_count": len(entries),
+        "covered_bytes": sum(entry["size"] for entry in entries),
+    }
+    if any(status.get(field) != value for field, value in expected_fields.items()):
+        raise RuntimeError("complete status differs from payload manifest")
+    if expected_payload is not None and payload != expected_payload:
+        raise RuntimeError("complete status bytes changed")
+    return status, payload
+
+
+def _require_in_progress_status(root: Path) -> None:
+    status, payload = _read_canonical_json_file(
+        root / _STATUS_RELATIVE_PATH,
+        "conversion status",
+    )
+    if status.get("state") != "in_progress":
+        raise RuntimeError("conversion status is not in_progress")
+    metadata = root.stat(follow_symlinks=False)
+    if payload != _in_progress_status_bytes(metadata):
+        raise RuntimeError("in_progress status differs from staging identity")
+
+
+def _validate_final_modes(root: Path) -> None:
+    files, directories = _canonical_tree_paths(root)
+    for relative_path, path in files:
+        metadata = path.lstat()
+        if stat.S_IMODE(metadata.st_mode) != 0o444:
+            raise RuntimeError(f"canonical file has wrong mode: {relative_path}")
+    for relative_path, path in directories:
+        metadata = path.lstat()
+        if stat.S_IMODE(metadata.st_mode) != 0o555:
+            raise RuntimeError(f"canonical directory has wrong mode: {relative_path}")
+
+
+def _replace_with_failed_status(
+    staging: Path,
+    error: BaseException,
+    filesystem: PublicationFilesystem,
+) -> None:
+    filesystem.atomic_replace_status(
+        staging / _STATUS_RELATIVE_PATH,
+        _failed_status_bytes(staging, error),
+        0o644,
+        lambda _point: None,
+    )
+
+
+def inspect_publication_state(staging: Path, output: Path) -> str:
+    if os.path.lexists(output):
+        if os.path.lexists(staging):
+            raise RuntimeError("both staging and canonical output exist")
+        output_fd = _open_validated_directory(output)
+        os.close(output_fd)
+        PublicationFilesystem().fsync_directory(output.parent)
+        _validate_complete_status(output)
+        _validate_final_modes(output)
+        return "published"
+    if not os.path.lexists(staging):
+        raise FileNotFoundError("neither staging nor canonical output exists")
+    status, _ = _read_canonical_json_file(
+        staging / _STATUS_RELATIVE_PATH,
+        "conversion status",
+    )
+    state = status.get("state")
+    if state == "failed":
+        return "pre_completion_failed"
+    if state == "in_progress":
+        return "completion_uncertain_unpublished"
+    if state != "complete":
+        raise RuntimeError("staging has an unknown conversion state")
+    try:
+        _validate_complete_status(staging)
+        _validate_final_modes(staging)
+    except (OSError, ValueError, RuntimeError):
+        return "completion_uncertain_unpublished"
+    return "complete_unpublished"
+
+
+def publish_staged_dataset(
+    staging: Path,
+    output: Path,
+    converter: ConverterIdentity,
+    filesystem: PublicationFilesystem,
+    fault: Callable[[str], None],
+) -> PublicationResult:
+    completion_write_started = False
+    durable_complete = False
+    publication_renamed = False
+    publication_durable = False
+    published_result: PublicationResult | None = None
+    manifest_sha256 = ""
+    complete_status_sha256 = ""
+    try:
+        fault("after_payload_close")
+
+        manifest = build_payload_manifest(staging)
+        fault("after_staged_validation")
+
+        manifest_payload = canonical_json_bytes(manifest)
+        manifest_sha256 = sha256_bytes(manifest_payload)
+        _write_manifest_new(
+            staging / _MANIFEST_RELATIVE_PATH,
+            manifest_payload,
+            filesystem,
+            fault,
+        )
+
+        files, directories = _canonical_tree_paths(staging)
+        for relative_path, path in files:
+            filesystem.fsync_file(path)
+            fault(f"after_each_payload_fsync:{relative_path}")
+        for relative_path, path in directories:
+            filesystem.fsync_directory(path)
+            fault(f"after_each_precomplete_directory_fsync:{relative_path}")
+
+        if validate_payload_manifest(staging) != manifest:
+            raise RuntimeError("staged manifest changed before completion")
+        _require_in_progress_status(staging)
+        fault("after_precomplete_revalidation")
+
+        complete_payload = _complete_status_bytes(
+            staging,
+            manifest,
+            manifest_payload,
+            converter,
+        )
+        complete_status_sha256 = sha256_bytes(complete_payload)
+        completion_write_started = True
+        filesystem.atomic_replace_status(
+            staging / _STATUS_RELATIVE_PATH,
+            complete_payload,
+            0o644,
+            fault,
+        )
+        durable_complete = True
+        fault("after_complete_root_fsync")
+
+        files, directories = _canonical_tree_paths(staging)
+        for relative_path, path in files:
+            filesystem.chmod(path, 0o444)
+            fault(f"after_each_chmod:{relative_path}")
+        for relative_path, path in directories:
+            filesystem.chmod(path, 0o555)
+            fault(f"after_each_chmod:{relative_path}")
+
+        for relative_path, path in files:
+            filesystem.fsync_file(path)
+            fault(f"after_each_final_file_fsync:{relative_path}")
+        for relative_path, path in directories:
+            filesystem.fsync_directory(path)
+            fault(f"after_each_final_directory_fsync:{relative_path}")
+
+        if staging.parent != output.parent:
+            raise ValueError("staging and canonical output must be siblings")
+        parent_fd = _open_validated_directory(staging.parent)
+        staging_fd = None
+        try:
+            staging_name = _validated_basename(staging, "staging root")
+            output_name = _validated_basename(output, "canonical output")
+            staging_fd = os.open(
+                staging_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            pinned = _validate_descriptor_entry(
+                staging_fd,
+                parent_fd,
+                staging_name,
+                expected_type="directory",
+            )
+            expected_staging_identity = (pinned.st_dev, pinned.st_ino)
+
+            if validate_payload_manifest(staging) != manifest:
+                raise RuntimeError("sealed manifest changed before publication")
+            _validate_complete_status(staging, complete_payload)
+            _validate_final_modes(staging)
+            pinned_after_validation = _validate_descriptor_entry(
+                staging_fd,
+                parent_fd,
+                staging_name,
+                expected_type="directory",
+            )
+            if (
+                pinned_after_validation.st_dev,
+                pinned_after_validation.st_ino,
+            ) != expected_staging_identity:
+                raise RuntimeError("validated staging root identity changed")
+            fault("after_final_revalidation")
+
+            if os.path.lexists(output):
+                raise FileExistsError(f"canonical output already exists: {output}")
+            fault("before_publication_rename")
+            _validate_descriptor_path(
+                parent_fd,
+                staging.parent,
+                expected_type="directory",
+            )
+            before_rename = _validate_descriptor_entry(
+                staging_fd,
+                parent_fd,
+                staging_name,
+                expected_type="directory",
+            )
+            if (
+                before_rename.st_dev,
+                before_rename.st_ino,
+            ) != expected_staging_identity:
+                raise RuntimeError("staging root was replaced before publication")
+            if validate_payload_manifest(staging) != manifest:
+                raise RuntimeError("sealed manifest changed at publication boundary")
+            _validate_complete_status(staging, complete_payload)
+            _validate_final_modes(staging)
+            final_source = _validate_descriptor_entry(
+                staging_fd,
+                parent_fd,
+                staging_name,
+                expected_type="directory",
+            )
+            if (final_source.st_dev, final_source.st_ino) != expected_staging_identity:
+                raise RuntimeError("staging root changed during final revalidation")
+            _validate_descriptor_path(
+                parent_fd,
+                staging.parent,
+                expected_type="directory",
+            )
+            if os.path.lexists(output):
+                raise FileExistsError(f"canonical output already exists: {output}")
+            filesystem.rename_noreplace(
+                staging,
+                output,
+                expected_identity=expected_staging_identity,
+            )
+            publication_renamed = True
+            published = _validate_descriptor_entry(
+                staging_fd,
+                parent_fd,
+                output_name,
+                expected_type="directory",
+            )
+            if (published.st_dev, published.st_ino) != expected_staging_identity:
+                raise RuntimeError("published root differs from validated staging root")
+            _validate_descriptor_path(
+                parent_fd,
+                output.parent,
+                expected_type="directory",
+            )
+            try:
+                fault("after_publication_rename")
+                _validate_descriptor_path(
+                    parent_fd,
+                    output.parent,
+                    expected_type="directory",
+                )
+                _validate_descriptor_entry(
+                    staging_fd,
+                    parent_fd,
+                    output_name,
+                    expected_type="directory",
+                )
+                filesystem.fsync_directory(output.parent)
+                _validate_descriptor_path(
+                    parent_fd,
+                    output.parent,
+                    expected_type="directory",
+                )
+                durable_root = _validate_descriptor_entry(
+                    staging_fd,
+                    parent_fd,
+                    output_name,
+                    expected_type="directory",
+                )
+                if (
+                    durable_root.st_dev,
+                    durable_root.st_ino,
+                ) != expected_staging_identity:
+                    raise RuntimeError(
+                        "durable output differs from validated staging root"
+                    )
+                os.fsync(parent_fd)
+                publication_durable = True
+                published_result = PublicationResult(
+                    dataset_root=output,
+                    manifest_sha256=manifest_sha256,
+                    complete_status_sha256=complete_status_sha256,
+                    state="published",
+                )
+            except BaseException as exc:
+                if publication_durable:
+                    if published_result is None:
+                        published_result = PublicationResult(
+                            dataset_root=output,
+                            manifest_sha256=manifest_sha256,
+                            complete_status_sha256=complete_status_sha256,
+                            state="published",
+                        )
+                    raise PublishedBoundaryError(published_result) from exc
+                uncertain = PublicationResult(
+                    dataset_root=output,
+                    manifest_sha256=manifest_sha256,
+                    complete_status_sha256=complete_status_sha256,
+                    state="publication_uncertain",
+                )
+                raise PublicationUncertainError(uncertain) from exc
+        finally:
+            cleanup_error = None
+            for descriptor in (staging_fd, parent_fd):
+                if descriptor is None:
+                    continue
+                try:
+                    os.close(descriptor)
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            if cleanup_error is not None:
+                raise cleanup_error
+        if published_result is None:
+            raise AssertionError("durable publication has no result")
+        try:
+            fault("after_destination_parent_fsync")
+        except BaseException as exc:
+            raise PublishedBoundaryError(published_result) from exc
+        return published_result
+    except (PublicationUncertainError, PublishedBoundaryError):
+        raise
+    except BaseException as exc:
+        if publication_durable:
+            if published_result is None:
+                published_result = PublicationResult(
+                    dataset_root=output,
+                    manifest_sha256=manifest_sha256,
+                    complete_status_sha256=complete_status_sha256,
+                    state="published",
+                )
+            raise PublishedBoundaryError(published_result) from exc
+        if publication_renamed:
+            uncertain = PublicationResult(
+                dataset_root=output,
+                manifest_sha256=manifest_sha256,
+                complete_status_sha256=complete_status_sha256,
+                state="publication_uncertain",
+            )
+            raise PublicationUncertainError(uncertain) from exc
+        if (
+            durable_complete
+            and not os.path.lexists(staging)
+            and os.path.lexists(output)
+        ):
+            uncertain = PublicationResult(
+                dataset_root=output,
+                manifest_sha256=manifest_sha256,
+                complete_status_sha256=complete_status_sha256,
+                state="publication_uncertain",
+            )
+            raise PublicationUncertainError(uncertain) from exc
+        if durable_complete:
+            raise PublicationStateError("complete_unpublished") from exc
+        if completion_write_started:
+            raise PublicationStateError("completion_uncertain_unpublished") from exc
+        try:
+            _replace_with_failed_status(staging, exc, filesystem)
+        except BaseException as report_error:
+            raise RuntimeError(
+                "publication and durable failure reporting both failed: "
+                f"{type(exc).__name__}: {exc}; "
+                f"{type(report_error).__name__}: {report_error}"
+            ) from report_error
+        raise PublicationStateError("pre_completion_failed") from exc
 
 
 def _generate_staged_dataset(plan: ConversionPlan, tree: _PinnedStagingTree) -> None:
