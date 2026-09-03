@@ -13,7 +13,7 @@ import shutil
 import stat
 import subprocess
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Literal
@@ -55,6 +55,25 @@ class MediaProfile:
 
 
 @dataclass(frozen=True)
+class WrittenMedia:
+    identity: MediaIdentity
+    sha256: str
+    st_dev: int
+    st_ino: int
+    st_size: int
+
+
+@dataclass(frozen=True)
+class SourceRootIdentity:
+    path: Path
+    st_dev: int
+    st_ino: int
+    st_uid: int
+    st_gid: int
+    st_mode: int
+
+
+@dataclass(frozen=True)
 class EpisodePlan:
     source_root: Path
     source_episode_index: int
@@ -82,6 +101,7 @@ class ConversionPlan:
     video_key: str
     media_mode: Literal["copy_all", "transcode_all"]
     output_media: MediaProfile
+    input_roots: tuple[SourceRootIdentity, ...]
     tasks: tuple[dict[str, object], ...]
     episodes: tuple[EpisodePlan, ...]
     converter: ConverterIdentity
@@ -754,6 +774,51 @@ def _episode_mapping(path: Path) -> dict[int, dict[str, object]]:
     return result
 
 
+def _snapshot_regular_file(
+    path: Path,
+    *,
+    label: str,
+    expected_sha256: str | None = None,
+) -> tuple[bytes, str]:
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        before = _validate_descriptor_path(
+            fd,
+            path,
+            expected_type="file",
+            require_single_link=True,
+        )
+        digest = hashlib.sha256()
+        chunks = []
+        os.lseek(fd, 0, os.SEEK_SET)
+        while block := os.read(fd, 1024 * 1024):
+            digest.update(block)
+            chunks.append(block)
+        payload = b"".join(chunks)
+        actual_sha256 = digest.hexdigest()
+        if len(payload) != before.st_size:
+            raise RuntimeError(f"{label} size changed while being snapshotted")
+        if expected_sha256 is not None and actual_sha256 != expected_sha256:
+            raise RuntimeError(f"{label} SHA-256 differs from preflight identity")
+        after = _validate_descriptor_path(
+            fd,
+            path,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ):
+            raise RuntimeError(f"{label} identity changed while being snapshotted")
+        if _sha256_descriptor(fd) != actual_sha256:
+            raise RuntimeError(f"{label} changed while being snapshotted")
+        return payload, actual_sha256
+    finally:
+        os.close(fd)
+
+
 def media_selection_key(value: MediaIdentity) -> tuple[object, ...]:
     return (
         value.codec_name,
@@ -864,6 +929,28 @@ def preflight_conversion(
         {Path(match).expanduser().resolve(strict=True) for match in matched_roots}
     )
 
+    input_roots = []
+    for source_root in source_roots:
+        source_root_fd = _open_validated_directory(source_root)
+        try:
+            source_root_metadata = _validate_descriptor_path(
+                source_root_fd,
+                source_root,
+                expected_type="directory",
+            )
+            input_roots.append(
+                SourceRootIdentity(
+                    path=source_root,
+                    st_dev=source_root_metadata.st_dev,
+                    st_ino=source_root_metadata.st_ino,
+                    st_uid=source_root_metadata.st_uid,
+                    st_gid=source_root_metadata.st_gid,
+                    st_mode=stat.S_IMODE(source_root_metadata.st_mode),
+                )
+            )
+        finally:
+            os.close(source_root_fd)
+
     candidates = []
     for source_root in source_roots:
         if not source_root.is_dir():
@@ -915,7 +1002,11 @@ def preflight_conversion(
         tasks,
         episodes,
     ) in selected_candidates:
-        schema = pq.read_schema(parquet_path)
+        parquet_payload, parquet_sha256 = _snapshot_regular_file(
+            parquet_path,
+            label="source Parquet",
+        )
+        schema = pq.read_schema(pa.BufferReader(parquet_payload))
         for name, expected_type in REQUIRED_SOURCE_TYPES.items():
             index = schema.get_field_index(name)
             if index < 0:
@@ -927,9 +1018,11 @@ def preflight_conversion(
                     f"expected {expected_type}"
                 )
 
-        parquet_file = pq.ParquetFile(parquet_path)
+        parquet_file = pq.ParquetFile(pa.BufferReader(parquet_payload))
         frame_count = parquet_file.metadata.num_rows
-        task_table = pq.read_table(parquet_path, columns=["task_index"])
+        task_table = pq.read_table(
+            pa.BufferReader(parquet_payload), columns=["task_index"]
+        )
         if len(task_table) != frame_count:
             raise ValueError("task_index row count does not match Parquet metadata")
         task_values = task_table["task_index"].to_pylist()
@@ -983,7 +1076,7 @@ def preflight_conversion(
                 output_episode_index=len(plans),
                 parquet_path=parquet_path,
                 video_path=video_path,
-                parquet_sha256=sha256_file(parquet_path),
+                parquet_sha256=parquet_sha256,
                 video_sha256=sha256_file(video_path),
                 frame_count=frame_count,
                 retained_indices=retained_indices,
@@ -1011,6 +1104,7 @@ def preflight_conversion(
         video_key=video_key,
         media_mode=media_mode,
         output_media=output_media,
+        input_roots=tuple(input_roots),
         tasks=tuple(output_tasks),
         episodes=tuple(plans),
         converter=converter,
@@ -1276,8 +1370,11 @@ def build_output_table(
     timestamp_quotients = [
         Fraction(frame, 1) / output_fps for frame in range(row_count)
     ]
-    with np.errstate(over="ignore"):
-        timestamp = np.asarray(timestamp_quotients, dtype=np.float32)
+    try:
+        with np.errstate(over="ignore"):
+            timestamp = np.asarray(timestamp_quotients, dtype=np.float32)
+    except OverflowError as exc:
+        raise ValueError("timestamp contains nonfinite values") from exc
     require_finite("timestamp", timestamp)
     frame_index = np.arange(row_count, dtype=np.int64)
     episode_index = np.full(row_count, output_episode_index, dtype=np.int64)
@@ -1298,6 +1395,604 @@ def build_output_table(
         ]
     )
     return pa.Table.from_arrays(arrays, schema=output_schema())
+
+
+def output_schema_sha256() -> str:
+    identity = {
+        "fields": [
+            {
+                "name": field.name,
+                "nullable": field.nullable,
+                "type": str(field.type),
+            }
+            for field in output_schema()
+        ]
+    }
+    return sha256_bytes(canonical_json_bytes(identity))
+
+
+def _atomic_write_new_bytes_at(
+    path: Path,
+    payload: bytes,
+    mode: int,
+    *,
+    parent_fd: int,
+) -> None:
+    destination_name = _validated_basename(path, "destination")
+    temporary_name = os.fsencode(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    payload_fd = None
+    temporary_read_fd = None
+    destination_fd = None
+    temporary_identity: tuple[int, int] | None = None
+    temporary_exists = False
+    primary_error: BaseException | None = None
+    try:
+        payload_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            mode,
+            dir_fd=parent_fd,
+        )
+        temporary_exists = True
+        created = _validate_descriptor_entry(
+            payload_fd,
+            parent_fd,
+            temporary_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        temporary_identity = (created.st_dev, created.st_ino)
+        with os.fdopen(payload_fd, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        written = _validate_descriptor_entry(
+            payload_fd,
+            parent_fd,
+            temporary_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (
+            written.st_dev,
+            written.st_ino,
+            written.st_size,
+        ) != (*temporary_identity, len(payload)):
+            raise RuntimeError("temporary payload identity or size changed")
+        expected_sha256 = sha256_bytes(payload)
+        temporary_read_fd = os.open(
+            temporary_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        verified = _validate_descriptor_entry(
+            temporary_read_fd,
+            parent_fd,
+            temporary_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (verified.st_dev, verified.st_ino) != temporary_identity:
+            raise RuntimeError("temporary payload identity changed before verification")
+        if _sha256_descriptor(temporary_read_fd) != expected_sha256:
+            raise RuntimeError("temporary payload digest differs from requested bytes")
+        _validate_descriptor_path(parent_fd, path.parent, expected_type="directory")
+        os.link(
+            temporary_name,
+            destination_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        destination_fd = os.open(
+            destination_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        linked = _validate_descriptor_entry(
+            destination_fd,
+            parent_fd,
+            destination_name,
+            expected_type="file",
+        )
+        if (linked.st_dev, linked.st_ino) != temporary_identity:
+            raise RuntimeError("published payload identity differs from temporary")
+        if linked.st_nlink != 2 or linked.st_size != len(payload):
+            raise RuntimeError("published payload has unsafe metadata")
+        if _sha256_descriptor(destination_fd) != expected_sha256:
+            raise RuntimeError("published payload digest differs from requested bytes")
+        fsync_directory(path.parent, directory_fd=parent_fd)
+        os.unlink(temporary_name, dir_fd=parent_fd)
+        temporary_exists = False
+        fsync_directory(path.parent, directory_fd=parent_fd)
+        final = _validate_descriptor_entry(
+            destination_fd,
+            parent_fd,
+            destination_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+        ) != (*temporary_identity, len(payload)):
+            raise RuntimeError("final payload identity or size changed")
+        if _sha256_descriptor(destination_fd) != expected_sha256:
+            raise RuntimeError("final payload digest differs from requested bytes")
+        _validate_descriptor_path(parent_fd, path.parent, expected_type="directory")
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_error = None
+        if temporary_exists and temporary_identity is not None:
+            try:
+                visible = os.stat(
+                    temporary_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (visible.st_dev, visible.st_ino) != temporary_identity:
+                    raise RuntimeError("temporary payload identity changed")
+                os.unlink(temporary_name, dir_fd=parent_fd)
+                fsync_directory(path.parent, directory_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            except BaseException as exc:
+                cleanup_error = exc
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if temporary_read_fd is not None:
+            os.close(temporary_read_fd)
+        if payload_fd is not None:
+            os.close(payload_fd)
+        if cleanup_error is not None and primary_error is None:
+            raise cleanup_error
+
+
+def atomic_write_new_bytes(path: Path, payload: bytes, mode: int = 0o644) -> None:
+    parent_fd = _open_validated_directory(path.parent)
+    try:
+        _atomic_write_new_bytes_at(
+            path,
+            payload,
+            mode,
+            parent_fd=parent_fd,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def _canonical_jsonl_bytes(rows: list[dict[str, object]]) -> bytes:
+    return b"".join(canonical_json_bytes(row) for row in rows)
+
+
+def _media_mapping(value: MediaIdentity | MediaProfile) -> dict[str, object]:
+    mapping = asdict(value)
+    mapping["audio_streams"] = list(mapping["audio_streams"])
+    return mapping
+
+
+def _write_parquet_new(
+    path: Path,
+    table: pa.Table,
+    *,
+    parent_fd: int | None = None,
+) -> None:
+    sink = pa.BufferOutputStream()
+    pq.write_table(table, sink)
+    payload = sink.getvalue().to_pybytes()
+    if parent_fd is None:
+        atomic_write_new_bytes(path, payload)
+    else:
+        _atomic_write_new_bytes_at(path, payload, 0o644, parent_fd=parent_fd)
+
+
+def _read_verified_source_parquet(
+    episode: EpisodePlan,
+) -> tuple[pa.Table, str]:
+    fd = os.open(
+        episode.parquet_path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        before = _validate_descriptor_path(
+            fd,
+            episode.parquet_path,
+            expected_type="file",
+            require_single_link=True,
+        )
+        digest = hashlib.sha256()
+        chunks = []
+        os.lseek(fd, 0, os.SEEK_SET)
+        while block := os.read(fd, 1024 * 1024):
+            digest.update(block)
+            chunks.append(block)
+        payload = b"".join(chunks)
+        consumed_sha256 = digest.hexdigest()
+        if len(payload) != before.st_size:
+            raise RuntimeError("source Parquet size changed while being read")
+        if consumed_sha256 != episode.parquet_sha256:
+            raise RuntimeError("source Parquet SHA-256 differs from preflight identity")
+        after_read = _validate_descriptor_path(
+            fd,
+            episode.parquet_path,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (after_read.st_dev, after_read.st_ino, after_read.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ):
+            raise RuntimeError("source Parquet identity changed while being read")
+
+        table = pq.read_table(pa.BufferReader(payload))
+
+        after_decode = _validate_descriptor_path(
+            fd,
+            episode.parquet_path,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (after_decode.st_dev, after_decode.st_ino, after_decode.st_size) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+        ):
+            raise RuntimeError("source Parquet identity changed while being decoded")
+        if _sha256_descriptor(fd) != consumed_sha256:
+            raise RuntimeError("source Parquet changed while being decoded")
+        return table, consumed_sha256
+    finally:
+        os.close(fd)
+
+
+def _feature_metadata() -> dict[str, dict[str, object]]:
+    return {
+        "states": {"dtype": "float32", "shape": [32]},
+        "action": {"dtype": "float32", "shape": [36]},
+        "observation.hand_joints": {
+            "dtype": "float32",
+            "shape": [14],
+            "names": ["hand_joints"],
+        },
+        "observation.arm_joints": {
+            "dtype": "float32",
+            "shape": [14],
+            "names": ["arm_joints"],
+        },
+        "observation.leg_joints": {
+            "dtype": "float32",
+            "shape": [15],
+            "names": ["leg_joints"],
+        },
+        "observation.prev_torso_rpy": {
+            "dtype": "float32",
+            "shape": [3],
+            "names": ["prev_roll", "prev_pitch", "prev_yaw"],
+        },
+        "observation.prev_height": {
+            "dtype": "float32",
+            "shape": [1],
+            "names": ["prev_height"],
+        },
+        "timestamp": {"dtype": "float32", "shape": [1]},
+        "frame_index": {"dtype": "int64", "shape": [1]},
+        "episode_index": {"dtype": "int64", "shape": [1]},
+        "index": {"dtype": "int64", "shape": [1]},
+        "task_index": {"dtype": "int64", "shape": [1]},
+        "next.done": {"dtype": "bool", "shape": [1]},
+    }
+
+
+def _in_progress_status_bytes(staging_metadata: os.stat_result) -> bytes:
+    return canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "staging": {
+                "st_dev": staging_metadata.st_dev,
+                "st_ino": staging_metadata.st_ino,
+            },
+            "state": "in_progress",
+        }
+    )
+
+
+def write_in_progress_status(staging: Path, plan: ConversionPlan) -> None:
+    del plan
+    staging_fd = _open_validated_directory(staging)
+    try:
+        staging_metadata = _validate_descriptor_path(
+            staging_fd,
+            staging,
+            expected_type="directory",
+        )
+        _atomic_write_new_bytes_at(
+            staging / "CONVERSION_STATUS.json",
+            _in_progress_status_bytes(staging_metadata),
+            0o644,
+            parent_fd=staging_fd,
+        )
+        _validate_descriptor_path(
+            staging_fd,
+            staging,
+            expected_type="directory",
+        )
+    finally:
+        os.close(staging_fd)
+
+
+def _validate_in_progress_status_at(staging: Path, staging_fd: int) -> None:
+    staging_metadata = _validate_descriptor_path(
+        staging_fd,
+        staging,
+        expected_type="directory",
+    )
+    if os.listdir(staging_fd) != ["CONVERSION_STATUS.json"]:
+        raise FileExistsError("existing staging tree is not freshly initialized")
+    status_fd = os.open(
+        b"CONVERSION_STATUS.json",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=staging_fd,
+    )
+    try:
+        _validate_descriptor_entry(
+            status_fd,
+            staging_fd,
+            b"CONVERSION_STATUS.json",
+            expected_type="file",
+            require_single_link=True,
+        )
+        os.lseek(status_fd, 0, os.SEEK_SET)
+        payload = b"".join(iter(lambda: os.read(status_fd, 4096), b""))
+        if payload != _in_progress_status_bytes(staging_metadata):
+            raise RuntimeError("staging identity or in_progress status differs")
+    finally:
+        os.close(status_fd)
+    _validate_descriptor_path(
+        staging_fd,
+        staging,
+        expected_type="directory",
+    )
+
+
+def _validate_in_progress_status(staging: Path) -> None:
+    staging_fd = _open_validated_directory(staging)
+    try:
+        _validate_in_progress_status_at(staging, staging_fd)
+    finally:
+        os.close(staging_fd)
+
+
+def _create_pinned_directory(
+    parent_fd: int,
+    parent_path: Path,
+    name: str,
+    *,
+    mode: int = 0o755,
+) -> int:
+    child_path = parent_path / name
+    child_name = _validated_basename(child_path, "directory")
+    _validate_descriptor_path(parent_fd, parent_path, expected_type="directory")
+    os.mkdir(child_name, mode=mode, dir_fd=parent_fd)
+    child_fd = None
+    try:
+        child_fd = os.open(
+            child_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        _validate_descriptor_entry(
+            child_fd,
+            parent_fd,
+            child_name,
+            expected_type="directory",
+        )
+        _validate_descriptor_path(child_fd, child_path, expected_type="directory")
+        fsync_directory(parent_path, directory_fd=parent_fd)
+        _validate_descriptor_path(parent_fd, parent_path, expected_type="directory")
+        return child_fd
+    except BaseException:
+        if child_fd is not None:
+            os.close(child_fd)
+        raise
+
+
+def _validate_input_root(identity: SourceRootIdentity) -> None:
+    fd = _open_validated_directory(identity.path)
+    try:
+        metadata = _validate_descriptor_path(
+            fd,
+            identity.path,
+            expected_type="directory",
+        )
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+            metadata.st_gid,
+            stat.S_IMODE(metadata.st_mode),
+        ) != (
+            identity.st_dev,
+            identity.st_ino,
+            identity.st_uid,
+            identity.st_gid,
+            identity.st_mode,
+        ):
+            raise RuntimeError("input root identity changed after preflight")
+    finally:
+        os.close(fd)
+
+
+def _prepare_staging_root(staging: Path, plan: ConversionPlan) -> None:
+    try:
+        staging.mkdir(mode=0o755)
+    except FileExistsError:
+        _validate_in_progress_status(staging)
+        return
+    write_in_progress_status(staging, plan)
+    _validate_in_progress_status(staging)
+
+
+class _PinnedStagingTree:
+    def __init__(self, staging: Path) -> None:
+        self.staging = staging
+        self.data_path = staging / "data"
+        self.video_path = staging / "videos"
+        self.meta_path = staging / "meta"
+        self._fds: list[int] = []
+        self._chunks: dict[int, tuple[Path, int, Path, int, Path, int]] = {}
+        try:
+            self.staging_fd = self._keep(_open_validated_directory(staging))
+            _validate_in_progress_status_at(staging, self.staging_fd)
+            self.data_fd = self._keep(
+                _create_pinned_directory(self.staging_fd, staging, "data")
+            )
+            self.video_fd = self._keep(
+                _create_pinned_directory(self.staging_fd, staging, "videos")
+            )
+            self.meta_fd = self._keep(
+                _create_pinned_directory(self.staging_fd, staging, "meta")
+            )
+            self.validate_base()
+        except BaseException:
+            self.close()
+            raise
+
+    def _keep(self, fd: int) -> int:
+        self._fds.append(fd)
+        return fd
+
+    def validate_base(self) -> None:
+        _validate_descriptor_path(
+            self.staging_fd,
+            self.staging,
+            expected_type="directory",
+        )
+        _validate_descriptor_entry(
+            self.data_fd,
+            self.staging_fd,
+            b"data",
+            expected_type="directory",
+        )
+        _validate_descriptor_path(
+            self.data_fd,
+            self.data_path,
+            expected_type="directory",
+        )
+        _validate_descriptor_entry(
+            self.video_fd,
+            self.staging_fd,
+            b"videos",
+            expected_type="directory",
+        )
+        _validate_descriptor_path(
+            self.video_fd,
+            self.video_path,
+            expected_type="directory",
+        )
+        _validate_descriptor_entry(
+            self.meta_fd,
+            self.staging_fd,
+            b"meta",
+            expected_type="directory",
+        )
+        _validate_descriptor_path(
+            self.meta_fd,
+            self.meta_path,
+            expected_type="directory",
+        )
+
+    def episode_directories(self, chunk_index: int) -> tuple[Path, int, Path, int]:
+        existing = self._chunks.get(chunk_index)
+        if existing is not None:
+            self._validate_chunk(chunk_index, existing)
+            return existing[0], existing[1], existing[4], existing[5]
+
+        self.validate_base()
+        chunk_name = f"chunk-{chunk_index:03d}"
+        data_chunk_path = self.data_path / chunk_name
+        data_chunk_fd = self._keep(
+            _create_pinned_directory(self.data_fd, self.data_path, chunk_name)
+        )
+        video_chunk_path = self.video_path / chunk_name
+        video_chunk_fd = self._keep(
+            _create_pinned_directory(self.video_fd, self.video_path, chunk_name)
+        )
+        egocentric_path = video_chunk_path / "egocentric"
+        egocentric_fd = self._keep(
+            _create_pinned_directory(
+                video_chunk_fd,
+                video_chunk_path,
+                "egocentric",
+            )
+        )
+        result = (
+            data_chunk_path,
+            data_chunk_fd,
+            video_chunk_path,
+            video_chunk_fd,
+            egocentric_path,
+            egocentric_fd,
+        )
+        self._chunks[chunk_index] = result
+        self._validate_chunk(chunk_index, result)
+        return data_chunk_path, data_chunk_fd, egocentric_path, egocentric_fd
+
+    def _validate_chunk(
+        self,
+        chunk_index: int,
+        directories: tuple[Path, int, Path, int, Path, int],
+    ) -> None:
+        self.validate_base()
+        (
+            data_chunk_path,
+            data_chunk_fd,
+            video_chunk_path,
+            video_chunk_fd,
+            egocentric_path,
+            egocentric_fd,
+        ) = directories
+        chunk_name = f"chunk-{chunk_index:03d}"
+        _validate_descriptor_entry(
+            data_chunk_fd,
+            self.data_fd,
+            chunk_name,
+            expected_type="directory",
+        )
+        _validate_descriptor_path(
+            data_chunk_fd,
+            data_chunk_path,
+            expected_type="directory",
+        )
+        _validate_descriptor_entry(
+            video_chunk_fd,
+            self.video_fd,
+            chunk_name,
+            expected_type="directory",
+        )
+        _validate_descriptor_path(
+            video_chunk_fd,
+            video_chunk_path,
+            expected_type="directory",
+        )
+        _validate_descriptor_entry(
+            egocentric_fd,
+            video_chunk_fd,
+            b"egocentric",
+            expected_type="directory",
+        )
+        _validate_descriptor_path(
+            egocentric_fd,
+            egocentric_path,
+            expected_type="directory",
+        )
+
+    def close(self) -> None:
+        while self._fds:
+            os.close(self._fds.pop())
 
 
 # default history command for the initial state
@@ -1339,7 +2034,9 @@ def write_episode_video(
     output_fps: Fraction,
     output_profile: MediaProfile,
     before_media_publish: Callable[[], None] | None = None,
-) -> MediaIdentity:
+    return_artifact: bool = False,
+    destination_parent_fd: int | None = None,
+) -> MediaIdentity | WrittenMedia:
     if output_fps <= 0:
         raise ValueError("output_fps must be positive")
     retained_count = len(episode.retained_indices)
@@ -1354,9 +2051,18 @@ def write_episode_video(
             raise ValueError(
                 "copy_all episode does not match the dataset media profile"
             )
-        parent_fd = _open_validated_directory(destination.parent)
+        parent_fd = (
+            _open_validated_directory(destination.parent)
+            if destination_parent_fd is None
+            else os.dup(destination_parent_fd)
+        )
         destination_fd = None
         try:
+            _validate_descriptor_path(
+                parent_fd,
+                destination.parent,
+                expected_type="directory",
+            )
             destination_name = _validated_basename(destination, "destination")
             copied_sha256, destination_fd = copy_file_exclusive(
                 episode.video_path,
@@ -1373,7 +2079,7 @@ def write_episode_video(
                 pinned_destination_path,
                 pass_fds=(parent_fd,),
             )
-            _validate_descriptor_entry(
+            final_metadata = _validate_descriptor_entry(
                 destination_fd,
                 parent_fd,
                 destination_name,
@@ -1410,9 +2116,17 @@ def write_episode_video(
                 expected_type="file",
                 require_single_link=True,
             )
-            if _sha256_descriptor(destination_fd) != episode.video_sha256:
+            final_sha256 = _sha256_descriptor(destination_fd)
+            if final_sha256 != episode.video_sha256:
                 raise RuntimeError("copied destination changed before completion")
-            return final_identity
+            artifact = WrittenMedia(
+                identity=final_identity,
+                sha256=final_sha256,
+                st_dev=final_metadata.st_dev,
+                st_ino=final_metadata.st_ino,
+                st_size=final_metadata.st_size,
+            )
+            return artifact if return_artifact else artifact.identity
         finally:
             if destination_fd is not None:
                 os.close(destination_fd)
@@ -1454,7 +2168,16 @@ def write_episode_video(
         )
         pinned_snapshot_path = Path(f"/proc/self/fd/{snapshot_fd}")
 
-        parent_fd = _open_validated_directory(destination.parent)
+        parent_fd = (
+            _open_validated_directory(destination.parent)
+            if destination_parent_fd is None
+            else os.dup(destination_parent_fd)
+        )
+        _validate_descriptor_path(
+            parent_fd,
+            destination.parent,
+            expected_type="directory",
+        )
         destination_name = _validated_basename(destination, "destination")
         private_name = f".{destination.name}.media-{uuid.uuid4().hex}"
         os.mkdir(private_name, mode=0o700, dir_fd=parent_fd)
@@ -1589,7 +2312,7 @@ def write_episode_video(
             destination_name,
             expected_identity=artifact_identity,
         )
-        _validate_descriptor_entry(
+        final_metadata = _validate_descriptor_entry(
             artifact_fd,
             parent_fd,
             destination_name,
@@ -1626,9 +2349,17 @@ def write_episode_video(
             expected_type="file",
             require_single_link=True,
         )
-        if _sha256_descriptor(artifact_fd) != artifact_sha256:
+        final_sha256 = _sha256_descriptor(artifact_fd)
+        if final_sha256 != artifact_sha256:
             raise RuntimeError("published media changed before completion")
-        return final_identity
+        artifact = WrittenMedia(
+            identity=final_identity,
+            sha256=final_sha256,
+            st_dev=final_metadata.st_dev,
+            st_ino=final_metadata.st_ino,
+            st_size=final_metadata.st_size,
+        )
+        return artifact if return_artifact else artifact.identity
     finally:
         if artifact_fd is not None:
             os.close(artifact_fd)
@@ -1639,6 +2370,384 @@ def write_episode_video(
         if snapshot_fd is not None:
             os.close(snapshot_fd)
         os.close(source_fd)
+
+
+def _verify_written_media(
+    path: Path,
+    expected: WrittenMedia,
+    *,
+    output_profile: MediaProfile,
+    retained_count: int,
+    parent_fd: int | None = None,
+) -> WrittenMedia:
+    owned_parent_fd = (
+        _open_validated_directory(path.parent)
+        if parent_fd is None
+        else os.dup(parent_fd)
+    )
+    name = _validated_basename(path, "output video")
+    fd = None
+    try:
+        _validate_descriptor_path(
+            owned_parent_fd,
+            path.parent,
+            expected_type="directory",
+        )
+        fd = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=owned_parent_fd,
+        )
+        before = _validate_descriptor_entry(
+            fd,
+            owned_parent_fd,
+            name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (before.st_dev, before.st_ino, before.st_size) != (
+            expected.st_dev,
+            expected.st_ino,
+            expected.st_size,
+        ):
+            raise RuntimeError("output video identity changed after writing")
+        before_sha256 = _sha256_descriptor(fd)
+        if before_sha256 != expected.sha256:
+            raise RuntimeError("output video SHA-256 changed after writing")
+        identity = probe_media(
+            Path(f"/proc/self/fd/{fd}"),
+            pass_fds=(fd,),
+        )
+        _validate_output_media(
+            identity,
+            output_profile=output_profile,
+            retained_count=retained_count,
+        )
+        if identity != expected.identity:
+            raise RuntimeError("output video media identity changed after writing")
+        after = _validate_descriptor_entry(
+            fd,
+            owned_parent_fd,
+            name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (after.st_dev, after.st_ino, after.st_size) != (
+            expected.st_dev,
+            expected.st_ino,
+            expected.st_size,
+        ):
+            raise RuntimeError("output video identity changed during verification")
+        after_sha256 = _sha256_descriptor(fd)
+        if after_sha256 != before_sha256:
+            raise RuntimeError("output video SHA-256 changed during verification")
+        _validate_descriptor_path(
+            owned_parent_fd,
+            path.parent,
+            expected_type="directory",
+        )
+        return WrittenMedia(
+            identity=identity,
+            sha256=after_sha256,
+            st_dev=after.st_dev,
+            st_ino=after.st_ino,
+            st_size=after.st_size,
+        )
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(owned_parent_fd)
+
+
+def generate_staged_dataset(plan: ConversionPlan, staging: Path) -> None:
+    _prepare_staging_root(staging, plan)
+    tree = _PinnedStagingTree(staging)
+    try:
+        _generate_staged_dataset(plan, tree)
+    finally:
+        tree.close()
+
+
+def _generate_staged_dataset(plan: ConversionPlan, tree: _PinnedStagingTree) -> None:
+    meta_root = tree.meta_path
+
+    tasks = [
+        {
+            "task_index": task["task_index"],
+            "task": task["task"],
+            "category": "",
+            "description": task["task"],
+        }
+        for task in plan.tasks
+    ]
+    task_by_index = {task["task_index"]: task for task in tasks}
+    if len(task_by_index) != len(tasks):
+        raise ValueError("output task indices must be unique")
+
+    episode_rows = []
+    episode_stats_rows = []
+    episode_provenance_digests = []
+    global_values: dict[str, list[np.ndarray]] = {
+        name: []
+        for name in (
+            "states",
+            "action",
+            "timestamp",
+            "frame_index",
+            "episode_index",
+            "index",
+            "task_index",
+            "next.done",
+        )
+    }
+    global_offset = 0
+    output_video_count = 0
+
+    input_root_by_path = {identity.path: identity for identity in plan.input_roots}
+    if len(input_root_by_path) != len(plan.input_roots):
+        raise ValueError("input root identities must have unique paths")
+    for input_root in plan.input_roots:
+        _validate_input_root(input_root)
+
+    for episode in plan.episodes:
+        input_root = input_root_by_path.get(episode.source_root)
+        if input_root is None:
+            raise ValueError("episode source root is absent from the preflight plan")
+        _validate_input_root(input_root)
+        table, consumed_parquet_sha256 = _read_verified_source_parquet(episode)
+        qpos = np.asarray(table["observation.joint_qpos"].to_pylist(), dtype=np.float32)
+        command = np.asarray(
+            table["observation.amo_policy_command"].to_pylist(), dtype=np.float32
+        )
+        target_yaw = np.asarray(
+            table["observation.amo_policy_target_yaw"], dtype=np.float32
+        )
+        turning = np.asarray(
+            table["observation.amo_policy_turning_flag"], dtype=np.float32
+        )
+        action = np.asarray(table["action"].to_pylist(), dtype=np.float32)
+        history = np.concatenate([initial_command[None], command[:-1]], axis=0)
+        states, actions = build_vectors(
+            qpos, command, history, action, target_yaw, turning
+        )
+        hand, arm, leg, torso, height = build_proprio_obs(qpos, history)
+        indices = episode.retained_indices
+        selected = {
+            "states": states[indices],
+            "action": actions[indices],
+            "observation.hand_joints": hand[indices],
+            "observation.arm_joints": arm[indices],
+            "observation.leg_joints": leg[indices],
+            "observation.prev_torso_rpy": torso[indices],
+            "observation.prev_height": height[indices],
+        }
+        output_table = build_output_table(
+            vectors=selected,
+            output_episode_index=episode.output_episode_index,
+            global_offset=global_offset,
+            output_task_index=episode.output_task_index,
+            output_fps=plan.output_fps,
+        )
+        retained_count = len(indices)
+        if output_table.num_rows != retained_count:
+            raise RuntimeError("output row count differs from retained indices")
+
+        chunk_index = episode.output_episode_index // plan.chunks_size
+        (
+            data_directory,
+            data_directory_fd,
+            video_directory,
+            video_directory_fd,
+        ) = tree.episode_directories(chunk_index)
+        data_path = (
+            data_directory / f"episode_{episode.output_episode_index:06d}.parquet"
+        )
+        _write_parquet_new(
+            data_path,
+            output_table,
+            parent_fd=data_directory_fd,
+        )
+
+        video_path = video_directory / f"episode_{episode.output_episode_index:06d}.mp4"
+        written_media = write_episode_video(
+            episode=episode,
+            destination=video_path,
+            media_mode=plan.media_mode,
+            output_fps=plan.output_fps,
+            output_profile=plan.output_media,
+            return_artifact=True,
+            destination_parent_fd=video_directory_fd,
+        )
+        if not isinstance(written_media, WrittenMedia):
+            raise RuntimeError("video writer did not return descriptor-bound evidence")
+        verified_media = _verify_written_media(
+            video_path,
+            written_media,
+            output_profile=plan.output_media,
+            retained_count=retained_count,
+            parent_fd=video_directory_fd,
+        )
+        _validate_input_root(input_root)
+        output_media = verified_media.identity
+        output_video_sha256 = verified_media.sha256
+        output_video_count += 1
+
+        episode_provenance = {
+            "source_episode_index": episode.source_episode_index,
+            "source_parquet_sha256": consumed_parquet_sha256,
+            "source_video_sha256": episode.video_sha256,
+            "requested_video_key": plan.video_key,
+            "requested_output_fps": str(plan.output_fps),
+            "skip": plan.skip,
+            "downsample": plan.downsample,
+            "retained_count": retained_count,
+            "source_media": _media_mapping(episode.source_media),
+            "output_video_sha256": output_video_sha256,
+            "output_media": _media_mapping(output_media),
+            "converter_commit": plan.converter.commit,
+            "converter_script_sha256": plan.converter.script_sha256,
+        }
+        episode_provenance_digests.append(
+            sha256_bytes(canonical_json_bytes(episode_provenance))
+        )
+        instruction = task_by_index.get(episode.output_task_index)
+        if instruction is None or instruction["task"] != episode.task_text:
+            raise ValueError("episode task mapping does not match emitted task")
+        episode_rows.append(
+            {
+                "episode_index": episode.output_episode_index,
+                "tasks": [episode.output_task_index],
+                "length": retained_count,
+                "dataset_from_index": global_offset,
+                "dataset_to_index": global_offset + retained_count - 1,
+                "robot_type": "g1",
+                "instruction": instruction,
+                "environment_config": episode.environment_config,
+                "conversion_provenance": episode_provenance,
+            }
+        )
+
+        table_values = {
+            name: np.asarray(output_table[name].to_pylist()) for name in global_values
+        }
+        table_values["states"] = selected["states"]
+        table_values["action"] = selected["action"]
+        episode_stats_rows.append(
+            {
+                "episode_index": episode.output_episode_index,
+                "stats": {
+                    "action": stats_block(selected["action"]),
+                    "timestamp": stats_block(table_values["timestamp"]),
+                },
+            }
+        )
+        for name, values in table_values.items():
+            if len(values) != retained_count:
+                raise RuntimeError(
+                    f"global accumulator {name!r} has incorrect cardinality"
+                )
+            global_values[name].append(values)
+        global_offset += retained_count
+
+    total_frames = global_offset
+    if output_video_count != len(plan.episodes):
+        raise RuntimeError("output video count differs from episode count")
+    global_stats = {
+        name: stats_block(np.concatenate(parts, axis=0))
+        for name, parts in global_values.items()
+    }
+    if any(block["count"] != [total_frames] for block in global_stats.values()):
+        raise RuntimeError("global statistics count differs from output rows")
+
+    profile = plan.output_media
+    image_feature = {
+        "dtype": "video",
+        "shape": [profile.height, profile.width, 3],
+        "names": ["height", "width", "channel"],
+        "video_info": {
+            "has_audio": bool(profile.audio_streams),
+            "video.channels": 3,
+            "video.codec": profile.codec_name,
+            "video.fps": float(Fraction(profile.average_frame_rate)),
+            "video.height": profile.height,
+            "video.is_depth_map": False,
+            "video.pix_fmt": profile.pixel_format,
+            "video.width": profile.width,
+        },
+    }
+    info = {
+        "codebase_version": "v2.1",
+        "robot_type": "g1",
+        "total_episodes": len(plan.episodes),
+        "total_frames": total_frames,
+        "total_tasks": len(tasks),
+        "total_videos": output_video_count,
+        "total_chunks": math.ceil(len(plan.episodes) / plan.chunks_size),
+        "chunks_size": plan.chunks_size,
+        "fps": float(plan.output_fps),
+        "data_path": (
+            "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+        ),
+        "video_path": (
+            "videos/chunk-{episode_chunk:03d}/egocentric/"
+            "episode_{episode_index:06d}.mp4"
+        ),
+        "features": {
+            "observation.images.egocentric": image_feature,
+            **_feature_metadata(),
+        },
+    }
+
+    input_roots = [
+        {
+            "path": str(identity.path),
+            "st_dev": identity.st_dev,
+            "st_ino": identity.st_ino,
+            "st_uid": identity.st_uid,
+            "st_gid": identity.st_gid,
+            "st_mode": identity.st_mode,
+        }
+        for identity in plan.input_roots
+    ]
+    dataset_provenance = {
+        "converter": asdict(plan.converter),
+        "invocation": {
+            "output_path": str(plan.output_path),
+            "skip": plan.skip,
+            "downsample": plan.downsample,
+            "output_fps": str(plan.output_fps),
+            "video_key": plan.video_key,
+            "chunks_size": plan.chunks_size,
+            "total_episodes": len(plan.episodes),
+        },
+        "input_roots": input_roots,
+        "media_mode": plan.media_mode,
+        "output_media": _media_mapping(plan.output_media),
+        "episode_provenance_sha256": episode_provenance_digests,
+        "output_schema_sha256": output_schema_sha256(),
+    }
+
+    metadata_payloads = {
+        "tasks.jsonl": _canonical_jsonl_bytes(tasks),
+        "episodes.jsonl": _canonical_jsonl_bytes(episode_rows),
+        "episodes_stats.jsonl": _canonical_jsonl_bytes(episode_stats_rows),
+        "info.json": canonical_json_bytes(info),
+        "relative_stats.json": canonical_json_bytes({}),
+        "lang_map.json": canonical_json_bytes({}),
+        "modality.json": canonical_json_bytes(modality_dict()),
+        "conversion_provenance.json": canonical_json_bytes(dataset_provenance),
+    }
+    stats_payload = canonical_json_bytes(global_stats)
+    metadata_payloads["stats.json"] = stats_payload
+    metadata_payloads["stats_psi0.json"] = stats_payload
+    for name, payload in metadata_payloads.items():
+        tree.validate_base()
+        _atomic_write_new_bytes_at(
+            meta_root / name,
+            payload,
+            0o644,
+            parent_fd=tree.meta_fd,
+        )
 
 
 def write_downsampled_video(
