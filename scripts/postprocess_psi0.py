@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 import argparse
+import ctypes
+import errno
+import fcntl
 import glob
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
+import stat
 import subprocess
+import uuid
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 import numpy as np
 import pyarrow as pa
@@ -172,6 +178,365 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_descriptor_path(
+    fd: int,
+    path: Path,
+    *,
+    expected_type: Literal["file", "directory"],
+    require_single_link: bool = False,
+) -> os.stat_result:
+    descriptor = os.fstat(fd)
+    try:
+        pathname = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"opened {expected_type} path disappeared: {path}") from exc
+    predicate = stat.S_ISREG if expected_type == "file" else stat.S_ISDIR
+    if not predicate(descriptor.st_mode) or not predicate(pathname.st_mode):
+        raise RuntimeError(f"unsafe {expected_type}: {path}")
+    if (descriptor.st_dev, descriptor.st_ino) != (pathname.st_dev, pathname.st_ino):
+        raise RuntimeError(f"opened {expected_type} identity changed: {path}")
+    if require_single_link and (descriptor.st_nlink != 1 or pathname.st_nlink != 1):
+        raise RuntimeError(f"opened {expected_type} has unsafe link count: {path}")
+    return descriptor
+
+
+def _sha256_descriptor(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while block := os.read(fd, 1024 * 1024):
+        digest.update(block)
+    return digest.hexdigest()
+
+
+_MFD_CLOEXEC = 0x0001
+_MFD_ALLOW_SEALING = 0x0002
+_F_ADD_SEALS = 1033
+_F_GET_SEALS = 1034
+_REQUIRED_SNAPSHOT_SEALS = 0x0001 | 0x0002 | 0x0004 | 0x0008
+
+
+def _verify_snapshot_seals(fd: int) -> None:
+    try:
+        actual_seals = fcntl.fcntl(fd, _F_GET_SEALS)
+    except OSError as exc:
+        raise RuntimeError("sealed memfd verification failed") from exc
+    if actual_seals & _REQUIRED_SNAPSHOT_SEALS != _REQUIRED_SNAPSHOT_SEALS:
+        raise RuntimeError("sealed memfd is missing required write seals")
+
+
+def _create_sealed_snapshot(source_fd: int, *, expected_sha256: str) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        memfd_create = libc.memfd_create
+    except AttributeError as exc:
+        raise RuntimeError("sealed memfd support is unavailable") from exc
+    memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+    memfd_create.restype = ctypes.c_int
+    snapshot_fd = memfd_create(
+        b"psi0-source-video",
+        _MFD_CLOEXEC | _MFD_ALLOW_SEALING,
+    )
+    if snapshot_fd < 0:
+        error_number = ctypes.get_errno()
+        raise RuntimeError(f"sealed memfd creation failed: {os.strerror(error_number)}")
+    try:
+        if not fcntl.fcntl(snapshot_fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC:
+            raise RuntimeError("sealed memfd is missing close-on-exec")
+        digest = hashlib.sha256()
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        while block := os.read(source_fd, 1024 * 1024):
+            digest.update(block)
+            remaining = memoryview(block)
+            while remaining:
+                written = os.write(snapshot_fd, remaining)
+                if written <= 0:
+                    raise OSError("snapshot copy made no forward progress")
+                remaining = remaining[written:]
+        if digest.hexdigest() != expected_sha256:
+            raise RuntimeError("source video SHA-256 differs during snapshot")
+        os.fsync(snapshot_fd)
+        try:
+            fcntl.fcntl(snapshot_fd, _F_ADD_SEALS, _REQUIRED_SNAPSHOT_SEALS)
+        except OSError as exc:
+            raise RuntimeError("sealed memfd write protection failed") from exc
+        _verify_snapshot_seals(snapshot_fd)
+        os.lseek(snapshot_fd, 0, os.SEEK_SET)
+        return snapshot_fd
+    except BaseException:
+        os.close(snapshot_fd)
+        raise
+
+
+def fsync_directory(path: Path, *, directory_fd: int | None = None) -> None:
+    owns_fd = directory_fd is None
+    fd = _open_validated_directory(path) if owns_fd else directory_fd
+    assert fd is not None
+    try:
+        _validate_descriptor_path(fd, path, expected_type="directory")
+        os.fsync(fd)
+        _validate_descriptor_path(fd, path, expected_type="directory")
+    finally:
+        if owns_fd:
+            os.close(fd)
+
+
+def copy_file_exclusive(
+    source: Path,
+    destination_parent_fd: int,
+    destination_name: bytes,
+    *,
+    expected_sha256: str,
+) -> tuple[str, int]:
+    source_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    destination_flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    source_fd = os.open(source, source_flags)
+    try:
+        _validate_descriptor_path(source_fd, source, expected_type="file")
+        source_digest = _sha256_descriptor(source_fd)
+        if source_digest != expected_sha256:
+            raise RuntimeError("source video SHA-256 differs from preflight identity")
+        os.lseek(source_fd, 0, os.SEEK_SET)
+
+        destination_fd: int | None = os.open(
+            destination_name,
+            destination_flags,
+            0o644,
+            dir_fd=destination_parent_fd,
+        )
+        verify_fd: int | None = None
+        try:
+            assert destination_fd is not None
+            destination_identity = _validate_descriptor_entry(
+                destination_fd,
+                destination_parent_fd,
+                destination_name,
+                expected_type="file",
+                require_single_link=True,
+            )
+            copied_digest = hashlib.sha256()
+            while block := os.read(source_fd, 1024 * 1024):
+                copied_digest.update(block)
+                remaining = memoryview(block)
+                while remaining:
+                    written = os.write(destination_fd, remaining)
+                    if written <= 0:
+                        raise OSError("copy made no forward progress")
+                    remaining = remaining[written:]
+            os.fsync(destination_fd)
+            after_fsync = _validate_descriptor_entry(
+                destination_fd,
+                destination_parent_fd,
+                destination_name,
+                expected_type="file",
+                require_single_link=True,
+            )
+            if (after_fsync.st_dev, after_fsync.st_ino) != (
+                destination_identity.st_dev,
+                destination_identity.st_ino,
+            ):
+                raise RuntimeError("destination video identity changed during copy")
+
+            _validate_descriptor_path(source_fd, source, expected_type="file")
+            if copied_digest.hexdigest() != source_digest:
+                raise RuntimeError("copied video SHA-256 differs from source")
+            verify_fd = os.open(
+                destination_name,
+                source_flags,
+                dir_fd=destination_parent_fd,
+            )
+            reopened_identity = _validate_descriptor_entry(
+                verify_fd,
+                destination_parent_fd,
+                destination_name,
+                expected_type="file",
+                require_single_link=True,
+            )
+            if (reopened_identity.st_dev, reopened_identity.st_ino) != (
+                destination_identity.st_dev,
+                destination_identity.st_ino,
+            ):
+                raise RuntimeError("destination verification identity changed")
+            destination_digest = _sha256_descriptor(verify_fd)
+            if destination_digest != source_digest:
+                raise RuntimeError("destination video SHA-256 differs from source")
+
+            writer_to_close = destination_fd
+            destination_fd = None
+            os.close(writer_to_close)
+            final_identity = _validate_descriptor_entry(
+                verify_fd,
+                destination_parent_fd,
+                destination_name,
+                expected_type="file",
+                require_single_link=True,
+            )
+            if (final_identity.st_dev, final_identity.st_ino) != (
+                destination_identity.st_dev,
+                destination_identity.st_ino,
+            ):
+                raise RuntimeError("destination verification identity changed")
+            if _sha256_descriptor(verify_fd) != destination_digest:
+                raise RuntimeError("destination video changed during verification")
+            result_fd = verify_fd
+            verify_fd = None
+            return destination_digest, result_fd
+        finally:
+            if verify_fd is not None:
+                os.close(verify_fd)
+            if destination_fd is not None:
+                os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+
+
+def _validated_basename(path: Path, label: str) -> bytes:
+    name = path.name
+    if not name or name in (".", "..") or path.parent / name != path:
+        raise ValueError(f"{label} must have a valid basename")
+    return os.fsencode(name)
+
+
+def _open_validated_directory(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        _validate_descriptor_path(fd, path, expected_type="directory")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _validate_descriptor_entry(
+    fd: int,
+    parent_fd: int,
+    name: str | bytes,
+    *,
+    expected_type: Literal["file", "directory"],
+    require_single_link: bool = False,
+) -> os.stat_result:
+    descriptor = os.fstat(fd)
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"opened {expected_type} entry disappeared") from exc
+    predicate = stat.S_ISREG if expected_type == "file" else stat.S_ISDIR
+    if not predicate(descriptor.st_mode) or not predicate(entry.st_mode):
+        raise RuntimeError(f"unsafe {expected_type} entry")
+    if (descriptor.st_dev, descriptor.st_ino) != (entry.st_dev, entry.st_ino):
+        raise RuntimeError(f"opened {expected_type} entry identity changed")
+    if require_single_link and (descriptor.st_nlink != 1 or entry.st_nlink != 1):
+        raise RuntimeError(f"opened {expected_type} entry has unsafe link count")
+    return descriptor
+
+
+def _rename_noreplace_at(
+    source_parent_fd: int,
+    source_name: bytes,
+    destination_parent_fd: int,
+    destination_name: bytes,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
+    source_metadata = os.stat(
+        source_name, dir_fd=source_parent_fd, follow_symlinks=False
+    )
+    if not (
+        stat.S_ISREG(source_metadata.st_mode) or stat.S_ISDIR(source_metadata.st_mode)
+    ):
+        raise RuntimeError("unsafe rename source")
+    if stat.S_ISREG(source_metadata.st_mode) and source_metadata.st_nlink != 1:
+        raise RuntimeError("rename source has unsafe link count")
+    if (
+        expected_identity is not None
+        and (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+        )
+        != expected_identity
+    ):
+        raise RuntimeError("rename source identity changed before publication")
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as exc:
+        raise RuntimeError("renameat2(RENAME_NOREPLACE) is unavailable") from exc
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if (
+        renameat2(
+            source_parent_fd,
+            source_name,
+            destination_parent_fd,
+            destination_name,
+            1,
+        )
+        != 0
+    ):
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number))
+        raise OSError(error_number, os.strerror(error_number))
+
+    destination_metadata = os.stat(
+        destination_name,
+        dir_fd=destination_parent_fd,
+        follow_symlinks=False,
+    )
+    if (destination_metadata.st_dev, destination_metadata.st_ino) != (
+        source_metadata.st_dev,
+        source_metadata.st_ino,
+    ):
+        raise RuntimeError("renamed output identity differs from source")
+    if (
+        stat.S_ISREG(destination_metadata.st_mode)
+        and destination_metadata.st_nlink != 1
+    ):
+        raise RuntimeError("renamed output has unsafe link count")
+
+
+def rename_noreplace(
+    source: Path,
+    destination: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
+    source_name = _validated_basename(source, "source")
+    destination_name = _validated_basename(destination, "destination")
+    source_parent_fd = _open_validated_directory(source.parent)
+    try:
+        destination_parent_fd = _open_validated_directory(destination.parent)
+        try:
+            _rename_noreplace_at(
+                source_parent_fd,
+                source_name,
+                destination_parent_fd,
+                destination_name,
+                expected_identity=expected_identity,
+            )
+            _validate_descriptor_path(
+                source_parent_fd, source.parent, expected_type="directory"
+            )
+            _validate_descriptor_path(
+                destination_parent_fd,
+                destination.parent,
+                expected_type="directory",
+            )
+        finally:
+            os.close(destination_parent_fd)
+    finally:
+        os.close(source_parent_fd)
+
+
 def parse_rate(value: str) -> Fraction:
     try:
         result = Fraction(value)
@@ -219,7 +584,7 @@ def _positive_duration(value: object) -> str:
     return str(duration)
 
 
-def probe_media(path: Path) -> MediaIdentity:
+def probe_media(path: Path, *, pass_fds: tuple[int, ...] = ()) -> MediaIdentity:
     command = [
         "ffprobe",
         "-v",
@@ -237,6 +602,7 @@ def probe_media(path: Path) -> MediaIdentity:
             check=True,
             capture_output=True,
             text=True,
+            pass_fds=pass_fds,
         )
     except FileNotFoundError as exc:
         raise RuntimeError("ffprobe is required but was not found in PATH") from exc
@@ -388,15 +754,73 @@ def _episode_mapping(path: Path) -> dict[int, dict[str, object]]:
     return result
 
 
-def _media_profile(identity: MediaIdentity) -> MediaProfile:
+def media_selection_key(value: MediaIdentity) -> tuple[object, ...]:
+    return (
+        value.codec_name,
+        value.pixel_format,
+        value.width,
+        value.height,
+        value.average_frame_rate,
+        value.nominal_frame_rate,
+        value.audio_streams,
+    )
+
+
+def media_profile(value: MediaIdentity) -> MediaProfile:
     return MediaProfile(
-        codec_name=identity.codec_name,
-        pixel_format=identity.pixel_format,
-        width=identity.width,
-        height=identity.height,
-        average_frame_rate=identity.average_frame_rate,
-        nominal_frame_rate=identity.nominal_frame_rate,
-        audio_streams=identity.audio_streams,
+        codec_name=value.codec_name,
+        pixel_format=value.pixel_format,
+        width=value.width,
+        height=value.height,
+        average_frame_rate=value.average_frame_rate,
+        nominal_frame_rate=value.nominal_frame_rate,
+        audio_streams=value.audio_streams,
+    )
+
+
+def decide_media_mode(
+    episodes: tuple[EpisodePlan, ...],
+    *,
+    skip: int,
+    downsample: int,
+    output_fps: Fraction,
+) -> tuple[Literal["copy_all", "transcode_all"], MediaProfile]:
+    if not episodes:
+        raise ValueError("at least one episode is required")
+    if skip < 0 or downsample <= 0 or output_fps <= 0:
+        raise ValueError("invalid media selection arguments")
+
+    first_source = episodes[0].source_media
+    first_key = media_selection_key(first_source)
+    copy_all = (
+        skip == 0
+        and downsample == 1
+        and all(
+            media_selection_key(episode.source_media) == first_key
+            for episode in episodes
+        )
+        and all(
+            parse_rate(episode.source_media.average_frame_rate) == output_fps
+            and parse_rate(episode.source_media.nominal_frame_rate) == output_fps
+            for episode in episodes
+        )
+        and all(
+            episode.source_media.frame_count == len(episode.retained_indices)
+            for episode in episodes
+        )
+    )
+    if copy_all:
+        return "copy_all", media_profile(first_source)
+
+    requested_rate = str(output_fps)
+    return "transcode_all", MediaProfile(
+        codec_name="h264",
+        pixel_format="yuv420p",
+        width=640,
+        height=360,
+        average_frame_rate=requested_rate,
+        nominal_frame_rate=requested_rate,
+        audio_streams=(),
     )
 
 
@@ -571,29 +995,12 @@ def preflight_conversion(
             )
         )
 
-    source_profiles = [_media_profile(plan.source_media) for plan in plans]
-    requested_rate = str(output_fps)
-    copy_all = (
-        skip == 0
-        and downsample == 1
-        and all(profile == source_profiles[0] for profile in source_profiles)
-        and source_profiles[0].average_frame_rate == requested_rate
-        and source_profiles[0].nominal_frame_rate == requested_rate
+    media_mode, output_media = decide_media_mode(
+        tuple(plans),
+        skip=skip,
+        downsample=downsample,
+        output_fps=output_fps,
     )
-    if copy_all:
-        media_mode: Literal["copy_all", "transcode_all"] = "copy_all"
-        output_media = source_profiles[0]
-    else:
-        media_mode = "transcode_all"
-        output_media = MediaProfile(
-            codec_name="h264",
-            pixel_format="yuv420p",
-            width=640,
-            height=360,
-            average_frame_rate=requested_rate,
-            nominal_frame_rate=requested_rate,
-            audio_streams=(),
-        )
 
     return ConversionPlan(
         output_path=output_path,
@@ -896,6 +1303,342 @@ def build_output_table(
 # default history command for the initial state
 initial_command = np.array([0, 0, 0, 0, 0, 0, 0.74, 0.74, 0.74], dtype=np.float32)
 default_fps = 50
+
+
+def _validate_output_media(
+    identity: MediaIdentity,
+    *,
+    output_profile: MediaProfile,
+    retained_count: int,
+) -> None:
+    if identity.frame_count != retained_count:
+        raise RuntimeError("output media frame count differs from retained rows")
+    if media_profile(identity) != output_profile:
+        raise RuntimeError("output media profile differs from dataset profile")
+
+
+def _select_filter(retained_indices: np.ndarray, output_fps: Fraction) -> str:
+    indices = np.asarray(retained_indices)
+    if (
+        indices.ndim != 1
+        or indices.size == 0
+        or not np.issubdtype(indices.dtype, np.integer)
+        or np.any(indices < 0)
+        or np.any(indices[1:] <= indices[:-1])
+    ):
+        raise ValueError("retained indices must be nonempty increasing integers")
+    selected = "+".join(f"eq(n\\,{int(index)})" for index in indices)
+    return f"select={selected},scale=640:360:flags=lanczos,setpts=N/({output_fps}*TB)"
+
+
+def write_episode_video(
+    *,
+    episode: EpisodePlan,
+    destination: Path,
+    media_mode: Literal["copy_all", "transcode_all"],
+    output_fps: Fraction,
+    output_profile: MediaProfile,
+    before_media_publish: Callable[[], None] | None = None,
+) -> MediaIdentity:
+    if output_fps <= 0:
+        raise ValueError("output_fps must be positive")
+    retained_count = len(episode.retained_indices)
+    if retained_count == 0:
+        raise ValueError("an episode video must contain at least one retained frame")
+
+    if media_mode == "copy_all":
+        if (
+            output_profile != media_profile(episode.source_media)
+            or episode.source_media.frame_count != retained_count
+        ):
+            raise ValueError(
+                "copy_all episode does not match the dataset media profile"
+            )
+        parent_fd = _open_validated_directory(destination.parent)
+        destination_fd = None
+        try:
+            destination_name = _validated_basename(destination, "destination")
+            copied_sha256, destination_fd = copy_file_exclusive(
+                episode.video_path,
+                parent_fd,
+                destination_name,
+                expected_sha256=episode.video_sha256,
+            )
+            if copied_sha256 != episode.video_sha256:
+                raise RuntimeError("copied destination SHA-256 differs from source")
+            pinned_destination_path = Path(
+                f"/proc/self/fd/{parent_fd}/{destination.name}"
+            )
+            output_identity = probe_media(
+                pinned_destination_path,
+                pass_fds=(parent_fd,),
+            )
+            _validate_descriptor_entry(
+                destination_fd,
+                parent_fd,
+                destination_name,
+                expected_type="file",
+                require_single_link=True,
+            )
+            if _sha256_descriptor(destination_fd) != episode.video_sha256:
+                raise RuntimeError("copied destination changed while being probed")
+            _validate_output_media(
+                output_identity,
+                output_profile=output_profile,
+                retained_count=retained_count,
+            )
+            fsync_directory(destination.parent, directory_fd=parent_fd)
+            _validate_descriptor_path(
+                parent_fd, destination.parent, expected_type="directory"
+            )
+            final_identity = probe_media(
+                Path(f"/proc/self/fd/{destination_fd}"),
+                pass_fds=(destination_fd,),
+            )
+            _validate_output_media(
+                final_identity,
+                output_profile=output_profile,
+                retained_count=retained_count,
+            )
+            _validate_descriptor_path(
+                parent_fd, destination.parent, expected_type="directory"
+            )
+            _validate_descriptor_entry(
+                destination_fd,
+                parent_fd,
+                destination_name,
+                expected_type="file",
+                require_single_link=True,
+            )
+            if _sha256_descriptor(destination_fd) != episode.video_sha256:
+                raise RuntimeError("copied destination changed before completion")
+            return final_identity
+        finally:
+            if destination_fd is not None:
+                os.close(destination_fd)
+            os.close(parent_fd)
+    if media_mode != "transcode_all":
+        raise ValueError(f"unsupported media mode: {media_mode!r}")
+
+    canonical_profile = MediaProfile(
+        codec_name="h264",
+        pixel_format="yuv420p",
+        width=640,
+        height=360,
+        average_frame_rate=str(output_fps),
+        nominal_frame_rate=str(output_fps),
+        audio_streams=(),
+    )
+    if output_profile != canonical_profile:
+        raise ValueError("transcode_all requires the canonical output media profile")
+
+    source_fd = os.open(episode.video_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    snapshot_fd = None
+    parent_fd = None
+    private_fd = None
+    artifact_fd = None
+    try:
+        _validate_descriptor_path(source_fd, episode.video_path, expected_type="file")
+        if _sha256_descriptor(source_fd) != episode.video_sha256:
+            raise RuntimeError("source video SHA-256 differs from preflight identity")
+        pinned_source_path = Path(f"/proc/self/fd/{source_fd}")
+        source_media = probe_media(pinned_source_path, pass_fds=(source_fd,))
+        if source_media != episode.source_media:
+            raise RuntimeError("source video media differs from preflight identity")
+        _validate_descriptor_path(source_fd, episode.video_path, expected_type="file")
+        if _sha256_descriptor(source_fd) != episode.video_sha256:
+            raise RuntimeError("source video changed after media validation")
+        snapshot_fd = _create_sealed_snapshot(
+            source_fd,
+            expected_sha256=episode.video_sha256,
+        )
+        pinned_snapshot_path = Path(f"/proc/self/fd/{snapshot_fd}")
+
+        parent_fd = _open_validated_directory(destination.parent)
+        destination_name = _validated_basename(destination, "destination")
+        private_name = f".{destination.name}.media-{uuid.uuid4().hex}"
+        os.mkdir(private_name, mode=0o700, dir_fd=parent_fd)
+        private_fd = os.open(
+            private_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        private_metadata = _validate_descriptor_entry(
+            private_fd,
+            parent_fd,
+            private_name,
+            expected_type="directory",
+        )
+        if stat.S_IMODE(private_metadata.st_mode) != 0o700:
+            raise RuntimeError("private media directory has unsafe metadata")
+        private_directory = destination.parent / private_name
+        fsync_directory(destination.parent, directory_fd=parent_fd)
+        pinned_artifact_path = Path(f"/proc/self/fd/{private_fd}/artifact.mp4")
+        command = [
+            "ffmpeg",
+            "-n",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-i",
+            str(pinned_snapshot_path),
+            "-vf",
+            _select_filter(episode.retained_indices, output_fps),
+            "-vsync",
+            "cfr",
+            "-r",
+            str(output_fps),
+            "-frames:v",
+            str(retained_count),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            str(pinned_artifact_path),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                pass_fds=(snapshot_fd, private_fd),
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg is required but was not found in PATH") from exc
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed for source video: {episode.video_path} "
+                f"(exit code {result.returncode})"
+            )
+        _validate_descriptor_path(source_fd, episode.video_path, expected_type="file")
+        if _sha256_descriptor(source_fd) != episode.video_sha256:
+            raise RuntimeError("source video changed during transcoding")
+        _verify_snapshot_seals(snapshot_fd)
+        if _sha256_descriptor(snapshot_fd) != episode.video_sha256:
+            raise RuntimeError("sealed source snapshot changed during transcoding")
+        artifact_fd = os.open(
+            "artifact.mp4",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=private_fd,
+        )
+        artifact_metadata = _validate_descriptor_entry(
+            artifact_fd,
+            private_fd,
+            "artifact.mp4",
+            expected_type="file",
+            require_single_link=True,
+        )
+        artifact_identity = (artifact_metadata.st_dev, artifact_metadata.st_ino)
+        output_identity = probe_media(
+            pinned_artifact_path,
+            pass_fds=(private_fd,),
+        )
+        _validate_descriptor_entry(
+            artifact_fd,
+            private_fd,
+            "artifact.mp4",
+            expected_type="file",
+            require_single_link=True,
+        )
+        _validate_output_media(
+            output_identity,
+            output_profile=output_profile,
+            retained_count=retained_count,
+        )
+        os.fsync(artifact_fd)
+        _validate_descriptor_entry(
+            artifact_fd,
+            private_fd,
+            "artifact.mp4",
+            expected_type="file",
+            require_single_link=True,
+        )
+        artifact_sha256 = _sha256_descriptor(artifact_fd)
+        fsync_directory(private_directory, directory_fd=private_fd)
+        if before_media_publish is not None:
+            before_media_publish()
+        _validate_descriptor_path(
+            parent_fd, destination.parent, expected_type="directory"
+        )
+        private_metadata = _validate_descriptor_entry(
+            private_fd,
+            parent_fd,
+            private_name,
+            expected_type="directory",
+        )
+        if stat.S_IMODE(private_metadata.st_mode) != 0o700:
+            raise RuntimeError("private media directory mode changed")
+        _validate_descriptor_path(
+            private_fd, private_directory, expected_type="directory"
+        )
+        _validate_descriptor_entry(
+            artifact_fd,
+            private_fd,
+            "artifact.mp4",
+            expected_type="file",
+            require_single_link=True,
+        )
+        if _sha256_descriptor(artifact_fd) != artifact_sha256:
+            raise RuntimeError("validated media artifact changed before publication")
+        _rename_noreplace_at(
+            private_fd,
+            b"artifact.mp4",
+            parent_fd,
+            destination_name,
+            expected_identity=artifact_identity,
+        )
+        _validate_descriptor_entry(
+            artifact_fd,
+            parent_fd,
+            destination_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if _sha256_descriptor(artifact_fd) != artifact_sha256:
+            raise RuntimeError("published media differs from validated artifact")
+        fsync_directory(destination.parent, directory_fd=parent_fd)
+        _validate_descriptor_entry(
+            artifact_fd,
+            parent_fd,
+            destination_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if _sha256_descriptor(artifact_fd) != artifact_sha256:
+            raise RuntimeError("published media changed after parent fsync")
+        os.rmdir(private_name, dir_fd=parent_fd)
+        fsync_directory(destination.parent, directory_fd=parent_fd)
+        final_identity = probe_media(
+            Path(f"/proc/self/fd/{artifact_fd}"),
+            pass_fds=(artifact_fd,),
+        )
+        _validate_output_media(
+            final_identity,
+            output_profile=output_profile,
+            retained_count=retained_count,
+        )
+        _validate_descriptor_entry(
+            artifact_fd,
+            parent_fd,
+            destination_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if _sha256_descriptor(artifact_fd) != artifact_sha256:
+            raise RuntimeError("published media changed before completion")
+        return final_identity
+    finally:
+        if artifact_fd is not None:
+            os.close(artifact_fd)
+        if private_fd is not None:
+            os.close(private_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        if snapshot_fd is not None:
+            os.close(snapshot_fd)
+        os.close(source_fd)
 
 
 def write_downsampled_video(
