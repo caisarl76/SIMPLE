@@ -359,6 +359,23 @@ def _validate_conversion_anchor_metadata(metadata: os.stat_result) -> None:
 _INHERITED_CONVERSION_LOCK_FDS: set[int] = set()
 
 
+@dataclass(frozen=True)
+class _ConversionLockOwnership:
+    pid: int
+    lock_fd: int
+    lock_identity: tuple[int, int]
+    parent_fd: int
+    parent_identity: tuple[int, int]
+
+
+_OWNED_CONVERSION_LOCKS: dict[Path, _ConversionLockOwnership] = {}
+
+
+def _conversion_lock_key(output: Path) -> Path:
+    _validated_basename(output, "conversion output")
+    return output.parent.resolve(strict=True) / output.name
+
+
 def _close_inherited_conversion_lock_fds() -> None:
     for fd in tuple(_INHERITED_CONVERSION_LOCK_FDS):
         try:
@@ -366,9 +383,43 @@ def _close_inherited_conversion_lock_fds() -> None:
         except OSError:
             pass
     _INHERITED_CONVERSION_LOCK_FDS.clear()
+    _OWNED_CONVERSION_LOCKS.clear()
 
 
 os.register_at_fork(after_in_child=_close_inherited_conversion_lock_fds)
+
+
+def assert_conversion_lock_held(output: Path) -> None:
+    key = _conversion_lock_key(output)
+    ownership = _OWNED_CONVERSION_LOCKS.get(key)
+    if ownership is None or ownership.pid != os.getpid():
+        raise RuntimeError("certification requires the active conversion lock")
+    try:
+        lock_metadata = os.fstat(ownership.lock_fd)
+        parent_metadata = os.fstat(ownership.parent_fd)
+    except OSError as exc:
+        raise RuntimeError("conversion lock ownership descriptor is invalid") from exc
+    if (lock_metadata.st_dev, lock_metadata.st_ino) != ownership.lock_identity or (
+        parent_metadata.st_dev,
+        parent_metadata.st_ino,
+    ) != ownership.parent_identity:
+        raise RuntimeError("conversion lock ownership identity changed")
+    _validate_conversion_lock_metadata(lock_metadata)
+    lock_name = _validated_basename(
+        output.parent / f".{output.name}.conversion.lock", "conversion lock"
+    )
+    visible = _validate_descriptor_entry(
+        ownership.lock_fd,
+        ownership.parent_fd,
+        lock_name,
+        expected_type="file",
+        require_single_link=True,
+    )
+    if (visible.st_dev, visible.st_ino) != ownership.lock_identity:
+        raise RuntimeError("visible conversion lock identity changed")
+    _validate_descriptor_path(
+        ownership.parent_fd, output.parent, expected_type="directory"
+    )
 
 
 @contextlib.contextmanager
@@ -382,6 +433,8 @@ def conversion_lock(output: Path):
     _INHERITED_CONVERSION_LOCK_FDS.add(parent_fd)
     anchor_fd = None
     fd = None
+    key = None
+    ownership = None
     try:
         _validate_descriptor_path(parent_fd, output.parent, expected_type="directory")
         try:
@@ -446,6 +499,18 @@ def conversion_lock(output: Path):
         )
         _validate_conversion_lock_metadata(locked)
         _validate_descriptor_path(parent_fd, output.parent, expected_type="directory")
+        key = _conversion_lock_key(output)
+        if key in _OWNED_CONVERSION_LOCKS:
+            raise RuntimeError("conversion lock is already registered")
+        parent_metadata = os.fstat(parent_fd)
+        ownership = _ConversionLockOwnership(
+            pid=owner_pid,
+            lock_fd=fd,
+            lock_identity=(locked.st_dev, locked.st_ino),
+            parent_fd=parent_fd,
+            parent_identity=(parent_metadata.st_dev, parent_metadata.st_ino),
+        )
+        _OWNED_CONVERSION_LOCKS[key] = ownership
         try:
             yield fd
         finally:
@@ -477,6 +542,8 @@ def conversion_lock(output: Path):
                 )
     finally:
         if os.getpid() == owner_pid:
+            if key is not None and _OWNED_CONVERSION_LOCKS.get(key) == ownership:
+                del _OWNED_CONVERSION_LOCKS[key]
             if fd is not None:
                 _INHERITED_CONVERSION_LOCK_FDS.discard(fd)
                 os.close(fd)
@@ -3376,6 +3443,19 @@ def generate_staged_dataset(plan: ConversionPlan, staging: Path) -> None:
         _generate_staged_dataset(plan, tree)
     finally:
         tree.close()
+
+
+def validate_staged_dataset(staging: Path, plan: ConversionPlan):
+    # Import lazily to keep the validator's dependency on this module acyclic.
+    # The conversion orchestrator calls this after generation and immediately
+    # before durable publication.
+    from scripts.certify_psi0_dataset import DatasetExpectations, validate_dataset
+
+    return validate_dataset(
+        staging,
+        expected=DatasetExpectations.from_plan(plan),
+        require_final_modes=False,
+    )
 
 
 def _canonical_tree_paths(
