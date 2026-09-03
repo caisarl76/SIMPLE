@@ -348,34 +348,61 @@ Before publication, while retaining the conversion lock, the converter:
 
 1. flushes and closes every payload writer;
 2. validates the complete staged dataset;
-3. enumerates the exact payload membership and writes the canonical manifest;
-4. atomically replaces `CONVERSION_STATUS.json` with the complete record by
-   fsyncing its temporary regular file, renaming it, and fsyncing the staging
+3. enumerates exact payload membership, writes the canonical manifest through a
+   temporary regular file, fsyncs it, renames it into place, and fsyncs the
+   `meta` directory;
+4. while `CONVERSION_STATUS.json` remains writable and `in_progress`, reopens
+   every manifest-covered file, the manifest, and the status with no-follow
+   semantics and successfully calls `fsync` on each one;
+5. fsyncs every canonical directory bottom-up, ending with the writable staging
    root;
-5. normalizes every canonical regular file to mode `0444` and every canonical
+6. revalidates exact membership, hashes, file types, link counts, manifest
+   content, and the still-`in_progress` status;
+7. persists the complete record by writing and fsyncing a temporary regular
+   file, atomically replacing `CONVERSION_STATUS.json`, and fsyncing the staging
+   root; successful completion of this root fsync is the durable-completion
+   boundary;
+8. normalizes every canonical regular file to mode `0444` and every canonical
    directory to mode `0555`;
-6. reopens every manifest-covered file, the manifest, and the complete status
-   with no-follow semantics and successfully calls `fsync` on each one;
-7. fsyncs every canonical directory bottom-up, ending with the staging root;
-8. revalidates exact membership, hashes, modes, file types, link counts, and the
-   complete record;
-9. rechecks that the canonical destination is absent;
-10. publishes with atomic `renameat2(RENAME_NOREPLACE)` on the same filesystem;
-11. fsyncs the destination parent directory.
+9. reopens every canonical file with no-follow semantics and fsyncs it to make
+   mode changes durable, then fsyncs every canonical directory bottom-up;
+10. revalidates exact membership, hashes, final modes, file types, link counts,
+    and the durable complete record;
+11. rechecks that the canonical destination is absent;
+12. publishes with atomic `renameat2(RENAME_NOREPLACE)` on the same filesystem;
+13. fsyncs the destination parent directory.
 
 Failure to open or fsync any generated Parquet, video, metadata, provenance,
 manifest, or status file aborts publication. Directory fsync alone is not
 sufficient. The implementation fails closed if atomic no-replace rename cannot
 be guaranteed.
 
-On a caught pre-publication failure, the canonical destination remains absent.
-When the staging root remains writable, `CONVERSION_STATUS.json` is atomically
-replaced with state `failed`, the phase, and error using `allow_nan=False`. A
-process crash can leave a staging directory in `in_progress` or even `complete`
-state; any such directory remains noncanonical and is never adopted or removed
-automatically. A later run creates a new staging directory only after acquiring
-the stable lock. The implementation plan defines an explicit inspection and
-authorized-removal command for preserved staging artifacts.
+Failures are classified relative to the durable-completion boundary:
+
+- Before step 7 begins, the staging tree is writable and `in_progress`. A
+  caught failure atomically replaces the status with `failed`, fsyncs that file
+  and the staging root, and preserves the staging tree. It is
+  `pre_completion_failed`.
+- A failure or crash during the temporary-file fsync, status rename, or staging
+  root fsync in step 7 is `completion_uncertain_unpublished`. It is never
+  treated as durably complete, even if a complete-looking status pathname is
+  visible.
+- After step 7's root fsync and before the publication rename, the only legal
+  durable status is `complete`. A seal, file-fsync, directory-fsync, final
+  validation, or rename failure leaves `complete_unpublished`. The converter
+  does not attempt to replace it with `failed`, including when directories are
+  already `0555`.
+- If rename succeeds but the destination-parent fsync does not, the result is
+  `publication_uncertain`: the visible tree remains immutable and uncertified.
+  A later certifier must acquire the stable lock, validate the complete tree,
+  and establish current parent durability before it may create sibling
+  evidence.
+
+All four non-success states return nonzero. Preserved staging trees are never
+adopted or removed automatically. A later conversion creates a new staging
+directory only after acquiring the stable lock and still requires the canonical
+destination to be absent. The implementation plan defines an explicit
+inspection and authorized-removal command for preserved staging artifacts.
 
 ### Immutable dataset and sibling certification evidence
 
@@ -512,8 +539,20 @@ Implementation follows test-driven development. New tests are written and observ
 - prove that preflight failures create no output or staging path;
 - use real processes to prove lock contention creates no staging path and that
   a holder terminated with `_exit` releases the stable lock for a new process;
-- inject failures during Parquet, video, metadata, and validation phases and
-  require a `failed` staging-status record with no canonical output;
+- inject failures during Parquet, video, metadata, payload-file fsync,
+  directory fsync, and pre-completion validation and require
+  `pre_completion_failed` with a durable `failed` status and no canonical
+  output;
+- prove a complete status is not persisted until every payload/manifest file
+  fsync, bottom-up directory fsync, and pre-completion revalidation succeeds;
+- inject immediately before and after the complete temporary-file fsync,
+  status rename, and staging-root fsync and require the defined
+  `completion_uncertain_unpublished` or durable-complete classification;
+- inject after durable completion at every seal, final file/directory fsync,
+  final validation, and immediately-before-rename boundary and require
+  `complete_unpublished` without any attempted failed-status rewrite;
+- inject after rename but before destination-parent fsync and require immutable
+  `publication_uncertain` handling;
 - reject an existing final destination;
 - prove every manifest-covered file and both reserved files are fsynced before
   bottom-up directory fsync, durable complete state, rename, and parent fsync;
@@ -540,7 +579,9 @@ Implementation follows test-driven development. New tests are written and observ
 - `tests/test_postprocess_psi0.py`
 - focused new converter test modules if splitting them improves isolation
 - a focused offline certification script or module if keeping it outside the converter makes the validation boundary clearer
-- generated certification evidence under the fresh output or its sibling evidence directory
+- generated certification evidence exclusively in the manifest-bound sibling
+  evidence roots; no certification artifact is written beneath the canonical
+  dataset
 
 No simulator, robot-control, PC2 bridge, dedicated-runtime, PSI0 training, or third-person-camera source is modified by this work.
 
