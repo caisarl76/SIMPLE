@@ -10,6 +10,7 @@ import subprocess
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pyarrow as pa
@@ -21,6 +22,73 @@ from tqdm import tqdm
 class ConverterIdentity:
     commit: str
     script_sha256: str
+
+
+@dataclass(frozen=True)
+class MediaIdentity:
+    codec_name: str
+    pixel_format: str
+    width: int
+    height: int
+    average_frame_rate: str
+    nominal_frame_rate: str
+    duration: str
+    frame_count: int
+    audio_streams: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class MediaProfile:
+    codec_name: str
+    pixel_format: str
+    width: int
+    height: int
+    average_frame_rate: str
+    nominal_frame_rate: str
+    audio_streams: tuple[dict[str, object], ...]
+
+
+@dataclass(frozen=True)
+class EpisodePlan:
+    source_root: Path
+    source_episode_index: int
+    output_episode_index: int
+    parquet_path: Path
+    video_path: Path
+    parquet_sha256: str
+    video_sha256: str
+    frame_count: int
+    retained_indices: np.ndarray
+    source_task_index: int
+    output_task_index: int
+    task_text: str
+    environment_config: str
+    source_media: MediaIdentity
+
+
+@dataclass(frozen=True)
+class ConversionPlan:
+    output_path: Path
+    output_fps: Fraction
+    skip: int
+    downsample: int
+    chunks_size: int
+    video_key: str
+    media_mode: Literal["copy_all", "transcode_all"]
+    output_media: MediaProfile
+    tasks: tuple[dict[str, object], ...]
+    episodes: tuple[EpisodePlan, ...]
+    converter: ConverterIdentity
+
+
+REQUIRED_SOURCE_TYPES = {
+    "observation.joint_qpos": pa.list_(pa.float32(), 43),
+    "observation.amo_policy_command": pa.list_(pa.float32(), 9),
+    "observation.amo_policy_target_yaw": pa.float32(),
+    "observation.amo_policy_turning_flag": pa.float32(),
+    "action": pa.list_(pa.float32(), 43),
+    "task_index": pa.int64(),
+}
 
 
 # joint orders are re-ordered to match G1Sonic.joint_names
@@ -102,6 +170,444 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def parse_rate(value: str) -> Fraction:
+    try:
+        result = Fraction(value)
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ValueError(f"invalid media rate: {value!r}") from exc
+    if result <= 0:
+        raise ValueError(f"media rate must be positive: {value!r}")
+    return result
+
+
+def _required_string(mapping: dict[str, object], field: str) -> str:
+    value = mapping.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"media field {field!r} must be a nonempty string")
+    return value
+
+
+def _positive_integer(value: object, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"media field {field!r} must be a positive integer")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"media field {field!r} must be a positive integer") from exc
+    if result <= 0 or str(result) != str(value):
+        raise ValueError(f"media field {field!r} must be a positive integer")
+    return result
+
+
+def _optional_frame_count(value: object, field: str) -> int | None:
+    if value is None or value in ("", "N/A"):
+        return None
+    return _positive_integer(value, field)
+
+
+def _positive_duration(value: object) -> str:
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        raise ValueError("media duration must be a positive finite number")
+    try:
+        duration = Fraction(str(value))
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ValueError("media duration must be a positive finite number") from exc
+    if duration <= 0:
+        raise ValueError("media duration must be a positive finite number")
+    return str(duration)
+
+
+def probe_media(path: Path) -> MediaIdentity:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-count_frames",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffprobe is required but was not found in PATH") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"ffprobe failed for source video: {path}") from exc
+
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("ffprobe returned malformed JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("streams"), list):
+        raise ValueError("ffprobe output must contain a stream list")
+    streams = payload["streams"]
+    if not all(isinstance(stream, dict) for stream in streams):
+        raise ValueError("ffprobe stream entries must be objects")
+    video_streams = [
+        stream for stream in streams if stream.get("codec_type") == "video"
+    ]
+    if len(video_streams) != 1:
+        raise ValueError("source media must contain exactly one video stream")
+    video = video_streams[0]
+
+    average_rate = parse_rate(_required_string(video, "avg_frame_rate"))
+    nominal_rate = parse_rate(_required_string(video, "r_frame_rate"))
+    if average_rate != nominal_rate:
+        raise ValueError("source video frame rate is ambiguous")
+
+    read_frames = _optional_frame_count(video.get("nb_read_frames"), "nb_read_frames")
+    declared_frames = _optional_frame_count(video.get("nb_frames"), "nb_frames")
+    if read_frames is None:
+        if declared_frames is None:
+            raise ValueError("source video frame count is unavailable")
+        frame_count = declared_frames
+    else:
+        if declared_frames is not None and declared_frames != read_frames:
+            raise ValueError("source video frame counts disagree")
+        frame_count = read_frames
+
+    duration_value = video.get("duration")
+    if duration_value in (None, "", "N/A"):
+        media_format = payload.get("format")
+        if not isinstance(media_format, dict):
+            raise ValueError("ffprobe output is missing media duration")
+        duration_value = media_format.get("duration")
+    duration = _positive_duration(duration_value)
+
+    audio_streams = []
+    for stream in streams:
+        if stream.get("codec_type") != "audio":
+            continue
+        audio_streams.append(
+            {
+                "codec_name": _required_string(stream, "codec_name"),
+                "sample_fmt": _required_string(stream, "sample_fmt"),
+                "sample_rate": _positive_integer(
+                    stream.get("sample_rate"), "sample_rate"
+                ),
+                "channels": _positive_integer(stream.get("channels"), "channels"),
+                "channel_layout": _required_string(stream, "channel_layout"),
+            }
+        )
+
+    return MediaIdentity(
+        codec_name=_required_string(video, "codec_name"),
+        pixel_format=_required_string(video, "pix_fmt"),
+        width=_positive_integer(video.get("width"), "width"),
+        height=_positive_integer(video.get("height"), "height"),
+        average_frame_rate=str(average_rate),
+        nominal_frame_rate=str(nominal_rate),
+        duration=duration,
+        frame_count=frame_count,
+        audio_streams=tuple(audio_streams),
+    )
+
+
+def _require_nonnegative_integer(value: object, name: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
+    return value
+
+
+def _require_positive_integer(value: object, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _load_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise RuntimeError(f"could not read metadata: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"metadata must contain a JSON object: {path}")
+    return value
+
+
+def _task_mapping(path: Path) -> dict[int, str]:
+    rows = load_jsonl(path)
+    result = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("task metadata rows must be objects")
+        task_index = row.get("task_index")
+        if type(task_index) is not int or task_index < 0:
+            raise ValueError("task_index must be a nonnegative integer")
+        task = row.get("task")
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("task must be a nonempty string")
+        if task_index in result:
+            raise ValueError(f"duplicate task_index: {task_index}")
+        result[task_index] = task
+    return result
+
+
+def _episode_mapping(path: Path) -> dict[int, dict[str, object]]:
+    rows = load_jsonl(path)
+    result = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("episode metadata rows must be objects")
+        episode_index = row.get("episode_index")
+        if type(episode_index) is not int or episode_index < 0:
+            raise ValueError("episode_index must be a nonnegative integer")
+        length = row.get("length")
+        if type(length) is not int or length <= 0:
+            raise ValueError("episode length must be a positive integer")
+        tasks = row.get("tasks")
+        if (
+            not isinstance(tasks, list)
+            or not tasks
+            or any(not isinstance(task, str) or not task.strip() for task in tasks)
+        ):
+            raise ValueError("episode tasks must be a nonempty list of strings")
+        environment_config = row.get("environment_config")
+        if not isinstance(environment_config, str):
+            raise ValueError("environment_config must be a JSON string")
+
+        def reject_nonfinite_json(value: str) -> None:
+            raise ValueError(f"invalid JSON constant: {value}")
+
+        try:
+            json.loads(environment_config, parse_constant=reject_nonfinite_json)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError("environment_config must contain valid JSON") from exc
+        if episode_index in result:
+            raise ValueError(f"duplicate episode_index: {episode_index}")
+        result[episode_index] = row
+    return result
+
+
+def _media_profile(identity: MediaIdentity) -> MediaProfile:
+    return MediaProfile(
+        codec_name=identity.codec_name,
+        pixel_format=identity.pixel_format,
+        width=identity.width,
+        height=identity.height,
+        average_frame_rate=identity.average_frame_rate,
+        nominal_frame_rate=identity.nominal_frame_rate,
+        audio_streams=identity.audio_streams,
+    )
+
+
+def _validate_timestamp_range(output_fps: Fraction, row_count: int) -> None:
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            maximum = np.asarray(
+                [Fraction(row_count - 1, 1) / output_fps], dtype=np.float32
+            )
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("requested FPS produces nonfinite float32 timestamps") from exc
+    if not np.isfinite(maximum).all():
+        raise ValueError("requested FPS produces nonfinite float32 timestamps")
+
+
+def preflight_conversion(
+    args: argparse.Namespace, converter: ConverterIdentity
+) -> ConversionPlan:
+    skip = _require_nonnegative_integer(args.skip, "skip")
+    downsample = _require_positive_integer(args.downsample, "downsample")
+    chunks_size = _require_positive_integer(args.chunks_size, "chunks_size")
+    total_episodes = _require_positive_integer(args.total_episodes, "total_episodes")
+    output_fps = parse_rate(str(args.fps))
+    video_key = args.video_key
+    if (
+        not isinstance(video_key, str)
+        or not video_key.strip()
+        or Path(video_key).name != video_key
+    ):
+        raise ValueError("video_key must be one nonempty path component")
+
+    requested_output = Path(args.out_dir).expanduser()
+    if requested_output.exists() or requested_output.is_symlink():
+        raise FileExistsError(f"destination already exists: {requested_output}")
+    output_path = requested_output.resolve(strict=False)
+
+    matched_roots = glob.glob(str(args.sim_root))
+    if not matched_roots:
+        raise ValueError(f"no source roots matched: {args.sim_root}")
+    source_roots = sorted(
+        {Path(match).expanduser().resolve(strict=True) for match in matched_roots}
+    )
+
+    candidates = []
+    for source_root in source_roots:
+        if not source_root.is_dir():
+            raise ValueError(f"source root is not a directory: {source_root}")
+        metadata_paths = {
+            name: source_root / "meta" / name
+            for name in ("info.json", "tasks.jsonl", "episodes.jsonl")
+        }
+        for path in metadata_paths.values():
+            if not path.is_file():
+                raise ValueError(f"required metadata file is missing: {path}")
+        _load_json_object(metadata_paths["info.json"])
+        tasks = _task_mapping(metadata_paths["tasks.jsonl"])
+        episodes = _episode_mapping(metadata_paths["episodes.jsonl"])
+
+        data_files = sorted((source_root / "data").glob("chunk-*/episode_*.parquet"))
+        seen_episode_indices = set()
+        for parquet_path in data_files:
+            match = re.fullmatch(r"episode_(\d+)", parquet_path.stem)
+            if match is None:
+                raise ValueError(f"invalid source episode filename: {parquet_path}")
+            source_episode_index = int(match.group(1))
+            if source_episode_index in seen_episode_indices:
+                raise ValueError(
+                    f"duplicate source episode index: {source_episode_index}"
+                )
+            seen_episode_indices.add(source_episode_index)
+            candidates.append(
+                (
+                    source_root,
+                    source_episode_index,
+                    parquet_path.resolve(strict=True),
+                    tasks,
+                    episodes,
+                )
+            )
+
+    selected_candidates = candidates[:total_episodes]
+    if not selected_candidates:
+        raise ValueError("no source episodes were found")
+
+    plans = []
+    output_tasks = []
+    output_task_by_text = {}
+    for (
+        source_root,
+        source_episode_index,
+        parquet_path,
+        tasks,
+        episodes,
+    ) in selected_candidates:
+        schema = pq.read_schema(parquet_path)
+        for name, expected_type in REQUIRED_SOURCE_TYPES.items():
+            index = schema.get_field_index(name)
+            if index < 0:
+                raise ValueError(f"required source column is missing: {name}")
+            actual_type = schema.field(index).type
+            if actual_type != expected_type:
+                raise ValueError(
+                    f"source column {name!r} has type {actual_type}, "
+                    f"expected {expected_type}"
+                )
+
+        parquet_file = pq.ParquetFile(parquet_path)
+        frame_count = parquet_file.metadata.num_rows
+        task_table = pq.read_table(parquet_path, columns=["task_index"])
+        if len(task_table) != frame_count:
+            raise ValueError("task_index row count does not match Parquet metadata")
+        task_values = task_table["task_index"].to_pylist()
+        if not task_values or any(type(value) is not int for value in task_values):
+            raise ValueError("task_index values must be int64 values")
+        source_task_index = task_values[0]
+        if any(value != source_task_index for value in task_values):
+            raise ValueError("task_index must be constant within an episode")
+
+        retained_indices = make_retained_indices(frame_count, skip, downsample)
+        retained_indices.setflags(write=False)
+        _validate_timestamp_range(output_fps, len(retained_indices))
+
+        video_candidates = sorted(
+            path.resolve(strict=True)
+            for path in (source_root / "videos").glob(
+                f"chunk-*/{video_key}/episode_{source_episode_index:06d}.mp4"
+            )
+            if path.is_file()
+        )
+        if len(video_candidates) != 1:
+            raise ValueError(
+                "source episode must have exactly one matching video candidate"
+            )
+        video_path = video_candidates[0]
+        source_media = probe_media(video_path)
+        if source_media.frame_count != frame_count:
+            raise ValueError("source video and Parquet frame counts differ")
+
+        task_text = tasks.get(source_task_index)
+        if task_text is None:
+            raise ValueError(f"task metadata lookup failed: {source_task_index}")
+        episode = episodes.get(source_episode_index)
+        if episode is None:
+            raise ValueError(f"episode metadata lookup failed: {source_episode_index}")
+        if episode["length"] != frame_count:
+            raise ValueError("episode metadata length does not match Parquet rows")
+        if task_text not in episode["tasks"]:
+            raise ValueError("episode task metadata does not match task_index")
+
+        output_task_index = output_task_by_text.get(task_text)
+        if output_task_index is None:
+            output_task_index = len(output_tasks)
+            output_task_by_text[task_text] = output_task_index
+            output_tasks.append({"task_index": output_task_index, "task": task_text})
+
+        plans.append(
+            EpisodePlan(
+                source_root=source_root,
+                source_episode_index=source_episode_index,
+                output_episode_index=len(plans),
+                parquet_path=parquet_path,
+                video_path=video_path,
+                parquet_sha256=sha256_file(parquet_path),
+                video_sha256=sha256_file(video_path),
+                frame_count=frame_count,
+                retained_indices=retained_indices,
+                source_task_index=source_task_index,
+                output_task_index=output_task_index,
+                task_text=task_text,
+                environment_config=episode["environment_config"],
+                source_media=source_media,
+            )
+        )
+
+    source_profiles = [_media_profile(plan.source_media) for plan in plans]
+    requested_rate = str(output_fps)
+    copy_all = (
+        skip == 0
+        and downsample == 1
+        and all(profile == source_profiles[0] for profile in source_profiles)
+        and source_profiles[0].average_frame_rate == requested_rate
+        and source_profiles[0].nominal_frame_rate == requested_rate
+    )
+    if copy_all:
+        media_mode: Literal["copy_all", "transcode_all"] = "copy_all"
+        output_media = source_profiles[0]
+    else:
+        media_mode = "transcode_all"
+        output_media = MediaProfile(
+            codec_name="h264",
+            pixel_format="yuv420p",
+            width=640,
+            height=360,
+            average_frame_rate=requested_rate,
+            nominal_frame_rate=requested_rate,
+            audio_streams=(),
+        )
+
+    return ConversionPlan(
+        output_path=output_path,
+        output_fps=output_fps,
+        skip=skip,
+        downsample=downsample,
+        chunks_size=chunks_size,
+        video_key=video_key,
+        media_mode=media_mode,
+        output_media=output_media,
+        tasks=tuple(output_tasks),
+        episodes=tuple(plans),
+        converter=converter,
+    )
 
 
 def resolve_converter_commit(repository_root: Path) -> str:
