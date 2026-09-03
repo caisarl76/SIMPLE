@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import ctypes
 import errno
 import fcntl
@@ -298,6 +299,682 @@ def fsync_directory(path: Path, *, directory_fd: int | None = None) -> None:
     finally:
         if owns_fd:
             os.close(fd)
+
+
+def _validate_conversion_lock_metadata(metadata: os.stat_result) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError("conversion lock is not a regular file")
+    if metadata.st_uid != os.getuid():
+        raise RuntimeError("conversion lock has wrong owner")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise RuntimeError("conversion lock has wrong mode")
+    if metadata.st_nlink != 1:
+        raise RuntimeError("conversion lock has wrong link count")
+
+
+def _validate_conversion_anchor_metadata(metadata: os.stat_result) -> None:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError("conversion lock anchor is not a directory")
+    if metadata.st_uid != os.getuid():
+        raise RuntimeError("conversion lock anchor has wrong owner")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise RuntimeError("conversion lock anchor has wrong mode")
+
+
+_INHERITED_CONVERSION_LOCK_FDS: set[int] = set()
+
+
+def _close_inherited_conversion_lock_fds() -> None:
+    for fd in tuple(_INHERITED_CONVERSION_LOCK_FDS):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _INHERITED_CONVERSION_LOCK_FDS.clear()
+
+
+os.register_at_fork(after_in_child=_close_inherited_conversion_lock_fds)
+
+
+@contextlib.contextmanager
+def conversion_lock(output: Path):
+    owner_pid = os.getpid()
+    lock_path = output.parent / f".{output.name}.conversion.lock"
+    lock_name = _validated_basename(lock_path, "conversion lock")
+    anchor_path = output.parent / f".{output.name}.conversion.lock-anchor"
+    anchor_name = _validated_basename(anchor_path, "conversion lock anchor")
+    parent_fd = _open_validated_directory(output.parent)
+    _INHERITED_CONVERSION_LOCK_FDS.add(parent_fd)
+    anchor_fd = None
+    fd = None
+    try:
+        _validate_descriptor_path(parent_fd, output.parent, expected_type="directory")
+        try:
+            os.mkdir(anchor_name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        else:
+            fsync_directory(output.parent, directory_fd=parent_fd)
+        anchor_fd = os.open(
+            anchor_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        _INHERITED_CONVERSION_LOCK_FDS.add(anchor_fd)
+        anchor_metadata = _validate_descriptor_entry(
+            anchor_fd,
+            parent_fd,
+            anchor_name,
+            expected_type="directory",
+        )
+        _validate_conversion_anchor_metadata(anchor_metadata)
+        _validate_descriptor_path(
+            anchor_fd,
+            anchor_path,
+            expected_type="directory",
+        )
+        fcntl.flock(anchor_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked_anchor = _validate_descriptor_entry(
+            anchor_fd,
+            parent_fd,
+            anchor_name,
+            expected_type="directory",
+        )
+        _validate_conversion_anchor_metadata(locked_anchor)
+        _validate_descriptor_path(
+            anchor_fd,
+            anchor_path,
+            expected_type="directory",
+        )
+        fd = os.open(
+            lock_name,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        _INHERITED_CONVERSION_LOCK_FDS.add(fd)
+        metadata = _validate_descriptor_entry(
+            fd,
+            parent_fd,
+            lock_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        _validate_conversion_lock_metadata(metadata)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked = _validate_descriptor_entry(
+            fd,
+            parent_fd,
+            lock_name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        _validate_conversion_lock_metadata(locked)
+        _validate_descriptor_path(parent_fd, output.parent, expected_type="directory")
+        try:
+            yield fd
+        finally:
+            if os.getpid() == owner_pid:
+                locked = _validate_descriptor_entry(
+                    fd,
+                    parent_fd,
+                    lock_name,
+                    expected_type="file",
+                    require_single_link=True,
+                )
+                _validate_conversion_lock_metadata(locked)
+                locked_anchor = _validate_descriptor_entry(
+                    anchor_fd,
+                    parent_fd,
+                    anchor_name,
+                    expected_type="directory",
+                )
+                _validate_conversion_anchor_metadata(locked_anchor)
+                _validate_descriptor_path(
+                    anchor_fd,
+                    anchor_path,
+                    expected_type="directory",
+                )
+                _validate_descriptor_path(
+                    parent_fd,
+                    output.parent,
+                    expected_type="directory",
+                )
+    finally:
+        if os.getpid() == owner_pid:
+            if fd is not None:
+                _INHERITED_CONVERSION_LOCK_FDS.discard(fd)
+                os.close(fd)
+            if anchor_fd is not None:
+                _INHERITED_CONVERSION_LOCK_FDS.discard(anchor_fd)
+                os.close(anchor_fd)
+            _INHERITED_CONVERSION_LOCK_FDS.discard(parent_fd)
+            os.close(parent_fd)
+
+
+_MANIFEST_RELATIVE_PATH = "meta/conversion_manifest.json"
+_STATUS_RELATIVE_PATH = "CONVERSION_STATUS.json"
+_RESERVED_MANIFEST_PATHS = {
+    _MANIFEST_RELATIVE_PATH,
+    _STATUS_RELATIVE_PATH,
+}
+_PAYLOAD_ROOTS = ("data", "videos", "meta")
+_LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _validate_manifest_member_metadata(metadata: object, relative_path: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"manifest member is not a regular file: {relative_path}")
+    if metadata.st_nlink != 1:
+        raise RuntimeError(f"manifest member has unsafe link count: {relative_path}")
+
+
+@dataclass(frozen=True)
+class _OpenManifestMember:
+    relative_path: str
+    fd: int
+    st_dev: int
+    st_ino: int
+    st_size: int
+    st_mtime_ns: int
+    st_ctime_ns: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _OpenManifestDirectory:
+    relative_path: str
+    fd: int
+    st_dev: int
+    st_ino: int
+    st_mtime_ns: int
+    st_ctime_ns: int
+
+
+@dataclass
+class _StagedTreeCapture:
+    files: dict[str, _OpenManifestMember]
+    directories: dict[str, _OpenManifestDirectory]
+
+    def close(self) -> None:
+        while self.files:
+            _, member = self.files.popitem()
+            os.close(member.fd)
+        while self.directories:
+            _, directory = self.directories.popitem()
+            os.close(directory.fd)
+
+
+def _member_metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _directory_metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _open_manifest_directory_identity(
+    relative_path: str,
+    fd: int,
+    metadata: os.stat_result,
+) -> _OpenManifestDirectory:
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"manifest directory is not a directory: {relative_path}")
+    return _OpenManifestDirectory(
+        relative_path=relative_path,
+        fd=fd,
+        st_dev=metadata.st_dev,
+        st_ino=metadata.st_ino,
+        st_mtime_ns=metadata.st_mtime_ns,
+        st_ctime_ns=metadata.st_ctime_ns,
+    )
+
+
+def _expected_directory_identity(
+    directory: _OpenManifestDirectory,
+) -> tuple[int, ...]:
+    return (
+        directory.st_dev,
+        directory.st_ino,
+        directory.st_mtime_ns,
+        directory.st_ctime_ns,
+    )
+
+
+def _open_manifest_member(
+    parent_fd: int,
+    name: str,
+    relative_path: str,
+) -> _OpenManifestMember:
+    path_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    _validate_manifest_member_metadata(path_metadata, relative_path)
+    fd = os.open(
+        name,
+        os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        before = _validate_descriptor_entry(
+            fd,
+            parent_fd,
+            name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        _validate_manifest_member_metadata(before, relative_path)
+        digest = _sha256_descriptor(fd)
+        after = _validate_descriptor_entry(
+            fd,
+            parent_fd,
+            name,
+            expected_type="file",
+            require_single_link=True,
+        )
+        _validate_manifest_member_metadata(after, relative_path)
+        if _member_metadata_identity(after) != _member_metadata_identity(before):
+            raise RuntimeError(
+                f"manifest member changed while hashing: {relative_path}"
+            )
+        if _sha256_descriptor(fd) != digest:
+            raise RuntimeError(
+                f"manifest member changed while hashing: {relative_path}"
+            )
+        return _OpenManifestMember(
+            relative_path=relative_path,
+            fd=fd,
+            st_dev=after.st_dev,
+            st_ino=after.st_ino,
+            st_size=after.st_size,
+            st_mtime_ns=after.st_mtime_ns,
+            st_ctime_ns=after.st_ctime_ns,
+            sha256=digest,
+        )
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _capture_manifest_directory(
+    directory_fd: int,
+    relative_directory: str,
+    capture: _StagedTreeCapture,
+) -> None:
+    captured_directory = capture.directories[relative_directory]
+    before = os.fstat(directory_fd)
+    if _directory_metadata_identity(before) != _expected_directory_identity(
+        captured_directory
+    ):
+        raise RuntimeError(
+            f"manifest directory changed before scan: {relative_directory}"
+        )
+    for name in os.listdir(directory_fd):
+        if not isinstance(name, str) or not name or name in (".", ".."):
+            raise RuntimeError("manifest traversal encountered an unsafe name")
+        relative_path = f"{relative_directory}/{name}"
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"manifest member is a symlink: {relative_path}")
+        if stat.S_ISDIR(metadata.st_mode):
+            if relative_path in capture.directories:
+                raise RuntimeError(f"duplicate manifest directory: {relative_path}")
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                child_before = _validate_descriptor_entry(
+                    child_fd,
+                    directory_fd,
+                    name,
+                    expected_type="directory",
+                )
+                capture.directories[relative_path] = _open_manifest_directory_identity(
+                    relative_path,
+                    child_fd,
+                    child_before,
+                )
+            except BaseException:
+                os.close(child_fd)
+                raise
+            _capture_manifest_directory(child_fd, relative_path, capture)
+            child_after = _validate_descriptor_entry(
+                child_fd,
+                directory_fd,
+                name,
+                expected_type="directory",
+            )
+            if _directory_metadata_identity(
+                child_after
+            ) != _expected_directory_identity(capture.directories[relative_path]):
+                raise RuntimeError(
+                    f"manifest directory identity changed: {relative_path}"
+                )
+            continue
+        if relative_path in capture.files:
+            raise RuntimeError(f"duplicate manifest member path: {relative_path}")
+        capture.files[relative_path] = _open_manifest_member(
+            directory_fd,
+            name,
+            relative_path,
+        )
+    after = os.fstat(directory_fd)
+    if _directory_metadata_identity(after) != _expected_directory_identity(
+        captured_directory
+    ):
+        raise RuntimeError(
+            f"manifest directory changed during scan: {relative_directory}"
+        )
+
+
+def _capture_staged_tree(staging: Path, staging_fd: int) -> _StagedTreeCapture:
+    capture = _StagedTreeCapture(files={}, directories={})
+    try:
+        captured_root_fd = os.dup(staging_fd)
+        root_metadata = os.fstat(captured_root_fd)
+        capture.directories["."] = _open_manifest_directory_identity(
+            ".",
+            captured_root_fd,
+            root_metadata,
+        )
+        root_names = set(os.listdir(captured_root_fd))
+        expected_root_names = {*_PAYLOAD_ROOTS, _STATUS_RELATIVE_PATH}
+        if root_names != expected_root_names:
+            raise RuntimeError(
+                "staged tree has files or directories outside payload layout"
+            )
+        for root_name in _PAYLOAD_ROOTS:
+            root_fd = os.open(
+                root_name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=captured_root_fd,
+            )
+            try:
+                root_before = _validate_descriptor_entry(
+                    root_fd,
+                    captured_root_fd,
+                    root_name,
+                    expected_type="directory",
+                )
+                capture.directories[root_name] = _open_manifest_directory_identity(
+                    root_name,
+                    root_fd,
+                    root_before,
+                )
+            except BaseException:
+                os.close(root_fd)
+                raise
+            _capture_manifest_directory(root_fd, root_name, capture)
+            root_after = _validate_descriptor_entry(
+                root_fd,
+                captured_root_fd,
+                root_name,
+                expected_type="directory",
+            )
+            if _directory_metadata_identity(root_after) != _expected_directory_identity(
+                capture.directories[root_name]
+            ):
+                raise RuntimeError(f"manifest directory identity changed: {root_name}")
+        capture.files[_STATUS_RELATIVE_PATH] = _open_manifest_member(
+            captured_root_fd,
+            _STATUS_RELATIVE_PATH,
+            _STATUS_RELATIVE_PATH,
+        )
+        root_after = os.fstat(captured_root_fd)
+        if _directory_metadata_identity(root_after) != _expected_directory_identity(
+            capture.directories["."]
+        ):
+            raise RuntimeError("manifest staging root changed during scan")
+        _validate_descriptor_path(staging_fd, staging, expected_type="directory")
+        return capture
+    except BaseException:
+        capture.close()
+        raise
+
+
+def _revalidate_open_capture(capture: _StagedTreeCapture) -> None:
+    for path, directory in capture.directories.items():
+        metadata = os.fstat(directory.fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"manifest directory changed type: {path}")
+        if _directory_metadata_identity(metadata) != _expected_directory_identity(
+            directory
+        ):
+            raise RuntimeError(f"manifest directory identity changed: {path}")
+    for path, member in capture.files.items():
+        metadata = os.fstat(member.fd)
+        _validate_manifest_member_metadata(metadata, path)
+        if _member_metadata_identity(metadata) != (
+            member.st_dev,
+            member.st_ino,
+            member.st_size,
+            member.st_mtime_ns,
+            member.st_ctime_ns,
+        ):
+            raise RuntimeError(f"manifest member identity changed: {path}")
+        if _sha256_descriptor(member.fd) != member.sha256:
+            raise RuntimeError(f"manifest member SHA-256 changed: {path}")
+
+
+def _compare_tree_captures(
+    initial: _StagedTreeCapture,
+    final: _StagedTreeCapture,
+) -> None:
+    if set(initial.directories) != set(final.directories):
+        raise RuntimeError("manifest directory membership or identity changed")
+    for path, before_directory in initial.directories.items():
+        after_directory = final.directories[path]
+        if _expected_directory_identity(
+            before_directory
+        ) != _expected_directory_identity(after_directory):
+            raise RuntimeError(f"manifest directory changed during validation: {path}")
+    if set(initial.files) != set(final.files):
+        raise RuntimeError("manifest file membership changed")
+    for path, before in initial.files.items():
+        after = final.files[path]
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.sha256,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.sha256,
+        ):
+            raise RuntimeError(f"manifest member changed during validation: {path}")
+
+
+def _read_open_manifest_member(member: _OpenManifestMember) -> bytes:
+    os.lseek(member.fd, 0, os.SEEK_SET)
+    payload = b"".join(iter(lambda: os.read(member.fd, 1024 * 1024), b""))
+    if len(payload) != member.st_size or sha256_bytes(payload) != member.sha256:
+        raise RuntimeError("payload manifest changed while being read")
+    return payload
+
+
+def _strict_canonical_json_member(
+    member: _OpenManifestMember,
+    label: str,
+) -> object:
+    payload = _read_open_manifest_member(member)
+    try:
+        value = json.loads(
+            payload,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {constant}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{label} is not strict JSON") from exc
+    if payload != canonical_json_bytes(value):
+        raise ValueError(f"{label} bytes are not canonical")
+    return value
+
+
+def _validate_status_staging_identity(
+    capture: _StagedTreeCapture,
+    staging_fd: int,
+) -> None:
+    status = _strict_canonical_json_member(
+        capture.files[_STATUS_RELATIVE_PATH],
+        "conversion status",
+    )
+    if not isinstance(status, dict):
+        raise RuntimeError("conversion status has no staging identity")
+    staging_identity = status.get("staging")
+    if not isinstance(staging_identity, dict):
+        raise RuntimeError("conversion status has no staging identity")
+    expected_device = staging_identity.get("st_dev")
+    expected_inode = staging_identity.get("st_ino")
+    if type(expected_device) is not int or type(expected_inode) is not int:
+        raise RuntimeError("conversion status has an invalid staging identity")
+    actual = os.fstat(staging_fd)
+    if (expected_device, expected_inode) != (actual.st_dev, actual.st_ino):
+        raise RuntimeError("conversion status staging identity differs from root")
+
+
+def build_payload_manifest(staging: Path) -> dict[str, object]:
+    staging_fd = _open_validated_directory(staging)
+    initial = None
+    final = None
+    try:
+        initial = _capture_staged_tree(staging, staging_fd)
+        _validate_status_staging_identity(initial, staging_fd)
+        entries = [
+            {
+                "path": path,
+                "size": initial.files[path].st_size,
+                "sha256": initial.files[path].sha256,
+            }
+            for path in sorted(
+                initial.files,
+                key=lambda value: value.encode("utf-8"),
+            )
+            if path not in _RESERVED_MANIFEST_PATHS
+        ]
+        _revalidate_open_capture(initial)
+        final = _capture_staged_tree(staging, staging_fd)
+        _compare_tree_captures(initial, final)
+        _revalidate_open_capture(initial)
+        _validate_descriptor_path(staging_fd, staging, expected_type="directory")
+        return {"schema_version": 1, "entries": entries}
+    finally:
+        if final is not None:
+            final.close()
+        if initial is not None:
+            initial.close()
+        os.close(staging_fd)
+
+
+def _validate_manifest_path(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("manifest entry path must be a string")
+    if value in _RESERVED_MANIFEST_PATHS:
+        raise ValueError(f"manifest entry path is reserved: {value}")
+    components = value.split("/")
+    if (
+        not value
+        or value.startswith("/")
+        or any(component in ("", ".", "..") for component in components)
+        or components[0] not in _PAYLOAD_ROOTS
+    ):
+        raise ValueError(f"unsafe manifest entry path: {value!r}")
+    return value
+
+
+def validate_payload_manifest(staging: Path) -> dict[str, object]:
+    staging_fd = _open_validated_directory(staging)
+    initial = None
+    final = None
+    try:
+        initial = _capture_staged_tree(staging, staging_fd)
+        if set(_RESERVED_MANIFEST_PATHS) - set(initial.files):
+            raise ValueError("staged tree is missing a reserved path")
+
+        _validate_status_staging_identity(initial, staging_fd)
+        manifest = _strict_canonical_json_member(
+            initial.files[_MANIFEST_RELATIVE_PATH],
+            "payload manifest",
+        )
+        if not isinstance(manifest, dict) or set(manifest) != {
+            "schema_version",
+            "entries",
+        }:
+            raise ValueError("payload manifest has an invalid schema")
+        if (
+            manifest["schema_version"] != 1
+            or type(manifest["schema_version"]) is not int
+        ):
+            raise ValueError("payload manifest has an invalid schema version")
+        entries = manifest["entries"]
+        if not isinstance(entries, list) or not entries:
+            raise ValueError("payload manifest entries must be a nonempty list")
+
+        expected_paths = []
+        expected_by_path: dict[str, tuple[int, str]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {
+                "path",
+                "size",
+                "sha256",
+            }:
+                raise ValueError("payload manifest entry has an invalid schema")
+            path = _validate_manifest_path(entry["path"])
+            size = entry["size"]
+            digest = entry["sha256"]
+            if type(size) is not int or size < 0:
+                raise ValueError("payload manifest entry size must be nonnegative")
+            if (
+                not isinstance(digest, str)
+                or _LOWERCASE_SHA256.fullmatch(digest) is None
+            ):
+                raise ValueError("payload manifest entry has malformed SHA-256")
+            if path in expected_by_path:
+                raise ValueError(f"payload manifest has duplicate path: {path}")
+            expected_paths.append(path)
+            expected_by_path[path] = (size, digest)
+        if expected_paths != sorted(
+            expected_paths,
+            key=lambda value: value.encode("utf-8"),
+        ):
+            raise ValueError("payload manifest paths are not in canonical order")
+
+        actual_payload = {
+            path: (member.st_size, member.sha256)
+            for path, member in initial.files.items()
+            if path not in _RESERVED_MANIFEST_PATHS
+        }
+        if set(expected_by_path) != set(actual_payload):
+            raise ValueError("payload manifest membership differs from staged tree")
+        for path, expected_identity in expected_by_path.items():
+            if actual_payload[path] != expected_identity:
+                raise ValueError(f"payload manifest identity differs for path: {path}")
+
+        _revalidate_open_capture(initial)
+        final = _capture_staged_tree(staging, staging_fd)
+        _compare_tree_captures(initial, final)
+        _revalidate_open_capture(initial)
+        _validate_descriptor_path(staging_fd, staging, expected_type="directory")
+        return manifest
+    finally:
+        if final is not None:
+            final.close()
+        if initial is not None:
+            initial.close()
+        os.close(staging_fd)
 
 
 def copy_file_exclusive(
