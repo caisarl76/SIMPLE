@@ -1,6 +1,8 @@
-import hashlib
+import subprocess
+from pathlib import Path
 
 import numpy as np
+import pytest
 
 from scripts.postprocess_psi0 import (
     build_proprio_obs,
@@ -35,30 +37,41 @@ def test_initial_history_height_is_point_74():
     assert initial_command[6] == np.float32(0.74)
 
 
-def test_conversion_provenance_binds_source_episode_and_converter(tmp_path):
+def test_converter_identity_rejects_dirty_script_bytes(tmp_path):
     from scripts import postprocess_psi0
 
-    raw = tmp_path / "episode_000007.parquet"
-    raw.write_bytes(b"raw-episode-seven")
-    result = postprocess_psi0.build_conversion_provenance(
-        source_path=raw,
-        source_episode_index=7,
-        skip=60,
-        downsample=2,
-        converter_commit="1" * 40,
+    script = tmp_path / "scripts" / "postprocess_psi0.py"
+    script.parent.mkdir()
+    script.write_bytes(Path(postprocess_psi0.__file__).read_bytes())
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        check=True,
     )
-    assert set(result) == {
-        "source_episode_index",
-        "source_parquet_sha256",
-        "skip",
-        "downsample",
-        "converter_commit",
-    }
-    assert result["source_episode_index"] == 7
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "add", str(script.relative_to(tmp_path))], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "commit", "-qm", "add converter"], cwd=tmp_path, check=True)
+
+    identity = postprocess_psi0.resolve_converter_identity(tmp_path, script)
     assert (
-        result["source_parquet_sha256"]
-        == hashlib.sha256(b"raw-episode-seven").hexdigest()
+        identity.commit
+        == subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
     )
-    assert result["skip"] == 60
-    assert result["downsample"] == 2
-    assert result["converter_commit"] == "1" * 40
+    assert identity.script_sha256 == postprocess_psi0.sha256_bytes(script.read_bytes())
+
+    script.write_bytes(script.read_bytes() + b"#")
+    with pytest.raises(
+        RuntimeError, match="executed converter differs from its recorded Git blob"
+    ):
+        postprocess_psi0.resolve_converter_identity(tmp_path, script)
