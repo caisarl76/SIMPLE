@@ -1,7 +1,41 @@
 #!/usr/bin/env python3
 """Independent validation and sibling certification for PSI0 converter output."""
 
+# ruff: noqa: E402
+
 from __future__ import annotations
+
+import sys as _startup_sys
+
+
+def _sanitize_entrypoint_sys_path() -> None:
+    if __name__ != "__main__":
+        return
+    trusted_roots = tuple(
+        root.rstrip("/\\")
+        for root in {_startup_sys.prefix, _startup_sys.base_prefix}
+        if root
+    )
+
+    def trusted(entry: object) -> bool:
+        if not isinstance(entry, str) or not entry:
+            return False
+        normalized = entry.replace("\\", "/").rstrip("/")
+        for root in trusted_roots:
+            normalized_root = root.replace("\\", "/")
+            if normalized == normalized_root:
+                return True
+            prefix = normalized_root + "/"
+            if normalized.startswith(prefix):
+                relative_parts = normalized[len(prefix) :].split("/")
+                return all(part not in {"", ".", ".."} for part in relative_parts)
+        return False
+
+    _startup_sys.path[:] = [entry for entry in _startup_sys.path if trusted(entry)]
+
+
+_sanitize_entrypoint_sys_path()
+sys = _startup_sys
 
 import argparse
 import importlib.machinery
@@ -11,20 +45,42 @@ import math
 import os
 import stat
 import subprocess
-import sys
 import uuid
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import NoReturn
 
-_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-if str(_REPOSITORY_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPOSITORY_ROOT))
-
 import numpy as np  # noqa: E402
 import pyarrow as pa  # noqa: E402
 import pyarrow.parquet as pq  # noqa: E402
+
+
+def _bootstrap_entrypoint_package() -> None:
+    if __name__ != "__main__":
+        return
+    scripts_root = Path(__file__).resolve().parent
+    package = sys.modules.get("scripts")
+    if __package__ in {None, ""}:
+        if package is not None:
+            raise RuntimeError("conflicting scripts package during direct execution")
+        package = type(sys)("scripts")
+        package.__package__ = "scripts"
+        package.__path__ = [str(scripts_root)]
+        sys.modules["scripts"] = package
+    else:
+        if (
+            __package__ != "scripts"
+            or getattr(__spec__, "name", None) != "scripts.certify_psi0_dataset"
+            or package is None
+            or getattr(package, "__file__", None) is not None
+        ):
+            raise RuntimeError("module execution requires a namespace scripts package")
+        package.__path__ = [str(scripts_root)]
+
+
+_bootstrap_entrypoint_package()
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 from scripts import postprocess_psi0 as converter  # noqa: E402
 

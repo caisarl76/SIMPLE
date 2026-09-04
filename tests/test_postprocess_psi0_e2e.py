@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1121,6 +1122,260 @@ def test_cli_subprocess_attests_real_committed_script(tmp_path):
     )
     assert not output.exists()
     assert not list(tmp_path.glob(".processed.staging-*"))
+
+
+@pytest.mark.parametrize("entrypoint", ["script", "module"])
+def test_cli_entrypoints_complete_conversion_and_certification(tmp_path, entrypoint):
+    from scripts.certify_psi0_dataset import validate_evidence_terminal
+
+    source = make_source_episode(tmp_path / "source", frames=3, fps=4)
+    repository = tmp_path / "repository"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    script = scripts / "postprocess_psi0.py"
+    certifier = scripts / "certify_psi0_dataset.py"
+    shutil.copyfile(Path(converter.__file__), script)
+    shutil.copyfile(
+        Path(__file__).resolve().parents[1] / "scripts/certify_psi0_dataset.py",
+        certifier,
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "add",
+            "scripts/postprocess_psi0.py",
+            "scripts/certify_psi0_dataset.py",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Task Twelve",
+            "-c",
+            "user.email=task12@example.invalid",
+            "commit",
+            "-qm",
+            "record converter and certifier",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    expected_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    expected_script_sha256 = converter.sha256_file(script)
+    psi0_root, psi0_commit, import_marker = _make_task9_fake_psi0_checkout(tmp_path)
+    output = tmp_path / "processed"
+    command = (
+        [sys.executable, str(script)]
+        if entrypoint == "script"
+        else [sys.executable, "-m", "scripts.postprocess_psi0"]
+    )
+
+    completed = subprocess.run(
+        [
+            *command,
+            *_conversion_argv(source, output),
+            "--certify-psi0-root",
+            str(psi0_root),
+            "--certify-psi0-commit",
+            psi0_commit,
+            "--certify-python",
+            sys.executable,
+        ],
+        cwd=repository,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert output.is_dir()
+    assert not list(tmp_path.glob(".processed.staging-*"))
+    validation = subprocess.run(
+        [sys.executable, str(certifier), str(output), "--print-tree-digest"],
+        cwd=repository,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert validation.returncode == 0, validation.stderr
+    assert re.fullmatch(r"[0-9a-f]{64}\n", validation.stdout)
+    assert _strict_json((output / "meta/info.json").read_bytes())["total_frames"] == 3
+    evidence_roots = list(tmp_path.glob(".processed.certification-*"))
+    assert len(evidence_roots) == 1
+    assert validate_evidence_terminal(evidence_roots[0])["verdict"] == "PASS"
+    assert import_marker.read_text() == "imported"
+    provenance = _strict_json((output / "meta/conversion_provenance.json").read_bytes())
+    assert provenance["converter"] == {
+        "commit": expected_commit,
+        "script_sha256": expected_script_sha256,
+    }
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "attack_location"),
+    [
+        ("converter-script", "script"),
+        ("converter-script", "pythonpath"),
+        ("converter-module", "cwd"),
+        ("certifier-script", "script"),
+        ("certifier-script", "pythonpath"),
+        ("certifier-module", "cwd"),
+    ],
+)
+def test_cli_entrypoints_ignore_shadowable_startup_paths(
+    tmp_path, entrypoint, attack_location
+):
+    source = make_source_episode(tmp_path / "source", frames=3, fps=4)
+    repository = tmp_path / "repository"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    converter_script = scripts / "postprocess_psi0.py"
+    certifier_script = scripts / "certify_psi0_dataset.py"
+    shutil.copyfile(Path(converter.__file__), converter_script)
+    shutil.copyfile(
+        Path(__file__).resolve().parents[1] / "scripts/certify_psi0_dataset.py",
+        certifier_script,
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "add",
+            "scripts/postprocess_psi0.py",
+            "scripts/certify_psi0_dataset.py",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Startup Test",
+            "-c",
+            "user.email=startup@example.invalid",
+            "commit",
+            "-qm",
+            "record entrypoints",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    marker = tmp_path / f"{entrypoint}-{attack_location}-executed"
+    if attack_location == "script":
+        attack_root = scripts
+    elif attack_location == "cwd":
+        attack_root = repository
+    else:
+        attack_root = tmp_path / "pythonpath-attack"
+        attack_root.mkdir()
+    (attack_root / "argparse.py").write_text(
+        f"open({str(marker)!r}, 'w').write('executed')\n"
+        "raise RuntimeError('shadow argparse executed')\n"
+    )
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    if attack_location == "pythonpath":
+        environment["PYTHONPATH"] = str(attack_root)
+    if entrypoint == "converter-script":
+        command = [
+            sys.executable,
+            str(converter_script),
+            "--preflight-only",
+            *_conversion_argv(source, tmp_path / "output"),
+        ]
+    elif entrypoint == "converter-module":
+        command = [
+            sys.executable,
+            "-m",
+            "scripts.postprocess_psi0",
+            "--preflight-only",
+            *_conversion_argv(source, tmp_path / "output"),
+        ]
+    elif entrypoint == "certifier-script":
+        command = [sys.executable, str(certifier_script), "--help"]
+    else:
+        command = [sys.executable, "-m", "scripts.certify_psi0_dataset", "--help"]
+
+    completed = subprocess.run(
+        command,
+        cwd=repository,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert not marker.exists()
+
+
+def test_converter_module_rejects_regular_scripts_package_before_conversion(tmp_path):
+    source = make_source_episode(tmp_path / "source", frames=3, fps=4)
+    repository = tmp_path / "repository"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copyfile(Path(converter.__file__), scripts / "postprocess_psi0.py")
+    shutil.copyfile(
+        Path(__file__).resolve().parents[1] / "scripts/certify_psi0_dataset.py",
+        scripts / "certify_psi0_dataset.py",
+    )
+    (scripts / "__init__.py").write_text("")
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "scripts"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Module Boundary",
+            "-c",
+            "user.email=module@example.invalid",
+            "commit",
+            "-qm",
+            "record regular package",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    output = tmp_path / "output"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.postprocess_psi0",
+            *_conversion_argv(source, output),
+        ],
+        cwd=repository,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "module execution requires a namespace scripts package" in completed.stderr
+    assert not output.exists()
+    assert not list(tmp_path.glob(".output.staging-*"))
 
 
 def test_certificate_array_expansion_is_executable(tmp_path):
