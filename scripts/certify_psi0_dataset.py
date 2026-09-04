@@ -2525,6 +2525,26 @@ def _write_worker_result(path: Path, value: dict[str, object]) -> None:
         os.close(fd)
 
 
+def _prime_urllib3_connection_offline(
+    socket_module: object,
+    network_violations: list[dict[str, object]],
+) -> None:
+    """Import urllib3 without its import-time IPv6 socket capability probe."""
+
+    original_has_ipv6 = socket_module.has_ipv6
+    violation_count = len(network_violations)
+    try:
+        socket_module.has_ipv6 = False
+        from urllib3.util import connection as urllib3_connection
+
+        if not callable(urllib3_connection.allowed_gai_family):
+            raise RuntimeError("urllib3 connection module is incomplete")
+    finally:
+        socket_module.has_ipv6 = original_has_ipv6
+    if len(network_violations) != violation_count:
+        raise RuntimeError("urllib3 offline priming violated loader audit policy")
+
+
 def _loader_worker_main(
     *, psi0_src: Path, dataset_root: Path, result_path: Path
 ) -> int:
@@ -2613,6 +2633,7 @@ def _loader_worker_main(
             )
 
         sys.addaudithook(deny_network_and_process_escape)
+        _prime_urllib3_connection_offline(socket, network_violations)
         sys.path.insert(0, source_string)
         recorded_sys_path_0 = sys.path[0]
         if recorded_sys_path_0 != source_string:
@@ -2719,6 +2740,8 @@ def _loader_worker_main(
         for start, end in episode_ranges:
             if start not in visited or end not in visited:
                 raise RuntimeError("loader traversal missed an episode boundary")
+        if network_violations:
+            raise RuntimeError("loader audit policy recorded a denied operation")
         value = {
             "schema_version": 1,
             "verdict": "PASS",

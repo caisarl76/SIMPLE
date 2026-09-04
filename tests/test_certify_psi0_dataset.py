@@ -263,6 +263,10 @@ if BEHAVIOR == "pycache_prefix":
     assert not list(expected_prefix.iterdir())
 if BEHAVIOR in ("sourceless_pyc", "race_sourceless_pyc"):
     import evil
+if BEHAVIOR == "urllib3_import":
+    from urllib3.util.connection import allowed_gai_family
+
+    assert callable(allowed_gai_family)
 IMPORT_MARKER.write_text("imported")
 
 
@@ -303,6 +307,13 @@ class LeRobotDataset:
             import socket
 
             socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
+        if BEHAVIOR == "caught_network" and index == 0:
+            import socket
+
+            try:
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
+            except PermissionError:
+                pass
         if BEHAVIOR == "resolver" and index == 0:
             import socket
 
@@ -3332,6 +3343,48 @@ def test_psi0_loader_network_and_process_attempts_fail_and_clean_cache(
     assert result["network_policy"]["violations"][0]["event"] == expected_event
 
 
+def test_psi0_loader_primes_urllib3_without_inet_capability_probe(
+    tmp_path,
+    generated,
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior="urllib3_import"
+    )
+
+    evidence = _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    assert import_marker.is_file()
+    assert validate_evidence_terminal(evidence)["verdict"] == "PASS"
+    result = _read_canonical_evidence(evidence / "psi0-loader-result.json")
+    assert result["returncode"] == 0
+    assert result["result"]["network_policy"]["violations"] == []
+
+
+def test_psi0_loader_caught_network_attempt_is_worker_failure(
+    tmp_path,
+    generated,
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior="caught_network"
+    )
+
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    evidence = caught.value.evidence_root
+    assert import_marker.is_file()
+    terminal = validate_evidence_terminal(evidence)
+    assert terminal["verdict"] == "FAIL"
+    result = _read_canonical_evidence(evidence / "psi0-loader-result.json")
+    assert result["returncode"] == 1
+    assert result["result"]["verdict"] == "FAIL"
+    assert result["result"]["network_policy"]["violations"] == [
+        {"category": "inet_socket", "event": "socket.__new__"}
+    ]
+
+
 @pytest.mark.parametrize("failure", ["dirty", "wrong_commit"])
 def test_psi0_loader_rejects_unpinned_checkout_before_import(
     tmp_path, generated, failure
@@ -3459,7 +3512,7 @@ def test_real_pinned_psi0_loader_traverses_every_synthetic_row(tmp_path):
         "action": {"dtype": "torch.float32", "shape": [36]},
         "observation.images.egocentric": {
             "dtype": "torch.float32",
-            "shape": [3, 360, 640],
+            "shape": [3, 48, 64],
         },
         "states": {"dtype": "torch.float32", "shape": [32]},
     }
