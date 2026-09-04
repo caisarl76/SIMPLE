@@ -2501,10 +2501,41 @@ def _run_psi0_loader(
         "returncode": process.returncode if process is not None else None,
         "stdout": process.stdout if process is not None else "",
         "stderr": process.stderr if process is not None else "",
+        "visited_indices": list(worker_value.get("visited_indices", [])),
+        "episode_boundaries": _episode_boundaries(result.dataset_root),
+        "sample_count": len(worker_value.get("visited_indices", [])),
+        "all_finite": worker_value.get("verdict") == "PASS",
         "result_sha256": converter.sha256_bytes(worker_payload),
         "result": worker_value,
     }
     return command, {"schema_version": 1, "entries": cache_entries}, wrapped_result
+
+
+def _episode_boundaries(dataset_root: Path) -> list[dict[str, int]]:
+    episodes, _ = _strict_jsonl(
+        dataset_root / "meta/episodes.jsonl",
+        "PSI0_LOADER_VALIDATION",
+    )
+    boundaries: list[dict[str, int]] = []
+    expected_from = 0
+    for episode in episodes:
+        episode_index = episode.get("episode_index")
+        start = episode.get("dataset_from_index")
+        end = episode.get("dataset_to_index")
+        if (
+            type(episode_index) is not int
+            or episode_index != len(boundaries)
+            or type(start) is not int
+            or start != expected_from
+            or type(end) is not int
+            or end < start
+        ):
+            raise DatasetValidationError(
+                "PSI0_LOADER_VALIDATION", "episode boundary metadata differs"
+            )
+        boundaries.append({"episode_index": episode_index, "from": start, "to": end})
+        expected_from = end + 1
+    return boundaries
 
 
 def _write_worker_result(path: Path, value: dict[str, object]) -> None:
@@ -3042,6 +3073,10 @@ def _validate_loader_evidence(
                 "returncode",
                 "stdout",
                 "stderr",
+                "visited_indices",
+                "episode_boundaries",
+                "sample_count",
+                "all_finite",
                 "result_sha256",
                 "result",
             }
@@ -3089,6 +3124,21 @@ def _validate_loader_evidence(
             or (worker_verdict == "FAIL" and loader_result["returncode"] == 0)
         ):
             raise ValueError("PSI0 loader worker result differs")
+        expected_boundaries = _episode_boundaries(Path(identity["path"]))
+        if (
+            not _json_exact_equal(
+                loader_result.get("visited_indices"),
+                worker_result["visited_indices"],
+            )
+            or not _json_exact_equal(
+                loader_result.get("episode_boundaries"), expected_boundaries
+            )
+            or type(loader_result.get("sample_count")) is not int
+            or loader_result["sample_count"] != len(worker_result["visited_indices"])
+            or type(loader_result.get("all_finite")) is not bool
+            or loader_result["all_finite"] != (worker_verdict == "PASS")
+        ):
+            raise ValueError("PSI0 loader summary differs from bound worker result")
         if terminal_verdict == "PASS" and worker_verdict != "PASS":
             raise ValueError("PASS evidence contains a failed PSI0 loader result")
         if worker_verdict == "PASS":
@@ -3629,9 +3679,44 @@ def certify_published_dataset(
     )
 
 
+def _validate_expected_video_key(dataset_root: Path, expected_video_key: str) -> None:
+    if not expected_video_key or Path(expected_video_key).name != expected_video_key:
+        raise DatasetValidationError(
+            "METADATA_VIDEO", "expected video key must be one path component"
+        )
+    info, _ = _strict_json_object(
+        dataset_root / "meta/info.json",
+        "METADATA_VIDEO",
+    )
+    modality, _ = _strict_json_object(
+        dataset_root / "meta/modality.json",
+        "METADATA_VIDEO",
+    )
+    features = info.get("features")
+    video = modality.get("video")
+    original_keys = (
+        {
+            entry.get("original_key")
+            for entry in video.values()
+            if isinstance(entry, dict)
+        }
+        if isinstance(video, dict)
+        else set()
+    )
+    if (
+        not isinstance(features, dict)
+        or expected_video_key not in features
+        or original_keys != {expected_video_key}
+    ):
+        raise DatasetValidationError(
+            "METADATA_VIDEO", "expected video key differs from published metadata"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset-root", type=Path)
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument("dataset_root_positional", nargs="?", type=Path)
+    parser.add_argument("--dataset-root", dest="dataset_root_option", type=Path)
     parser.add_argument("--loader-worker", action="store_true")
     parser.add_argument("--psi0-src", type=Path)
     parser.add_argument("--result", type=Path)
@@ -3640,39 +3725,76 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--psi0-root", type=Path)
     parser.add_argument("--psi0-commit")
     parser.add_argument("--python", type=Path)
+    parser.add_argument("--expected-video-key")
     args = parser.parse_args(argv)
+    if (
+        args.dataset_root_positional is not None
+        and args.dataset_root_option is not None
+    ):
+        parser.error("dataset root must be supplied exactly once")
     if args.loader_worker:
-        if args.psi0_src is None or args.dataset_root is None or args.result is None:
+        if (
+            args.dataset_root_positional is not None
+            or args.psi0_src is None
+            or args.dataset_root_option is None
+            or args.result is None
+            or args.print_tree_digest
+            or args.recover_publication_uncertain
+            or args.psi0_root is not None
+            or args.psi0_commit is not None
+            or args.python is not None
+            or args.expected_video_key is not None
+        ):
             parser.error("loader worker requires PSI0 src, dataset root, and result")
         return _loader_worker_main(
             psi0_src=args.psi0_src,
-            dataset_root=args.dataset_root,
+            dataset_root=args.dataset_root_option,
             result_path=args.result,
         )
-    if args.dataset_root is None:
-        parser.error("--dataset-root is required")
+    if args.psi0_src is not None or args.result is not None:
+        parser.error("worker-only options require --loader-worker")
+    dataset_root = args.dataset_root_positional or args.dataset_root_option
+    if dataset_root is None:
+        parser.error("dataset root is required")
+    certification_values = (args.psi0_root, args.psi0_commit, args.python)
+    supplied_certification_values = sum(
+        value is not None for value in certification_values
+    )
+    if args.print_tree_digest:
+        if (
+            supplied_certification_values
+            or args.recover_publication_uncertain
+            or args.expected_video_key is not None
+        ):
+            parser.error("tree-digest and certification modes cannot be combined")
+    else:
+        if supplied_certification_values != len(certification_values):
+            parser.error("certification requires PSI0 root, commit, and Python")
+        if args.expected_video_key is None and not args.recover_publication_uncertain:
+            parser.error("standalone certification requires --expected-video-key")
     try:
         if args.print_tree_digest:
             result = validate_dataset(
-                args.dataset_root, expected=None, require_final_modes=True
+                dataset_root, expected=None, require_final_modes=True
             )
             print(result.tree_digest)
             return 0
-        if not args.recover_publication_uncertain:
-            parser.error("certification requires --recover-publication-uncertain")
-        if args.psi0_root is None or args.psi0_commit is None or args.python is None:
-            parser.error("certification requires PSI0 root, commit, and Python")
-        with converter.conversion_lock(args.dataset_root):
+        assert args.psi0_root is not None
+        assert args.psi0_commit is not None
+        assert args.python is not None
+        with converter.conversion_lock(dataset_root):
             result = validate_dataset(
-                args.dataset_root, expected=None, require_final_modes=True
+                dataset_root, expected=None, require_final_modes=True
             )
-            converter.PublicationFilesystem().fsync_directory(args.dataset_root.parent)
+            converter.PublicationFilesystem().fsync_directory(dataset_root.parent)
             if result.manifest_sha256 is None or result.complete_status_sha256 is None:
                 raise DatasetValidationError(
                     "PUBLICATION_IDENTITY", "published metadata absent"
                 )
+            if args.expected_video_key is not None:
+                _validate_expected_video_key(dataset_root, args.expected_video_key)
             publication = converter.PublicationResult(
-                dataset_root=args.dataset_root,
+                dataset_root=dataset_root,
                 manifest_sha256=result.manifest_sha256,
                 complete_status_sha256=result.complete_status_sha256,
                 state="published",

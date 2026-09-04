@@ -214,6 +214,17 @@ def certify_published_dataset(*args, **kwargs):
                 "returncode": 0,
                 "stdout": "",
                 "stderr": "",
+                "visited_indices": list(range(validation.total_frames)),
+                "episode_boundaries": [
+                    {
+                        "episode_index": row["episode_index"],
+                        "from": row["dataset_from_index"],
+                        "to": row["dataset_to_index"],
+                    }
+                    for row in episodes
+                ],
+                "sample_count": validation.total_frames,
+                "all_finite": True,
                 "result_sha256": converter.sha256_bytes(
                     converter.canonical_json_bytes(result_value)
                 ),
@@ -2792,6 +2803,117 @@ def test_evidence_print_tree_digest_is_read_only_and_requires_published_tree(
     assert not list(staging.parent.glob(".manifestless.certification-*"))
 
 
+def test_task12_cli_accepts_positional_digest_and_standalone_certification(
+    tmp_path,
+    copy_generated,
+    capsys,
+):
+    _, _, original = copy_generated
+    publication = _published_copy(original, tmp_path / "task12-cli")
+    checkout, commit, _ = _make_fake_psi0_checkout(tmp_path)
+
+    assert certifier.main([str(publication.dataset_root), "--print-tree-digest"]) == 0
+    printed = capsys.readouterr()
+    assert (
+        printed.out.strip()
+        == validate_dataset(
+            publication.dataset_root,
+            expected=None,
+            require_final_modes=True,
+        ).tree_digest
+    )
+    assert printed.err == ""
+
+    assert (
+        certifier.main(
+            [
+                str(publication.dataset_root),
+                "--psi0-root",
+                str(checkout),
+                "--psi0-commit",
+                commit,
+                "--python",
+                sys.executable,
+                "--expected-video-key",
+                "observation.images.egocentric",
+            ]
+        )
+        == 0
+    )
+    evidence = next(
+        publication.dataset_root.parent.glob(
+            f".{publication.dataset_root.name}.certification-"
+            f"{publication.manifest_sha256}-*"
+        )
+    )
+    assert validate_evidence_terminal(evidence)["verdict"] == "PASS"
+    loader = _read_canonical_evidence(evidence / "psi0-loader-result.json")
+    assert loader["visited_indices"] == list(range(7))
+    assert loader["episode_boundaries"] == [
+        {"episode_index": 0, "from": 0, "to": 2},
+        {"episode_index": 1, "from": 3, "to": 6},
+    ]
+    assert loader["sample_count"] == 7
+    assert loader["all_finite"] is True
+
+
+def test_task12_cli_rejects_wrong_video_key_before_evidence(
+    tmp_path,
+    copy_generated,
+    capsys,
+):
+    _, _, original = copy_generated
+    publication = _published_copy(original, tmp_path / "task12-wrong-key")
+    checkout, commit, _ = _make_fake_psi0_checkout(tmp_path)
+
+    assert (
+        certifier.main(
+            [
+                str(publication.dataset_root),
+                "--psi0-root",
+                str(checkout),
+                "--psi0-commit",
+                commit,
+                "--python",
+                sys.executable,
+                "--expected-video-key",
+                "observation.images.wrong",
+            ]
+        )
+        == 1
+    )
+
+    assert "video key" in capsys.readouterr().err
+    assert not list(
+        publication.dataset_root.parent.glob(
+            f".{publication.dataset_root.name}.certification-*"
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["/tmp/data", "--dataset-root", "/tmp/data", "--print-tree-digest"],
+        ["/tmp/data", "--print-tree-digest", "--psi0-root", "/tmp/psi0"],
+        ["/tmp/data", "--expected-video-key", "camera"],
+        [
+            "/tmp/data",
+            "--loader-worker",
+            "--dataset-root",
+            "/tmp/data",
+            "--psi0-src",
+            "/tmp/src",
+            "--result",
+            "/tmp/result",
+        ],
+    ],
+)
+def test_certifier_cli_rejects_ambiguous_partial_or_mixed_modes(argv):
+    with pytest.raises(SystemExit):
+        certifier.main(argv)
+
+
 def _read_canonical_evidence(path: Path) -> dict[str, object]:
     payload = path.read_bytes()
     value = json.loads(payload)
@@ -2878,6 +3000,13 @@ def test_psi0_loader_parent_uses_isolated_worker_and_traverses_every_row(
     assert worker_result["verdict"] == "PASS"
     assert worker_result["visited_indices"] == list(range(5))
     assert worker_result["episode_ranges"] == [[0, 1], [2, 4]]
+    assert result["visited_indices"] == list(range(5))
+    assert result["episode_boundaries"] == [
+        {"episode_index": 0, "from": 0, "to": 1},
+        {"episode_index": 1, "from": 2, "to": 4},
+    ]
+    assert result["sample_count"] == 5
+    assert result["all_finite"] is True
     assert worker_result["sys_path_0"] == str((checkout / "src").resolve())
     assert worker_result["module_provenance"] == {
         "blob_sha256": converter.sha256_bytes(
@@ -3020,6 +3149,46 @@ def test_psi0_loader_terminal_semantics_are_bound_to_dataset_and_cache_roots(
         _coherently_rewrite_evidence_member(
             evidence, "psi0-loader-result.json", mutate_result
         )
+
+    with pytest.raises(ValueError, match="PSI0 loader"):
+        validate_evidence_terminal(evidence)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["visited_indices", "episode_boundaries", "sample_count", "all_finite"],
+)
+def test_psi0_loader_top_level_summary_is_bound_to_worker_and_episodes(
+    tmp_path,
+    generated,
+    field,
+):
+    _, _, publication = generated
+    checkout, commit, _ = _make_fake_psi0_checkout(tmp_path)
+    evidence = _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+    original = _read_canonical_evidence(evidence / "psi0-loader-result.json")
+    assert {
+        "visited_indices",
+        "episode_boundaries",
+        "sample_count",
+        "all_finite",
+    } <= set(original)
+
+    def mutate(value):
+        if field == "visited_indices":
+            value[field] = [0, 1, 3, 2, 4]
+        elif field == "episode_boundaries":
+            value[field][0]["to"] += 1
+        elif field == "sample_count":
+            value[field] -= 1
+        else:
+            value[field] = False
+
+    _coherently_rewrite_evidence_member(
+        evidence,
+        "psi0-loader-result.json",
+        mutate,
+    )
 
     with pytest.raises(ValueError, match="PSI0 loader"):
         validate_evidence_terminal(evidence)
