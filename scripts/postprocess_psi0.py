@@ -13,6 +13,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import uuid
 from dataclasses import asdict, dataclass
 from fractions import Fraction
@@ -22,7 +23,6 @@ from typing import Callable, Literal
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from tqdm import tqdm
 
 
 @dataclass(frozen=True)
@@ -422,6 +422,25 @@ def assert_conversion_lock_held(output: Path) -> None:
     )
 
 
+def _conversion_lock_ownership(output: Path) -> _ConversionLockOwnership:
+    assert_conversion_lock_held(output)
+    ownership = _OWNED_CONVERSION_LOCKS.get(_conversion_lock_key(output))
+    if ownership is None or ownership.pid != os.getpid():
+        raise RuntimeError("conversion lock ownership disappeared")
+    return ownership
+
+
+def _validate_owned_parent(ownership: _ConversionLockOwnership, output: Path) -> None:
+    metadata = os.fstat(ownership.parent_fd)
+    if (metadata.st_dev, metadata.st_ino) != ownership.parent_identity:
+        raise RuntimeError("conversion parent descriptor identity changed")
+    _validate_descriptor_path(
+        ownership.parent_fd,
+        output.parent,
+        expected_type="directory",
+    )
+
+
 @contextlib.contextmanager
 def conversion_lock(output: Path):
     owner_pid = os.getpid()
@@ -780,7 +799,10 @@ def _capture_manifest_directory(
         )
 
 
-def _capture_staged_tree(staging: Path, staging_fd: int) -> _StagedTreeCapture:
+def _capture_staged_tree(
+    staging: Path | None,
+    staging_fd: int,
+) -> _StagedTreeCapture:
     capture = _StagedTreeCapture(files={}, directories={})
     try:
         captured_root_fd = os.dup(staging_fd)
@@ -838,7 +860,8 @@ def _capture_staged_tree(staging: Path, staging_fd: int) -> _StagedTreeCapture:
             capture.directories["."]
         ):
             raise RuntimeError("manifest staging root changed during scan")
-        _validate_descriptor_path(staging_fd, staging, expected_type="directory")
+        if staging is not None:
+            _validate_descriptor_path(staging_fd, staging, expected_type="directory")
         return capture
     except BaseException:
         capture.close()
@@ -997,73 +1020,83 @@ def _validate_manifest_path(value: object) -> str:
     return value
 
 
+def _validate_payload_manifest_capture(
+    capture: _StagedTreeCapture,
+) -> tuple[dict[str, object], bytes]:
+    if set(_RESERVED_MANIFEST_PATHS) - set(capture.files):
+        raise ValueError("staged tree is missing a reserved path")
+    manifest_member = capture.files[_MANIFEST_RELATIVE_PATH]
+    manifest_payload = _read_open_manifest_member(manifest_member)
+    manifest = _strict_canonical_json_member(manifest_member, "payload manifest")
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema_version",
+        "entries",
+    }:
+        raise ValueError("payload manifest has an invalid schema")
+    if manifest["schema_version"] != 1 or type(manifest["schema_version"]) is not int:
+        raise ValueError("payload manifest has an invalid schema version")
+    entries = manifest["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("payload manifest entries must be a nonempty list")
+
+    expected_paths = []
+    expected_by_path: dict[str, tuple[int, str]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+            "path",
+            "size",
+            "sha256",
+        }:
+            raise ValueError("payload manifest entry has an invalid schema")
+        path = _validate_manifest_path(entry["path"])
+        size = entry["size"]
+        digest = entry["sha256"]
+        if type(size) is not int or size < 0:
+            raise ValueError("payload manifest entry size must be nonnegative")
+        if not isinstance(digest, str) or _LOWERCASE_SHA256.fullmatch(digest) is None:
+            raise ValueError("payload manifest entry has malformed SHA-256")
+        if path in expected_by_path:
+            raise ValueError(f"payload manifest has duplicate path: {path}")
+        expected_paths.append(path)
+        expected_by_path[path] = (size, digest)
+    if expected_paths != sorted(
+        expected_paths,
+        key=lambda value: value.encode("utf-8"),
+    ):
+        raise ValueError("payload manifest paths are not in canonical order")
+
+    actual_payload = {
+        path: (member.st_size, member.sha256)
+        for path, member in capture.files.items()
+        if path not in _RESERVED_MANIFEST_PATHS
+    }
+    if set(expected_by_path) != set(actual_payload):
+        raise ValueError("payload manifest membership differs from staged tree")
+    for path, expected_identity in expected_by_path.items():
+        if actual_payload[path] != expected_identity:
+            raise ValueError(f"payload manifest identity differs for path: {path}")
+
+    required_directories = {".", *_PAYLOAD_ROOTS}
+    for path in expected_paths:
+        parts = path.split("/")[:-1]
+        required_directories.update(
+            "/".join(parts[:index]) for index in range(1, len(parts) + 1)
+        )
+    if set(capture.directories) != required_directories:
+        raise ValueError(
+            "payload manifest directory membership differs from staged tree"
+        )
+    return manifest, manifest_payload
+
+
 def validate_payload_manifest(staging: Path) -> dict[str, object]:
     staging_fd = _open_validated_directory(staging)
     initial = None
     final = None
     try:
         initial = _capture_staged_tree(staging, staging_fd)
-        if set(_RESERVED_MANIFEST_PATHS) - set(initial.files):
-            raise ValueError("staged tree is missing a reserved path")
-
         _validate_status_staging_identity(initial, staging_fd)
-        manifest = _strict_canonical_json_member(
-            initial.files[_MANIFEST_RELATIVE_PATH],
-            "payload manifest",
-        )
-        if not isinstance(manifest, dict) or set(manifest) != {
-            "schema_version",
-            "entries",
-        }:
-            raise ValueError("payload manifest has an invalid schema")
-        if (
-            manifest["schema_version"] != 1
-            or type(manifest["schema_version"]) is not int
-        ):
-            raise ValueError("payload manifest has an invalid schema version")
-        entries = manifest["entries"]
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("payload manifest entries must be a nonempty list")
-
-        expected_paths = []
-        expected_by_path: dict[str, tuple[int, str]] = {}
-        for entry in entries:
-            if not isinstance(entry, dict) or set(entry) != {
-                "path",
-                "size",
-                "sha256",
-            }:
-                raise ValueError("payload manifest entry has an invalid schema")
-            path = _validate_manifest_path(entry["path"])
-            size = entry["size"]
-            digest = entry["sha256"]
-            if type(size) is not int or size < 0:
-                raise ValueError("payload manifest entry size must be nonnegative")
-            if (
-                not isinstance(digest, str)
-                or _LOWERCASE_SHA256.fullmatch(digest) is None
-            ):
-                raise ValueError("payload manifest entry has malformed SHA-256")
-            if path in expected_by_path:
-                raise ValueError(f"payload manifest has duplicate path: {path}")
-            expected_paths.append(path)
-            expected_by_path[path] = (size, digest)
-        if expected_paths != sorted(
-            expected_paths,
-            key=lambda value: value.encode("utf-8"),
-        ):
-            raise ValueError("payload manifest paths are not in canonical order")
-
-        actual_payload = {
-            path: (member.st_size, member.sha256)
-            for path, member in initial.files.items()
-            if path not in _RESERVED_MANIFEST_PATHS
-        }
-        if set(expected_by_path) != set(actual_payload):
-            raise ValueError("payload manifest membership differs from staged tree")
-        for path, expected_identity in expected_by_path.items():
-            if actual_payload[path] != expected_identity:
-                raise ValueError(f"payload manifest identity differs for path: {path}")
+        manifest, _ = _validate_payload_manifest_capture(initial)
 
         _revalidate_open_capture(initial)
         final = _capture_staged_tree(staging, staging_fd)
@@ -3713,6 +3746,604 @@ def inspect_publication_state(staging: Path, output: Path) -> str:
     return "complete_unpublished"
 
 
+def _absolute_lexical_path(value: str | os.PathLike[str], label: str) -> Path:
+    text = os.fspath(value)
+    if not os.path.isabs(text):
+        raise ValueError(f"{label} must be absolute")
+    if any(component in {".", ".."} for component in text.split(os.sep)):
+        raise ValueError(f"{label} must not contain dot segments")
+    return Path(text)
+
+
+def _validate_preserved_staging_paths(
+    staging_value: str | os.PathLike[str],
+    output_value: str | os.PathLike[str],
+) -> tuple[Path, Path]:
+    staging = _absolute_lexical_path(staging_value, "staging path")
+    output = _absolute_lexical_path(output_value, "output path")
+    _validated_basename(output, "output path")
+    expected = re.fullmatch(
+        rf"\.{re.escape(output.name)}\.staging-"
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        staging.name,
+    )
+    if expected is None:
+        raise ValueError("staging path has the wrong direct-sibling name")
+    if staging.parent != output.parent:
+        raise ValueError("staging and output must be direct siblings")
+    return staging, output
+
+
+def _require_output_absent_at(
+    parent_fd: int,
+    output_name: bytes,
+    boundary: str,
+) -> None:
+    try:
+        os.stat(output_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    raise FileExistsError(f"canonical output exists at {boundary}")
+
+
+def _open_preserved_staging(
+    staging: Path,
+    output: Path,
+    ownership: _ConversionLockOwnership,
+) -> tuple[int, os.stat_result]:
+    parent_fd = ownership.parent_fd
+    _validate_owned_parent(ownership, output)
+    output_name = _validated_basename(output, "canonical output")
+    _require_output_absent_at(parent_fd, output_name, "initial validation")
+    staging_fd = None
+    try:
+        staging_name = _validated_basename(staging, "preserved staging")
+        pathname = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(pathname.st_mode):
+            raise RuntimeError("preserved staging is not a directory")
+        staging_fd = os.open(
+            staging_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        opened = _validate_descriptor_entry(
+            staging_fd,
+            parent_fd,
+            staging_name,
+            expected_type="directory",
+        )
+        if (opened.st_dev, opened.st_ino) != (pathname.st_dev, pathname.st_ino):
+            raise RuntimeError("preserved staging identity changed while opening")
+        _validate_owned_parent(ownership, output)
+        return staging_fd, opened
+    except BaseException:
+        if staging_fd is not None:
+            os.close(staging_fd)
+        raise
+
+
+def _read_regular_at(
+    directory_fd: int, name: str, label: str
+) -> tuple[bytes, os.stat_result]:
+    encoded = os.fsencode(name)
+    pathname = os.stat(encoded, dir_fd=directory_fd, follow_symlinks=False)
+    if not stat.S_ISREG(pathname.st_mode) or pathname.st_nlink != 1:
+        raise RuntimeError(f"unsafe {label}")
+    fd = os.open(
+        encoded,
+        os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+    )
+    try:
+        opened = _validate_descriptor_entry(
+            fd,
+            directory_fd,
+            encoded,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (opened.st_dev, opened.st_ino) != (pathname.st_dev, pathname.st_ino):
+            raise RuntimeError(f"{label} identity changed while opening")
+        payload = b"".join(iter(lambda: os.read(fd, 1024 * 1024), b""))
+        after = _validate_descriptor_entry(
+            fd,
+            directory_fd,
+            encoded,
+            expected_type="file",
+            require_single_link=True,
+        )
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+        ) or len(payload) != opened.st_size:
+            raise RuntimeError(f"{label} changed while being read")
+        return payload, opened
+    finally:
+        os.close(fd)
+
+
+def _tree_entry_type(metadata: os.stat_result) -> str:
+    if stat.S_ISDIR(metadata.st_mode):
+        return "directory"
+    if stat.S_ISREG(metadata.st_mode):
+        return "file"
+    if stat.S_ISLNK(metadata.st_mode):
+        return "symlink"
+    return "special"
+
+
+def _inspect_tree_at(
+    directory_fd: int,
+    relative: str,
+    root_device: int,
+) -> list[dict[str, object]]:
+    root_metadata = os.fstat(directory_fd)
+    result = [
+        {
+            "path": relative,
+            "type": "directory",
+            "st_dev": root_metadata.st_dev,
+            "st_ino": root_metadata.st_ino,
+            "st_nlink": root_metadata.st_nlink,
+            "mode": f"{stat.S_IMODE(root_metadata.st_mode):04o}",
+            "size": root_metadata.st_size,
+        }
+    ]
+    for name in sorted(os.listdir(directory_fd), key=lambda item: item.encode("utf-8")):
+        encoded = os.fsencode(name)
+        metadata = os.stat(encoded, dir_fd=directory_fd, follow_symlinks=False)
+        child_relative = name if relative == "." else f"{relative}/{name}"
+        entry_type = _tree_entry_type(metadata)
+        result.append(
+            {
+                "path": child_relative,
+                "type": entry_type,
+                "st_dev": metadata.st_dev,
+                "st_ino": metadata.st_ino,
+                "st_nlink": metadata.st_nlink,
+                "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+                "size": metadata.st_size,
+            }
+        )
+        if entry_type != "directory":
+            continue
+        if metadata.st_dev != root_device:
+            raise RuntimeError("preserved staging contains a mounted directory")
+        child_fd = os.open(
+            encoded,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        try:
+            opened = _validate_descriptor_entry(
+                child_fd,
+                directory_fd,
+                encoded,
+                expected_type="directory",
+            )
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise RuntimeError("preserved tree changed during inspection")
+            descendants = _inspect_tree_at(child_fd, child_relative, root_device)
+            result.extend(descendants[1:])
+        finally:
+            os.close(child_fd)
+    return result
+
+
+def _canonical_json_object(payload: bytes, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(
+            payload,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"invalid JSON constant: {constant}")
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{label} is not strict JSON") from exc
+    if not isinstance(value, dict) or payload != canonical_json_bytes(value):
+        raise ValueError(f"{label} bytes are not canonical")
+    return value
+
+
+def _validate_status_record_at(
+    status: dict[str, object],
+    payload: bytes,
+    staging_fd: int,
+) -> str:
+    root = os.fstat(staging_fd)
+    staging_identity = status.get("staging")
+    if not isinstance(staging_identity, dict) or set(staging_identity) != {
+        "st_dev",
+        "st_ino",
+    }:
+        raise RuntimeError("conversion status has an invalid staging identity")
+    if any(type(staging_identity.get(field)) is not int for field in staging_identity):
+        raise RuntimeError("conversion status has an invalid staging identity")
+    if (staging_identity["st_dev"], staging_identity["st_ino"]) != (
+        root.st_dev,
+        root.st_ino,
+    ):
+        raise RuntimeError("conversion status root identity differs")
+    state = status.get("state")
+    common = {"schema_version", "staging", "state"}
+    if (
+        status.get("schema_version") != 1
+        or type(status.get("schema_version")) is not int
+    ):
+        raise ValueError("conversion status has an invalid schema version")
+    if state == "in_progress":
+        if set(status) != common or payload != _in_progress_status_bytes(root):
+            raise ValueError("in_progress status has an invalid schema or binding")
+    elif state == "failed":
+        if set(status) != common | {"error", "error_type"} or not all(
+            isinstance(status.get(field), str) for field in ("error", "error_type")
+        ):
+            raise ValueError("failed status has an invalid schema")
+    elif state == "complete":
+        if set(status) != common | {
+            "manifest_sha256",
+            "manifest_size",
+            "entry_count",
+            "covered_bytes",
+            "converter",
+        }:
+            raise ValueError("complete status has an invalid schema")
+        for field in ("manifest_size", "entry_count", "covered_bytes"):
+            if type(status[field]) is not int or status[field] < 0:
+                raise ValueError(f"complete status has invalid {field}")
+        if (
+            not isinstance(status["manifest_sha256"], str)
+            or _LOWERCASE_SHA256.fullmatch(status["manifest_sha256"]) is None
+        ):
+            raise ValueError("complete status has invalid manifest SHA-256")
+        converter = status["converter"]
+        if (
+            not isinstance(converter, dict)
+            or set(converter) != {"commit", "script_sha256"}
+            or not isinstance(converter["commit"], str)
+            or re.fullmatch(r"[0-9a-f]{40}", converter["commit"]) is None
+            or not isinstance(converter["script_sha256"], str)
+            or _LOWERCASE_SHA256.fullmatch(converter["script_sha256"]) is None
+        ):
+            raise ValueError("complete status has invalid converter identity")
+    else:
+        raise ValueError("conversion status has an unknown state")
+    return state
+
+
+def _validate_final_capture_modes(
+    capture: _StagedTreeCapture,
+    staging_fd: int,
+) -> None:
+    root_device = os.fstat(staging_fd).st_dev
+    for path, member in capture.files.items():
+        metadata = os.fstat(member.fd)
+        _validate_manifest_member_metadata(metadata, path)
+        if metadata.st_dev != root_device or stat.S_IMODE(metadata.st_mode) != 0o444:
+            raise RuntimeError(f"canonical file has wrong identity or mode: {path}")
+    for path, directory in capture.directories.items():
+        metadata = os.fstat(directory.fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_dev != root_device
+            or metadata.st_nlink < 1
+            or stat.S_IMODE(metadata.st_mode) != 0o555
+        ):
+            raise RuntimeError(
+                f"canonical directory has wrong identity or mode: {path}"
+            )
+
+
+def _validate_complete_tree_at(
+    staging_fd: int,
+) -> tuple[dict[str, object], bytes]:
+    initial = None
+    final = None
+    try:
+        initial = _capture_staged_tree(None, staging_fd)
+        manifest, manifest_payload = _validate_payload_manifest_capture(initial)
+        status_member = initial.files[_STATUS_RELATIVE_PATH]
+        status_payload = _read_open_manifest_member(status_member)
+        status = _strict_canonical_json_member(status_member, "conversion status")
+        if not isinstance(status, dict):
+            raise ValueError("conversion status is not an object")
+        if _validate_status_record_at(status, status_payload, staging_fd) != "complete":
+            raise ValueError("conversion status is not complete")
+        entries = manifest["entries"]
+        assert isinstance(entries, list)
+        expected = {
+            "manifest_sha256": sha256_bytes(manifest_payload),
+            "manifest_size": len(manifest_payload),
+            "entry_count": len(entries),
+            "covered_bytes": sum(entry["size"] for entry in entries),
+        }
+        if any(status[field] != value for field, value in expected.items()):
+            raise RuntimeError("complete status differs from payload manifest")
+        _validate_final_capture_modes(initial, staging_fd)
+        _revalidate_open_capture(initial)
+        final = _capture_staged_tree(None, staging_fd)
+        _compare_tree_captures(initial, final)
+        _revalidate_open_capture(initial)
+        return manifest, manifest_payload
+    finally:
+        if final is not None:
+            final.close()
+        if initial is not None:
+            initial.close()
+
+
+def _inspect_manifest_at(staging_fd: int) -> dict[str, object]:
+    try:
+        metadata = os.stat(b"meta", dir_fd=staging_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return {"state": "absent"}
+    if not stat.S_ISDIR(metadata.st_mode):
+        return {"state": "invalid", "error": "meta is not a directory"}
+    meta_fd = None
+    try:
+        meta_fd = os.open(
+            b"meta",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=staging_fd,
+        )
+        opened = _validate_descriptor_entry(
+            meta_fd,
+            staging_fd,
+            b"meta",
+            expected_type="directory",
+        )
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise RuntimeError("meta identity changed during manifest inspection")
+        try:
+            os.stat(
+                b"conversion_manifest.json",
+                dir_fd=meta_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return {"state": "absent"}
+        value, manifest_payload = _validate_complete_tree_at(staging_fd)
+        return {
+            "state": "valid",
+            "sha256": sha256_bytes(manifest_payload),
+            "size": len(manifest_payload),
+            "entry_count": len(value["entries"]),
+        }
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"state": "invalid", "error": str(exc)}
+    finally:
+        if meta_fd is not None:
+            os.close(meta_fd)
+
+
+def _inspect_preserved_staging_locked(staging: Path, output: Path) -> dict[str, object]:
+    ownership = _conversion_lock_ownership(output)
+    parent_fd = ownership.parent_fd
+    staging_fd, staging_metadata = _open_preserved_staging(staging, output, ownership)
+    try:
+        status_payload, status_metadata = _read_regular_at(
+            staging_fd, _STATUS_RELATIVE_PATH, "conversion status"
+        )
+        status_value = None
+        try:
+            status_value = _canonical_json_object(
+                status_payload,
+                "conversion status",
+            )
+            state = _validate_status_record_at(
+                status_value,
+                status_payload,
+                staging_fd,
+            )
+            status_error = None
+        except (OSError, RuntimeError, ValueError) as exc:
+            state = status_value.get("state") if status_value is not None else None
+            status_error = str(exc)
+        tree = _inspect_tree_at(staging_fd, ".", staging_metadata.st_dev)
+        manifest = _inspect_manifest_at(staging_fd)
+        if status_error is not None:
+            if manifest.get("state") == "valid":
+                manifest = {"state": "invalid", "error": status_error}
+            classification = "completion_uncertain_unpublished"
+        elif state == "failed":
+            classification = "pre_completion_failed"
+        elif state == "in_progress":
+            classification = "completion_uncertain_unpublished"
+        elif state == "complete":
+            final_modes = all(
+                (entry["type"] == "file" and entry["mode"] == "0444")
+                or (entry["type"] == "directory" and entry["mode"] == "0555")
+                for entry in tree
+            )
+            if manifest.get("state") == "valid" and final_modes:
+                classification = "complete_unpublished"
+            else:
+                classification = "completion_uncertain_unpublished"
+        else:
+            classification = "completion_uncertain_unpublished"
+
+        _validate_owned_parent(ownership, output)
+        visible = _validate_descriptor_entry(
+            staging_fd,
+            parent_fd,
+            _validated_basename(staging, "preserved staging"),
+            expected_type="directory",
+        )
+        if (visible.st_dev, visible.st_ino) != (
+            staging_metadata.st_dev,
+            staging_metadata.st_ino,
+        ):
+            raise RuntimeError("preserved staging changed during inspection")
+        return {
+            "schema_version": 1,
+            "staging_path": str(staging),
+            "output_path": str(output),
+            "root_identity": {
+                "st_dev": staging_metadata.st_dev,
+                "st_ino": staging_metadata.st_ino,
+            },
+            "status": {
+                "bytes": status_payload.decode("utf-8"),
+                "sha256": sha256_bytes(status_payload),
+                "size": status_metadata.st_size,
+                "mode": f"{stat.S_IMODE(status_metadata.st_mode):04o}",
+            },
+            "manifest": manifest,
+            "failure_classification": classification,
+            "tree": tree,
+        }
+    finally:
+        os.close(staging_fd)
+
+
+def inspect_preserved_staging(
+    staging_value: str | os.PathLike[str],
+    output_value: str | os.PathLike[str],
+) -> dict[str, object]:
+    staging, output = _validate_preserved_staging_paths(staging_value, output_value)
+    with conversion_lock(output):
+        return _inspect_preserved_staging_locked(staging, output)
+
+
+def _remove_tree_contents_at(directory_fd: int, root_device: int) -> None:
+    for name in sorted(os.listdir(directory_fd), key=lambda item: item.encode("utf-8")):
+        encoded = os.fsencode(name)
+        metadata = os.stat(encoded, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(metadata.st_mode):
+            if metadata.st_dev != root_device:
+                raise RuntimeError("preserved staging contains a mounted directory")
+            child_fd = os.open(
+                encoded,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                opened = _validate_descriptor_entry(
+                    child_fd,
+                    directory_fd,
+                    encoded,
+                    expected_type="directory",
+                )
+                if (opened.st_dev, opened.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    raise RuntimeError("preserved tree changed during removal")
+                _remove_tree_contents_at(child_fd, root_device)
+                os.fsync(child_fd)
+                visible = _validate_descriptor_entry(
+                    child_fd,
+                    directory_fd,
+                    encoded,
+                    expected_type="directory",
+                )
+                if (visible.st_dev, visible.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    raise RuntimeError("preserved directory changed during removal")
+            finally:
+                os.close(child_fd)
+            os.rmdir(encoded, dir_fd=directory_fd)
+        else:
+            os.unlink(encoded, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+
+
+def remove_preserved_staging(
+    staging_value: str | os.PathLike[str],
+    output_value: str | os.PathLike[str],
+    *,
+    expected_status_sha256: str,
+    confirm_remove: str,
+) -> None:
+    staging, output = _validate_preserved_staging_paths(staging_value, output_value)
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_status_sha256):
+        raise ValueError("expected status SHA-256 must be 64 lowercase hex characters")
+    if confirm_remove != str(staging):
+        raise ValueError("removal confirmation does not exactly match staging path")
+    with conversion_lock(output):
+        _remove_preserved_staging_locked(
+            staging,
+            output,
+            expected_status_sha256=expected_status_sha256,
+        )
+
+
+def _remove_preserved_staging_locked(
+    staging: Path,
+    output: Path,
+    *,
+    expected_status_sha256: str,
+) -> None:
+    ownership = _conversion_lock_ownership(output)
+    parent_fd = ownership.parent_fd
+    output_name = _validated_basename(output, "canonical output")
+    staging_name = _validated_basename(staging, "preserved staging")
+    staging_fd, staging_metadata = _open_preserved_staging(staging, output, ownership)
+    try:
+        status_payload, _ = _read_regular_at(
+            staging_fd, _STATUS_RELATIVE_PATH, "conversion status"
+        )
+        if sha256_bytes(status_payload) != expected_status_sha256:
+            raise ValueError("conversion status SHA-256 does not match authorization")
+        status = _canonical_json_object(status_payload, "conversion status")
+        _validate_status_record_at(status, status_payload, staging_fd)
+        _validate_owned_parent(ownership, output)
+        visible = _validate_descriptor_entry(
+            staging_fd,
+            parent_fd,
+            staging_name,
+            expected_type="directory",
+        )
+        if (visible.st_dev, visible.st_ino) != (
+            staging_metadata.st_dev,
+            staging_metadata.st_ino,
+        ):
+            raise RuntimeError("preserved staging changed before removal")
+        _require_output_absent_at(
+            parent_fd,
+            output_name,
+            "before_recursive_mutation",
+        )
+        _remove_tree_contents_at(staging_fd, staging_metadata.st_dev)
+        _validate_owned_parent(ownership, output)
+        visible = _validate_descriptor_entry(
+            staging_fd,
+            parent_fd,
+            staging_name,
+            expected_type="directory",
+        )
+        if (visible.st_dev, visible.st_ino) != (
+            staging_metadata.st_dev,
+            staging_metadata.st_ino,
+        ):
+            raise RuntimeError("preserved staging changed before root removal")
+        _require_output_absent_at(
+            parent_fd,
+            output_name,
+            "before_staging_rmdir",
+        )
+        os.rmdir(staging_name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        try:
+            os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise RuntimeError("preserved staging removal did not persist")
+        _validate_owned_parent(ownership, output)
+    finally:
+        os.close(staging_fd)
+
+
 def publish_staged_dataset(
     staging: Path,
     output: Path,
@@ -4286,6 +4917,147 @@ def _generate_staged_dataset(plan: ConversionPlan, tree: _PinnedStagingTree) -> 
         )
 
 
+def no_fault(point: str) -> None:
+    del point
+
+
+def create_unique_staging(plan: ConversionPlan) -> Path:
+    output = plan.output_path
+    assert_conversion_lock_held(output)
+    if os.path.lexists(output):
+        raise FileExistsError(f"canonical output already exists: {output}")
+    parent_fd = _open_validated_directory(output.parent)
+    try:
+        for _attempt in range(100):
+            staging = output.parent / f".{output.name}.staging-{uuid.uuid4()}"
+            name = _validated_basename(staging, "staging root")
+            try:
+                os.mkdir(name, mode=0o755, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            staging_fd = None
+            try:
+                staging_fd = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                _validate_descriptor_entry(
+                    staging_fd,
+                    parent_fd,
+                    name,
+                    expected_type="directory",
+                )
+                _validate_descriptor_path(
+                    staging_fd, staging, expected_type="directory"
+                )
+                os.fsync(parent_fd)
+                return staging
+            finally:
+                if staging_fd is not None:
+                    os.close(staging_fd)
+        raise FileExistsError("could not allocate a unique staging directory")
+    finally:
+        os.close(parent_fd)
+
+
+def preflight_report(plan: ConversionPlan) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "output_path": str(plan.output_path),
+        "selected_episodes": len(plan.episodes),
+        "source_frames": sum(item.frame_count for item in plan.episodes),
+        "retained_frames": sum(len(item.retained_indices) for item in plan.episodes),
+        "media_mode": plan.media_mode,
+        "output_profile": asdict(plan.output_media),
+        "episodes": [
+            {
+                "source_episode_index": item.source_episode_index,
+                "output_episode_index": item.output_episode_index,
+                "source_frames": item.frame_count,
+                "retained_frames": len(item.retained_indices),
+                "source_media": asdict(item.source_media),
+            }
+            for item in plan.episodes
+        ],
+    }
+
+
+def report_conversion_failure(staging: Path, error: BaseException) -> None:
+    print(
+        f"CONVERSION_FAILED: preserved staging {staging}: "
+        f"{type(error).__name__}: {error}",
+        file=sys.stderr,
+    )
+    if not os.path.lexists(staging):
+        return
+    if isinstance(error, PublicationStateError):
+        return
+    try:
+        status, _ = _read_canonical_json_file(
+            staging / _STATUS_RELATIVE_PATH, "conversion status"
+        )
+    except (OSError, RuntimeError, ValueError):
+        return
+    if status.get("state") == "in_progress":
+        _replace_with_failed_status(staging, error, PublicationFilesystem())
+
+
+def certify_published_dataset(
+    publication: PublicationResult,
+    *,
+    psi0_root: Path,
+    psi0_commit: str,
+    python: Path,
+) -> Path:
+    from scripts.certify_psi0_dataset import certify_published_dataset as certify
+
+    return certify(
+        publication,
+        psi0_root=psi0_root,
+        psi0_commit=psi0_commit,
+        python=python,
+    )
+
+
+def run_conversion(args: argparse.Namespace) -> PublicationResult | ConversionPlan:
+    repository = Path(__file__).resolve().parents[1]
+    identity = resolve_converter_identity(repository, Path(__file__))
+    output = Path(args.out_dir).resolve(strict=False)
+    with conversion_lock(output):
+        plan = preflight_conversion(args, identity)
+        if args.preflight_only:
+            print(canonical_json_bytes(preflight_report(plan)).decode(), end="")
+            return plan
+        staging = create_unique_staging(plan)
+        write_in_progress_status(staging, plan)
+        try:
+            generate_staged_dataset(plan, staging)
+            validate_staged_dataset(staging, plan)
+            result = publish_staged_dataset(
+                staging,
+                output,
+                identity,
+                PublicationFilesystem(),
+                no_fault,
+            )
+        except (PublicationUncertainError, PublishedBoundaryError):
+            raise
+        except BaseException as exc:
+            report_conversion_failure(staging, exc)
+            raise
+        if result.state != "published":
+            raise AssertionError("publish_staged_dataset returned a non-success state")
+        if args.certify_psi0_root is not None:
+            certify_published_dataset(
+                result,
+                psi0_root=Path(args.certify_psi0_root),
+                psi0_commit=args.certify_psi0_commit,
+                python=Path(args.certify_python),
+            )
+        return result
+
+
 def write_downsampled_video(
     src_video: Path, dst_video: Path, skip: int, downsample: int, fps: int
 ):
@@ -4336,406 +5108,151 @@ def write_downsampled_video(
         )
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--sim-root",
-        required=True,
-        help="Path or glob pattern, e.g. data/datagen*/simple/G1WholebodyBendPick-v0",
-    )
+def _lowercase_hex_argument(length: int, label: str) -> Callable[[str], str]:
+    def parse(value: str) -> str:
+        if re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is None:
+            raise argparse.ArgumentTypeError(
+                f"{label} must be exactly {length} lowercase hexadecimal characters"
+            )
+        return value
+
+    return parse
+
+
+def _positive_integer_argument(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a positive integer") from exc
+    if result <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument("--sim-root")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--skip", type=int, default=60)
     parser.add_argument("--downsample", type=int, default=1)
-    parser.add_argument("--total_episodes", type=int, default=100)
-    parser.add_argument("--fps", type=int, default=default_fps)
+    parser.add_argument(
+        "--total-episodes",
+        "--total_episodes",
+        dest="total_episodes",
+        type=int,
+        default=100,
+    )
+    parser.add_argument("--fps", type=parse_rate, default=Fraction(default_fps, 1))
     parser.add_argument("--video-key", default="observation.rgb_head_stereo_left")
-    parser.add_argument("--chunks-size", type=int, default=1000)
-    args = parser.parse_args()
-    repository_root = Path(__file__).resolve().parents[1]
-    converter_commit = resolve_converter_commit(repository_root)
-
-    # last_episode_idx = 0
-    episode_idx = 0
-    last_index = 0
-    all_tasks = []
-
-    total_frames = 0
-    episodes = []
-    episode_stats_rows = []
-
-    all_states = []
-    all_actions = []
-    all_timestamp = []
-    all_frame_index = []
-    all_episode_index = []
-    all_index = []
-    all_task_index = []
-    all_done = []
-
-    out_dir = Path(args.out_dir).resolve()
-    (out_dir / "data").mkdir(parents=True, exist_ok=True)
-    (out_dir / "videos").mkdir(parents=True, exist_ok=True)
-    (out_dir / "meta").mkdir(parents=True, exist_ok=True)
-    print("created output directories at", out_dir)
-
-    sim_info = None
-
-    all_sim_roots = sorted(Path(p).resolve() for p in glob.glob(args.sim_root))
-    for sim_root in all_sim_roots:
-        if episode_idx >= args.total_episodes:
-            print(
-                f"Reached total_episodes={args.total_episodes}, stopping further processing."
-            )
-            break
-
-        print(f"Merging data: {sim_root}")
-
-        sim_info = json.loads((sim_root / "meta" / "info.json").read_text())
-        sim_tasks = load_jsonl(sim_root / "meta" / "tasks.jsonl")
-        episodes_info = load_jsonl(sim_root / "meta" / "episodes.jsonl")
-
-        original_fps = float(sim_info["fps"])
-        if args.fps / original_fps != args.downsample:
-            print(
-                f"Warning: The specified fps {args.fps} is not consistent with the original fps {original_fps} and downsample factor {args.downsample}."
-                f"The timestamps will be computed based on the specified fps."
-            )
-
-        curr_task_index_to_new_task_index = {}
-
-        def merge_task(task, all_tasks):
-            for t in all_tasks:
-                if t["task"] == task:
-                    return t["task_index"]
-            all_tasks.append(
-                {
-                    "task_index": len(all_tasks),
-                    "task": task,
-                }
-            )
-            return len(all_tasks) - 1
-
-        for t in sim_tasks:
-            task_index = t["task_index"]
-            task = t["task"]
-            curr_task_index_to_new_task_index[task_index] = merge_task(task, all_tasks)
-
-        data_files = sorted((sim_root / "data").glob("chunk-*/episode_*.parquet"))
-        for data_path in tqdm(data_files):  # for each episode
-            if episode_idx >= args.total_episodes:
-                print(
-                    f"Reached total_episodes={args.total_episodes}, stopping further processing."
-                )
-                break
-
-            ep_index = int(data_path.stem.split("_")[-1])
-            chunk_id = episode_idx // args.chunks_size
-
-            table = pq.read_table(data_path)
-            proprio = np.asarray(
-                table["observation.joint_qpos"].to_pylist(), dtype=np.float32
-            )
-            cmd = np.asarray(
-                table["observation.amo_policy_command"].to_pylist(), dtype=np.float32
-            )
-            target_yaw = np.asarray(
-                table["observation.amo_policy_target_yaw"].to_pylist(), dtype=np.float32
-            )
-            turning_flag = np.asanyarray(
-                table["observation.amo_policy_turning_flag"].to_pylist(),
-                dtype=np.float32,
-            )
-            action = np.asarray(table["action"].to_pylist(), dtype=np.float32)
-
-            history_cmd = np.concatenate([initial_command[None, :], cmd[:-1]], axis=0)
-            states, actions = build_vectors(
-                proprio, cmd, history_cmd, action, target_yaw, turning_flag
-            )
-            hand_joints, arm_joints, leg_joints, torso_rpy, prev_height = (
-                build_proprio_obs(proprio, history_cmd)
-            )
-
-            m = states.shape[0]
-            assert m >= args.skip, (
-                f"Episode {episode_idx} has only {m} frames, which is less than skip={args.skip}"
-            )
-            n = (m - args.skip) // args.downsample
-
-            done = np.zeros((n,), dtype=bool)
-            if n > 0:
-                done[-1] = True
-
-            # frame_index = np.asarray(table["frame_index"].to_pylist(), dtype=np.int64)
-            frame_index = np.asarray(range(n), dtype=np.int64)
-
-            # episode_index = np.asarray(table["episode_index"].to_pylist(), dtype=np.int64)
-            episode_index = np.asarray([episode_idx] * n, dtype=np.int64)
-
-            # index = np.asarray(table["index"].to_pylist(), dtype=np.int64)
-            index = np.asarray(table["index"].to_pylist(), dtype=np.int64) + last_index
-
-            # timesteps = np.asarray([round(ts * original_fps) for ts in table["timestamp"].to_pylist()], dtype=np.float32)
-            timestamp = frame_index * 1.0 / args.fps
-
-            curr_task_indices = np.asarray(
-                table["task_index"].to_pylist(), dtype=np.int64
-            )
-            assert np.all(curr_task_indices == curr_task_indices[0]), (
-                f"Episode {episode_idx} has multiple task indices: {set(curr_task_indices)}"
-            )
-            new_task_index = curr_task_index_to_new_task_index[curr_task_indices[0]]
-            task_index = np.asarray([new_task_index] * n, dtype=np.int64)
-
-            out_table = pa.table(
-                {
-                    "states": states[args.skip :][:: args.downsample].tolist(),
-                    "action": actions[args.skip :][:: args.downsample].tolist(),
-                    "observation.hand_joints": hand_joints[args.skip :][
-                        :: args.downsample
-                    ].tolist(),
-                    "observation.arm_joints": arm_joints[args.skip :][
-                        :: args.downsample
-                    ].tolist(),
-                    "observation.leg_joints": leg_joints[args.skip :][
-                        :: args.downsample
-                    ].tolist(),
-                    "observation.prev_torso_rpy": torso_rpy[args.skip :][
-                        :: args.downsample
-                    ].tolist(),
-                    "observation.prev_height": prev_height[args.skip :][
-                        :: args.downsample
-                    ].tolist(),
-                    "timestamp": timestamp,
-                    "frame_index": frame_index,
-                    "episode_index": episode_index,
-                    "index": index[args.skip :][:: args.downsample],
-                    "task_index": task_index,
-                    "next.done": done,
-                }
-            )
-
-            out_data_dir = out_dir / "data" / f"chunk-{chunk_id:03d}"
-            out_data_dir.mkdir(parents=True, exist_ok=True)
-            pq.write_table(
-                out_table, out_data_dir / f"episode_{episode_idx:06d}.parquet"
-            )
-
-            src_chunk = data_path.parent.name
-            src_episode_idx = int(data_path.stem.split("_")[-1])
-            src_video = (
-                sim_root
-                / "videos"
-                / src_chunk
-                / args.video_key
-                / f"episode_{src_episode_idx:06d}.mp4"
-            )
-            dst_video_dir = out_dir / "videos" / f"chunk-{chunk_id:03d}" / "egocentric"
-            dst_video_dir.mkdir(parents=True, exist_ok=True)
-            dst_video = dst_video_dir / f"episode_{episode_idx:06d}.mp4"
-            if src_video.exists():
-                write_downsampled_video(
-                    src_video=src_video,
-                    dst_video=dst_video,
-                    skip=args.skip,
-                    downsample=args.downsample,
-                    fps=args.fps,
-                )
-
-            total_frames += n
-            ep_task = task_index[0]  # ) if len(task_index) else 0
-            conversion_provenance = build_conversion_provenance(
-                source_path=data_path,
-                source_episode_index=ep_index,
-                skip=args.skip,
-                downsample=args.downsample,
-                converter_commit=converter_commit,
-            )
-            episodes.append(
-                {
-                    "episode_index": episode_idx,
-                    "tasks": [ep_task],
-                    "length": n,
-                    "dataset_from_index": total_frames - n,
-                    "dataset_to_index": total_frames - 1,
-                    "robot_type": "g1",
-                    "instruction": all_tasks[task_index[0]],
-                    "environment_config": episodes_info[ep_index]["environment_config"],
-                    "conversion_provenance": conversion_provenance,
-                }
-            )
-
-            ep_stats = {
-                "episode_index": episode_idx,
-                "stats": {
-                    "action": {**stats_block(actions), "count": [int(n)]},
-                    "timestamp": {**stats_block(timestamp), "count": [int(n)]},
-                },
-            }
-            episode_stats_rows.append(ep_stats)
-
-            all_states.append(states)
-            all_actions.append(actions)
-            all_timestamp.append(timestamp)
-            all_frame_index.append(frame_index)
-            all_episode_index.append(episode_index)
-            all_index.append(index)
-            all_task_index.append(task_index)
-            all_done.append(done.astype(np.float32))
-
-            last_index += n
-            episode_idx += 1
-
-    all_states = (
-        np.concatenate(all_states, axis=0)
-        if all_states
-        else np.zeros((0, 32), dtype=np.float32)
+    parser.add_argument("--chunks-size", type=_positive_integer_argument, default=1000)
+    parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--certify-psi0-root")
+    parser.add_argument(
+        "--certify-psi0-commit",
+        type=_lowercase_hex_argument(40, "PSI0 commit"),
     )
-    all_actions = (
-        np.concatenate(all_actions, axis=0)
-        if all_actions
-        else np.zeros((0, 36), dtype=np.float32)
+    parser.add_argument("--certify-python")
+    parser.add_argument("--inspect-preserved-staging")
+    parser.add_argument("--remove-preserved-staging")
+    parser.add_argument(
+        "--expected-status-sha256",
+        type=_lowercase_hex_argument(64, "status SHA-256"),
     )
-    all_timestamp = (
-        np.concatenate(all_timestamp, axis=0)
-        if all_timestamp
-        else np.zeros((0,), dtype=np.float32)
-    )
-    all_frame_index = (
-        np.concatenate(all_frame_index, axis=0)
-        if all_frame_index
-        else np.zeros((0,), dtype=np.float32)
-    )
-    all_episode_index = (
-        np.concatenate(all_episode_index, axis=0)
-        if all_episode_index
-        else np.zeros((0,), dtype=np.float32)
-    )
-    all_index = (
-        np.concatenate(all_index, axis=0)
-        if all_index
-        else np.zeros((0,), dtype=np.float32)
-    )
-    all_task_index = (
-        np.concatenate(all_task_index, axis=0)
-        if all_task_index
-        else np.zeros((0,), dtype=np.float32)
-    )
-    all_done = (
-        np.concatenate(all_done, axis=0)
-        if all_done
-        else np.zeros((0,), dtype=np.float32)
-    )
+    parser.add_argument("--confirm-remove")
+    return parser
 
-    task_by_index = {}
-    tasks_rows = []
-    for t in all_tasks:
-        ti = t.get("task_index", 0)
-        task_by_index[int(ti)] = t.get("task", "")
-        tasks_rows.append(
-            {
-                "task_index": int(ti),
-                "task": t.get("task", ""),
-                "category": "",
-                "description": t.get("task", ""),
-            }
+
+def _argv_contains(raw: list[str], option: str) -> bool:
+    return any(value == option or value.startswith(option + "=") for value in raw)
+
+
+def _validate_cli_mode(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    raw: list[str],
+) -> Literal["conversion", "inspection", "removal"]:
+    inspection = args.inspect_preserved_staging is not None
+    removal = args.remove_preserved_staging is not None
+    if inspection and removal:
+        parser.error("inspection and removal modes are mutually exclusive")
+    if inspection or removal:
+        forbidden = (
+            "--sim-root",
+            "--skip",
+            "--downsample",
+            "--total-episodes",
+            "--total_episodes",
+            "--fps",
+            "--video-key",
+            "--chunks-size",
+            "--preflight-only",
+            "--certify-psi0-root",
+            "--certify-psi0-commit",
+            "--certify-python",
         )
+        if any(_argv_contains(raw, option) for option in forbidden):
+            parser.error("maintenance mode cannot include conversion options")
+        if inspection:
+            if (
+                args.expected_status_sha256 is not None
+                or args.confirm_remove is not None
+            ):
+                parser.error("inspection does not accept removal authorization")
+            return "inspection"
+        if args.expected_status_sha256 is None or args.confirm_remove is None:
+            parser.error("removal requires status digest and exact confirmation")
+        return "removal"
 
-    meta_dir = out_dir / "meta"
-    write_jsonl(meta_dir / "tasks.jsonl", tasks_rows)
-    print("Wrote tasks.jsonl with", len(tasks_rows), "tasks")
-    write_jsonl(
-        meta_dir / "episodes.jsonl", sorted(episodes, key=lambda r: r["episode_index"])
+    if args.expected_status_sha256 is not None or args.confirm_remove is not None:
+        parser.error("removal authorization requires --remove-preserved-staging")
+    if args.sim_root is None:
+        parser.error("conversion requires --sim-root")
+    certification = (
+        args.certify_psi0_root,
+        args.certify_psi0_commit,
+        args.certify_python,
     )
-    print("Wrote episodes.jsonl with", len(episodes), "episodes")
-    write_jsonl(
-        meta_dir / "episodes_stats.jsonl",
-        sorted(episode_stats_rows, key=lambda r: r["episode_index"]),
-    )
-    print("Wrote episodes_stats.jsonl")
+    if sum(value is not None for value in certification) not in {0, 3}:
+        parser.error("certification requires PSI0 root, commit, and Python")
+    return "conversion"
 
-    assert sim_info is not None
-    video_feat = sim_info["features"][args.video_key]
 
-    info = {
-        "codebase_version": "v2.1",
-        "robot_type": "g1",
-        "total_episodes": len(episodes),
-        "total_frames": int(total_frames),
-        "total_tasks": len(tasks_rows),
-        "total_videos": len(episodes),
-        "total_chunks": math.ceil(len(episodes) / args.chunks_size)
-        if args.chunks_size
-        else 1,
-        "chunks_size": args.chunks_size,
-        "fps": args.fps,
-        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-        "video_path": "videos/chunk-{episode_chunk:03d}/egocentric/episode_{episode_index:06d}.mp4",
-        "features": {
-            "observation.images.egocentric": {
-                "dtype": video_feat.get("dtype", "video"),
-                "shape": video_feat.get("shape", [360, 640, 3]),
-                "names": ["height", "width", "channel"],
-                "video_info": video_feat.get("info", video_feat.get("video_info", {})),
-            },
-            "observation.hand_joints": {
-                "dtype": "float32",
-                "shape": [14],
-                "names": ["hand_joints"],
-            },
-            "observation.arm_joints": {
-                "dtype": "float32",
-                "shape": [14],
-                "names": ["arm_joints"],
-            },
-            "observation.leg_joints": {
-                "dtype": "float32",
-                "shape": [15],
-                "names": ["leg_joints"],
-            },
-            "observation.prev_torso_rpy": {
-                "dtype": "float32",
-                "shape": [3],
-                "names": ["prev_roll", "prev_pitch", "prev_yaw"],
-            },
-            "observation.prev_height": {
-                "dtype": "float32",
-                "shape": [1],
-                "names": ["prev_height"],
-            },
-            "states": {"dtype": "float32", "shape": [-1]},
-            "action": {"dtype": "float32", "shape": [-1]},
-            "timestamp": {"dtype": "float32", "shape": [1]},
-            "frame_index": {"dtype": "int64", "shape": [1]},
-            "episode_index": {"dtype": "int64", "shape": [1]},
-            "index": {"dtype": "int64", "shape": [1]},
-            "next.done": {"dtype": "bool", "shape": [1]},
-            "task_index": {"dtype": "int64", "shape": [1]},
-        },
-    }
-    (meta_dir / "info.json").write_text(json.dumps(info, indent=4))
-    print("Wrote info.json")
-
-    stats = {
-        "states": stats_block(all_states),
-        "action": stats_block(all_actions),
-        "timestamp": stats_block(all_timestamp),
-        "frame_index": stats_block(all_frame_index),
-        "episode_index": stats_block(all_episode_index),
-        "index": stats_block(all_index),
-        "task_index": stats_block(all_task_index),
-        "next.done": stats_block(all_done),
-    }
-    (meta_dir / "stats.json").write_text(json.dumps(stats, indent=4))
-    print("Wrote stats.json")
-    (meta_dir / "stats_psi0.json").write_text(json.dumps(stats, indent=4))
-    print("Wrote stats_psi0.json")
-    (meta_dir / "relative_stats.json").write_text("{}")
-    print("Wrote relative_stats.json")
-    (meta_dir / "lang_map.json").write_text("{}")
-    print("Wrote lang_map.json")
-    (meta_dir / "modality.json").write_text(json.dumps(modality_dict(), indent=2))
-    print("Wrote modality.json")
+def main(argv: list[str] | None = None) -> int:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(raw)
+    mode = _validate_cli_mode(parser, args, raw)
+    if mode == "inspection":
+        report = inspect_preserved_staging(
+            args.inspect_preserved_staging,
+            args.out_dir,
+        )
+        print(canonical_json_bytes(report).decode(), end="")
+        return 0
+    if mode == "removal":
+        staging = _absolute_lexical_path(args.remove_preserved_staging, "staging path")
+        remove_preserved_staging(
+            staging,
+            args.out_dir,
+            expected_status_sha256=args.expected_status_sha256,
+            confirm_remove=args.confirm_remove,
+        )
+        print(
+            canonical_json_bytes(
+                {
+                    "schema_version": 1,
+                    "removed": str(staging),
+                    "output_path": str(
+                        _absolute_lexical_path(args.out_dir, "output path")
+                    ),
+                }
+            ).decode(),
+            end="",
+        )
+        return 0
+    run_conversion(args)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,7 +1,11 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
+import sys
+import time
+import uuid
 from dataclasses import asdict, replace
 from fractions import Fraction
 from pathlib import Path
@@ -808,3 +812,1317 @@ def test_generation_refuses_existing_staging_tree(tmp_path, plan):
         converter.generate_staged_dataset(plan, staging)
 
     assert sentinel.read_bytes() == b"preserve\n"
+
+
+def _conversion_argv(source: Path, output: Path) -> list[str]:
+    return [
+        "--sim-root",
+        str(source),
+        "--out-dir",
+        str(output),
+        "--skip",
+        "0",
+        "--downsample",
+        "1",
+        "--total-episodes",
+        "1",
+        "--fps",
+        "4",
+        "--video-key",
+        "observation.rgb_head_stereo_left",
+        "--chunks-size",
+        "1000",
+    ]
+
+
+def _recorded_converter_identity() -> converter.ConverterIdentity:
+    repository = Path(__file__).resolve().parents[1]
+    commit = subprocess.run(
+        ["git", "log", "-1", "--format=%H", "--", "scripts/postprocess_psi0.py"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    payload = subprocess.run(
+        ["git", "show", f"{commit}:scripts/postprocess_psi0.py"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+    ).stdout
+    return converter.ConverterIdentity(commit, converter.sha256_bytes(payload))
+
+
+def _failed_staging(output: Path) -> Path:
+    staging = output.parent / f".{output.name}.staging-{uuid.uuid4()}"
+    staging.mkdir(mode=0o755)
+    error = RuntimeError("synthetic generation failure")
+    (staging / "CONVERSION_STATUS.json").write_bytes(
+        converter._failed_status_bytes(staging, error)
+    )
+    return staging
+
+
+def _complete_staging(output: Path) -> Path:
+    staging = output.parent / f".{output.name}.staging-{uuid.uuid4()}"
+    staging.mkdir(mode=0o755)
+    for name in ("data", "videos", "meta"):
+        (staging / name).mkdir(mode=0o755)
+    (staging / "data" / "payload.bin").write_bytes(b"certified payload\n")
+    (staging / "CONVERSION_STATUS.json").write_bytes(
+        converter._in_progress_status_bytes(staging.stat(follow_symlinks=False))
+    )
+    manifest = converter.build_payload_manifest(staging)
+    manifest_payload = converter.canonical_json_bytes(manifest)
+    (staging / "meta" / "conversion_manifest.json").write_bytes(manifest_payload)
+    (staging / "CONVERSION_STATUS.json").write_bytes(
+        converter._complete_status_bytes(
+            staging,
+            manifest,
+            manifest_payload,
+            converter.ConverterIdentity("a" * 40, "b" * 64),
+        )
+    )
+    for path in staging.rglob("*"):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    staging.chmod(0o555)
+    return staging
+
+
+def _replace_sealed_json(path: Path, value: object) -> None:
+    path.parent.chmod(0o755)
+    path.chmod(0o644)
+    path.write_bytes(converter.canonical_json_bytes(value))
+    path.chmod(0o444)
+    path.parent.chmod(0o555)
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[int, int, int, str | None]]:
+    snapshot = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        metadata = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        digest = converter.sha256_file(path) if stat.S_ISREG(metadata.st_mode) else None
+        snapshot[relative] = (
+            stat.S_IFMT(metadata.st_mode),
+            stat.S_IMODE(metadata.st_mode),
+            metadata.st_ino,
+            digest,
+        )
+    return snapshot
+
+
+def test_cli_accepts_exact_conversion_options_and_legacy_episode_alias(tmp_path):
+    parser = converter.build_parser()
+    common = [
+        "--sim-root",
+        str(tmp_path / "source-*"),
+        "--out-dir",
+        str(tmp_path / "processed"),
+        "--skip",
+        "3",
+        "--downsample",
+        "2",
+        "--fps",
+        "25/2",
+        "--video-key",
+        "camera",
+        "--chunks-size",
+        "17",
+        "--preflight-only",
+    ]
+
+    dashed = parser.parse_args([*common, "--total-episodes", "9"])
+    underscored = parser.parse_args([*common, "--total_episodes", "9"])
+
+    for args in (dashed, underscored):
+        assert args.sim_root == str(tmp_path / "source-*")
+        assert args.out_dir == str(tmp_path / "processed")
+        assert args.skip == 3
+        assert args.downsample == 2
+        assert args.total_episodes == 9
+        assert args.fps == Fraction(25, 2)
+        assert args.video_key == "camera"
+        assert args.chunks_size == 17
+        assert args.preflight_only is True
+        assert args.certify_psi0_root is None
+        assert args.certify_psi0_commit is None
+        assert args.certify_python is None
+
+
+@pytest.mark.parametrize("fps", ["0", "-1", "not-a-rate"])
+def test_cli_rejects_nonpositive_or_invalid_fps(fps):
+    with pytest.raises(SystemExit):
+        converter.build_parser().parse_args(["--out-dir", "/tmp/output", "--fps", fps])
+
+
+@pytest.mark.parametrize("chunks_size", ["0", "-1", "not-an-integer"])
+def test_cli_rejects_nonpositive_or_invalid_chunks_size(chunks_size):
+    with pytest.raises(SystemExit):
+        converter.build_parser().parse_args(
+            ["--out-dir", "/tmp/output", "--chunks-size", chunks_size]
+        )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--certify-psi0-root", "/tmp/psi0"],
+        ["--certify-psi0-commit", "a" * 40],
+        ["--certify-python", sys.executable],
+        [
+            "--certify-psi0-root",
+            "/tmp/psi0",
+            "--certify-psi0-commit",
+            "a" * 40,
+        ],
+    ],
+)
+def test_cli_rejects_partial_certification_option_sets(tmp_path, options):
+    source = make_source_episode(tmp_path / "source", frames=2, fps=4)
+    with pytest.raises(SystemExit):
+        converter.main([*_conversion_argv(source, tmp_path / "output"), *options])
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--inspect-preserved-staging", "/tmp/.output.staging-" + str(uuid.uuid4())],
+        [
+            "--remove-preserved-staging",
+            "/tmp/.output.staging-" + str(uuid.uuid4()),
+            "--expected-status-sha256",
+            "a" * 64,
+            "--confirm-remove",
+            "/tmp/.output.staging-" + str(uuid.uuid4()),
+        ],
+    ],
+)
+def test_cli_maintenance_modes_reject_conversion_and_certification_options(options):
+    with pytest.raises(SystemExit):
+        converter.main(
+            [
+                "--out-dir",
+                "/tmp/output",
+                *options,
+                "--sim-root",
+                "/tmp/source",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "abbreviated",
+    [
+        ["--ski", "1"],
+        ["--certify-psi0-r", "/tmp/psi0"],
+    ],
+)
+def test_cli_maintenance_rejects_abbreviated_conversion_and_certification_options(
+    tmp_path,
+    abbreviated,
+):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    before = _tree_snapshot(staging)
+
+    with pytest.raises(SystemExit):
+        converter.main(
+            [
+                "--out-dir",
+                str(output),
+                "--inspect-preserved-staging",
+                str(staging),
+                *abbreviated,
+            ]
+        )
+
+    assert _tree_snapshot(staging) == before
+
+
+def test_cli_rejects_combined_inspection_and_removal():
+    staging = "/tmp/.output.staging-" + str(uuid.uuid4())
+    with pytest.raises(SystemExit):
+        converter.main(
+            [
+                "--out-dir",
+                "/tmp/output",
+                "--inspect-preserved-staging",
+                staging,
+                "--remove-preserved-staging",
+                staging,
+                "--expected-status-sha256",
+                "a" * 64,
+                "--confirm-remove",
+                staging,
+            ]
+        )
+
+
+def test_cli_subprocess_attests_real_committed_script(tmp_path):
+    source = make_source_episode(tmp_path / "source", frames=3, fps=4)
+    repository = tmp_path / "repository"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    script = scripts / "postprocess_psi0.py"
+    shutil.copyfile(Path(converter.__file__), script)
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "add", "scripts/postprocess_psi0.py"], cwd=repository, check=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Task Nine",
+            "-c",
+            "user.email=task9@example.invalid",
+            "commit",
+            "-qm",
+            "record converter",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    expected_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    output = tmp_path / "processed"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--preflight-only",
+            *_conversion_argv(source, output),
+        ],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    report = json.loads(completed.stdout)
+    assert report["selected_episodes"] == 1
+    assert report["retained_frames"] == 3
+    assert (
+        expected_commit
+        == subprocess.run(
+            ["git", "log", "-1", "--format=%H", "--", "scripts/postprocess_psi0.py"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    assert not output.exists()
+    assert not list(tmp_path.glob(".processed.staging-*"))
+
+
+def test_certificate_array_expansion_is_executable(tmp_path):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    certificate = parent / (
+        ".output.certification-" + "a" * 64 + "-00000000-0000-0000-0000-000000000001"
+    )
+    certificate.mkdir()
+    script = r"""
+set -euo pipefail
+PARENT=$1
+mapfile -t CERTS < <(find "$PARENT" -maxdepth 1 -type d -name '.output.certification-*' -print | sort)
+test "${#CERTS[@]}" -eq 1
+CERT_ROOT=${CERTS[0]}
+test "$CERT_ROOT" = "$PARENT/.output.certification-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-00000000-0000-0000-0000-000000000001"
+"""
+    subprocess.run(["bash", "-c", script, "bash", str(parent)], check=True)
+
+
+def test_preserved_staging_inspection_is_no_follow_and_read_only(tmp_path):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    nested = staging / "nested"
+    nested.mkdir()
+    (nested / "payload").write_bytes(b"payload")
+    (nested / "leaf-link").symlink_to(tmp_path / "outside")
+    before = _tree_snapshot(staging)
+
+    report = converter.inspect_preserved_staging(staging, output)
+
+    assert _tree_snapshot(staging) == before
+    assert report["schema_version"] == 1
+    assert report["staging_path"] == str(staging.absolute())
+    assert report["output_path"] == str(output.absolute())
+    assert report["failure_classification"] == "pre_completion_failed"
+    assert report["status"]["bytes"] == (staging / "CONVERSION_STATUS.json").read_text()
+    assert report["status"]["sha256"] == converter.sha256_file(
+        staging / "CONVERSION_STATUS.json"
+    )
+    assert report["manifest"]["state"] == "absent"
+    assert [entry["path"] for entry in report["tree"]] == sorted(
+        before, key=lambda value: value.encode("utf-8")
+    )
+    assert (
+        next(item for item in report["tree"] if item["path"] == "nested/leaf-link")[
+            "type"
+        ]
+        == "symlink"
+    )
+
+
+def test_preserved_staging_inspection_never_reads_through_manifest_ancestor(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    external_meta = tmp_path / "external-meta"
+    external_meta.mkdir()
+    (external_meta / "conversion_manifest.json").write_bytes(b"external")
+    (staging / "meta").symlink_to(external_meta, target_is_directory=True)
+    actual_read = converter._read_regular_file_bytes
+
+    def reject_external_read(path, label):
+        if path == staging / "meta/conversion_manifest.json":
+            pytest.fail("inspection followed an untrusted manifest ancestor")
+        return actual_read(path, label)
+
+    monkeypatch.setattr(converter, "_read_regular_file_bytes", reject_external_read)
+
+    report = converter.inspect_preserved_staging(staging, output)
+
+    assert report["manifest"]["state"] in {"absent", "invalid"}
+    assert (
+        next(item for item in report["tree"] if item["path"] == "meta")["type"]
+        == "symlink"
+    )
+
+
+def test_preserved_complete_staging_inspection_validates_full_bound_tree(tmp_path):
+    output = tmp_path / "output"
+    staging = _complete_staging(output)
+
+    report = converter.inspect_preserved_staging(staging, output)
+
+    assert report["manifest"]["state"] == "valid"
+    assert report["failure_classification"] == "complete_unpublished"
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing_status_field",
+        "empty_entries",
+        "wrong_hash",
+        "extra_file",
+        "missing_file",
+        "wrong_root_identity",
+    ],
+)
+def test_preserved_complete_staging_inspection_rejects_corrupt_binding(
+    tmp_path,
+    corruption,
+):
+    output = tmp_path / "output"
+    staging = _complete_staging(output)
+    status_path = staging / "CONVERSION_STATUS.json"
+    manifest_path = staging / "meta" / "conversion_manifest.json"
+
+    if corruption in {"missing_status_field", "wrong_root_identity"}:
+        status = _strict_json(status_path.read_bytes())
+        if corruption == "missing_status_field":
+            del status["entry_count"]
+        else:
+            status["staging"]["st_ino"] += 1
+        _replace_sealed_json(status_path, status)
+    elif corruption in {"empty_entries", "wrong_hash"}:
+        manifest = _strict_json(manifest_path.read_bytes())
+        if corruption == "empty_entries":
+            manifest["entries"] = []
+        else:
+            manifest["entries"][0]["sha256"] = "0" * 64
+        _replace_sealed_json(manifest_path, manifest)
+    elif corruption == "extra_file":
+        data = staging / "data"
+        data.chmod(0o755)
+        (data / "extra.bin").write_bytes(b"extra\n")
+        (data / "extra.bin").chmod(0o444)
+        data.chmod(0o555)
+    else:
+        data = staging / "data"
+        data.chmod(0o755)
+        (data / "payload.bin").unlink()
+        data.chmod(0o555)
+    before = _tree_snapshot(staging)
+
+    report = converter.inspect_preserved_staging(staging, output)
+
+    assert _tree_snapshot(staging) == before
+    assert report["manifest"]["state"] == "invalid"
+    assert report["failure_classification"] == "completion_uncertain_unpublished"
+
+
+def test_preserved_staging_removal_rejects_status_bound_to_another_root(tmp_path):
+    output = tmp_path / "output"
+    staging = _complete_staging(output)
+    status_path = staging / "CONVERSION_STATUS.json"
+    status = _strict_json(status_path.read_bytes())
+    status["staging"]["st_ino"] += 1
+    _replace_sealed_json(status_path, status)
+    status_sha256 = converter.sha256_file(status_path)
+    before = _tree_snapshot(staging)
+
+    with pytest.raises(RuntimeError, match="identity|root"):
+        converter.remove_preserved_staging(
+            staging,
+            output,
+            expected_status_sha256=status_sha256,
+            confirm_remove=str(staging),
+        )
+
+    assert _tree_snapshot(staging) == before
+
+
+def test_preserved_staging_removal_is_fd_relative_and_preserves_siblings(tmp_path):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    nested = staging / "nested"
+    nested.mkdir()
+    payload = nested / "payload"
+    payload.write_bytes(b"payload")
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    (nested / "leaf-link").symlink_to(outside)
+    hard_link = nested / "hard-link"
+    os.link(outside, hard_link)
+    sibling = tmp_path / "unrelated"
+    sibling.mkdir()
+    (sibling / "sentinel").write_bytes(b"preserve")
+    status_sha256 = converter.sha256_file(staging / "CONVERSION_STATUS.json")
+
+    converter.remove_preserved_staging(
+        staging,
+        output,
+        expected_status_sha256=status_sha256,
+        confirm_remove=str(staging.absolute()),
+    )
+
+    assert not os.path.lexists(staging)
+    assert outside.read_bytes() == b"outside"
+    assert (sibling / "sentinel").read_bytes() == b"preserve"
+
+
+def test_preserved_staging_removal_holds_lock_through_mutation_and_parent_fsync(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    (staging / "payload").write_bytes(b"payload")
+    status_sha256 = converter.sha256_file(staging / "CONVERSION_STATUS.json")
+    actual_unlink = converter.os.unlink
+    actual_fsync = converter.os.fsync
+    mutation_seen = False
+    parent_fsync_seen = False
+
+    def checked_unlink(*args, **kwargs):
+        nonlocal mutation_seen
+        converter.assert_conversion_lock_held(output)
+        mutation_seen = True
+        return actual_unlink(*args, **kwargs)
+
+    def checked_fsync(fd):
+        nonlocal parent_fsync_seen
+        if mutation_seen:
+            converter.assert_conversion_lock_held(output)
+            parent_fsync_seen = True
+        return actual_fsync(fd)
+
+    monkeypatch.setattr(converter.os, "unlink", checked_unlink)
+    monkeypatch.setattr(converter.os, "fsync", checked_fsync)
+
+    converter.remove_preserved_staging(
+        staging,
+        output,
+        expected_status_sha256=status_sha256,
+        confirm_remove=str(staging),
+    )
+
+    assert mutation_seen
+    assert parent_fsync_seen
+
+
+def test_preserved_staging_output_race_before_recursive_mutation_keeps_tree(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    nested = staging / "nested"
+    nested.mkdir()
+    (nested / "payload").write_bytes(b"payload")
+    before = _tree_snapshot(staging)
+    status_sha256 = converter.sha256_file(staging / "CONVERSION_STATUS.json")
+    actual = converter._require_output_absent_at
+
+    def create_output(parent_fd, output_name, boundary):
+        if boundary == "before_recursive_mutation":
+            os.mkdir(output_name, dir_fd=parent_fd)
+        return actual(parent_fd, output_name, boundary)
+
+    monkeypatch.setattr(converter, "_require_output_absent_at", create_output)
+
+    with pytest.raises(FileExistsError):
+        converter.remove_preserved_staging(
+            staging,
+            output,
+            expected_status_sha256=status_sha256,
+            confirm_remove=str(staging),
+        )
+
+    assert _tree_snapshot(staging) == before
+    assert output.is_dir()
+
+
+def test_preserved_staging_output_race_before_root_rmdir_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    (staging / "payload").write_bytes(b"payload")
+    status_sha256 = converter.sha256_file(staging / "CONVERSION_STATUS.json")
+    actual = converter._require_output_absent_at
+
+    def create_output(parent_fd, output_name, boundary):
+        if boundary == "before_staging_rmdir":
+            os.mkdir(output_name, dir_fd=parent_fd)
+        return actual(parent_fd, output_name, boundary)
+
+    monkeypatch.setattr(converter, "_require_output_absent_at", create_output)
+
+    with pytest.raises(FileExistsError):
+        converter.remove_preserved_staging(
+            staging,
+            output,
+            expected_status_sha256=status_sha256,
+            confirm_remove=str(staging),
+        )
+
+    assert staging.is_dir()
+    assert output.is_dir()
+
+
+@pytest.mark.parametrize(
+    "failure", ["wrong_digest", "wrong_confirmation", "output_exists"]
+)
+def test_preserved_staging_removal_rejects_wrong_authorization(tmp_path, failure):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    status_sha256 = converter.sha256_file(staging / "CONVERSION_STATUS.json")
+    confirmation = str(staging.absolute())
+    if failure == "wrong_digest":
+        status_sha256 = "0" * 64
+    elif failure == "wrong_confirmation":
+        confirmation = str(staging) + "-wrong"
+    else:
+        output.mkdir()
+
+    with pytest.raises((ValueError, RuntimeError, FileExistsError)):
+        converter.remove_preserved_staging(
+            staging,
+            output,
+            expected_status_sha256=status_sha256,
+            confirm_remove=confirmation,
+        )
+
+    assert staging.is_dir()
+
+
+@pytest.mark.parametrize(
+    "staging_text",
+    [
+        "/tmp/not-a-staging-root",
+        "/tmp/.other.staging-00000000-0000-0000-0000-000000000000",
+        "/tmp/../tmp/.output.staging-00000000-0000-0000-0000-000000000000",
+    ],
+)
+def test_preserved_staging_rejects_bad_path_contract(staging_text, tmp_path):
+    output = tmp_path / "output"
+    with pytest.raises((ValueError, FileNotFoundError)):
+        converter.inspect_preserved_staging(Path(staging_text), output)
+
+
+def test_preserved_staging_rejects_symlink_root(tmp_path):
+    output = tmp_path / "output"
+    target = _failed_staging(output)
+    link = output.parent / f".{output.name}.staging-{uuid.uuid4()}"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises((ValueError, RuntimeError, OSError)):
+        converter.inspect_preserved_staging(link, output)
+
+
+def test_preserved_staging_removal_rejects_live_lock_holder(tmp_path):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    status_sha256 = converter.sha256_file(staging / "CONVERSION_STATUS.json")
+
+    with converter.conversion_lock(output):
+        with pytest.raises(BlockingIOError):
+            converter.remove_preserved_staging(
+                staging,
+                output,
+                expected_status_sha256=status_sha256,
+                confirm_remove=str(staging.absolute()),
+            )
+
+    assert staging.is_dir()
+
+
+def test_preserved_staging_open_rejects_path_swap(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    original = staging.with_name(staging.name + ".preserved")
+    replacement = staging.with_name(staging.name + ".replacement")
+    replacement.mkdir()
+    (replacement / "sentinel").write_bytes(b"replacement")
+    actual_open = converter.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and path == os.fsencode(staging.name):
+            swapped = True
+            staging.rename(original)
+            staging.symlink_to(replacement, target_is_directory=True)
+        return actual_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(converter.os, "open", swap_before_open)
+    started = time.monotonic()
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        converter.inspect_preserved_staging(staging, output)
+    assert time.monotonic() - started < 2
+    assert swapped
+    assert (replacement / "sentinel").read_bytes() == b"replacement"
+    assert original.is_dir()
+
+
+def test_preserved_staging_removal_rejects_path_swap_before_open(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    status_sha256 = converter.sha256_file(staging / "CONVERSION_STATUS.json")
+    original = staging.with_name(staging.name + ".preserved")
+    replacement = staging.with_name(staging.name + ".replacement")
+    replacement.mkdir()
+    (replacement / "sentinel").write_bytes(b"replacement")
+    actual_open = converter.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and path == os.fsencode(staging.name):
+            swapped = True
+            staging.rename(original)
+            staging.symlink_to(replacement, target_is_directory=True)
+        return actual_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(converter.os, "open", swap_before_open)
+    started = time.monotonic()
+    with pytest.raises((OSError, RuntimeError, ValueError)):
+        converter.remove_preserved_staging(
+            staging,
+            output,
+            expected_status_sha256=status_sha256,
+            confirm_remove=str(staging),
+        )
+    assert time.monotonic() - started < 2
+    assert swapped
+    assert (replacement / "sentinel").read_bytes() == b"replacement"
+    assert original.is_dir()
+
+
+@pytest.mark.parametrize("operation", ["inspect", "remove"])
+def test_preserved_staging_parent_swap_after_lock_uses_no_reopened_parent(
+    tmp_path,
+    monkeypatch,
+    operation,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    output = parent / "output"
+    staging = _failed_staging(output)
+    (staging / "payload").write_bytes(b"original")
+    status_sha256 = converter.sha256_file(staging / "CONVERSION_STATUS.json")
+    original_before = _tree_snapshot(staging)
+    displaced_parent = tmp_path / "displaced-parent"
+    actual_open = converter._open_preserved_staging
+    actual_read = converter._read_regular_at
+    replacement_before = None
+    replacement_read = False
+    swapped = False
+
+    def swap_then_open(*args, **kwargs):
+        nonlocal replacement_before, swapped
+        if not swapped:
+            swapped = True
+            parent.rename(displaced_parent)
+            parent.mkdir()
+            replacement = parent / staging.name
+            shutil.copytree(displaced_parent / staging.name, replacement)
+            (replacement / "payload").write_bytes(b"replacement")
+            replacement_before = _tree_snapshot(replacement)
+        return actual_open(*args, **kwargs)
+
+    def track_replacement_read(directory_fd, name, label):
+        nonlocal replacement_read
+        replacement = parent / staging.name
+        if (
+            replacement.exists()
+            and os.fstat(directory_fd).st_ino == replacement.stat().st_ino
+        ):
+            replacement_read = True
+        return actual_read(directory_fd, name, label)
+
+    monkeypatch.setattr(converter, "_open_preserved_staging", swap_then_open)
+    monkeypatch.setattr(converter, "_read_regular_at", track_replacement_read)
+
+    with pytest.raises((RuntimeError, FileNotFoundError)):
+        if operation == "inspect":
+            converter.inspect_preserved_staging(staging, output)
+        else:
+            converter.remove_preserved_staging(
+                staging,
+                output,
+                expected_status_sha256=status_sha256,
+                confirm_remove=str(staging),
+            )
+
+    assert swapped
+    assert replacement_before is not None
+    assert _tree_snapshot(displaced_parent / staging.name) == original_before
+    assert _tree_snapshot(parent / staging.name) == replacement_before
+    assert replacement_read is False
+
+
+def test_cli_maintenance_branches_before_converter_attestation_and_preflight(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    output = tmp_path / "output"
+    staging = _failed_staging(output)
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: pytest.fail("maintenance attempted converter attestation"),
+    )
+    monkeypatch.setattr(
+        converter,
+        "preflight_conversion",
+        lambda *_: pytest.fail("maintenance attempted source preflight"),
+    )
+
+    assert (
+        converter.main(
+            [
+                "--out-dir",
+                str(output),
+                "--inspect-preserved-staging",
+                str(staging),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["staging_path"] == str(staging)
+
+
+def test_original_run_never_certifies_publication_uncertain(tmp_path, monkeypatch):
+    source = make_source_episode(tmp_path / "source", frames=8, fps=4)
+    output = tmp_path / "processed"
+    psi0_root = tmp_path / "psi0"
+    psi0_root.mkdir()
+    certifier_calls = []
+
+    class FailDestinationParentFsync(converter.PublicationFilesystem):
+        def fsync_directory(self, path):
+            if path == output.parent and output.exists():
+                raise OSError("injected destination-parent fsync failure")
+            super().fsync_directory(path)
+
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: _recorded_converter_identity(),
+    )
+    monkeypatch.setattr(
+        converter,
+        "PublicationFilesystem",
+        FailDestinationParentFsync,
+    )
+    monkeypatch.setattr(
+        converter,
+        "certify_published_dataset",
+        lambda *args, **kwargs: certifier_calls.append((args, kwargs)),
+    )
+    args = converter.build_parser().parse_args(
+        [
+            *_conversion_argv(source, output),
+            "--certify-psi0-root",
+            str(psi0_root),
+            "--certify-psi0-commit",
+            "c" * 40,
+            "--certify-python",
+            sys.executable,
+        ]
+    )
+
+    with pytest.raises(converter.PublicationUncertainError):
+        converter.run_conversion(args)
+
+    assert output.is_dir()
+    assert certifier_calls == []
+    assert list(tmp_path.glob(".processed.certification-*")) == []
+
+
+def test_post_parent_fsync_hook_bypasses_failure_reporting_and_certification(
+    tmp_path,
+    monkeypatch,
+):
+    source = make_source_episode(tmp_path / "source", frames=8, fps=4)
+    output = tmp_path / "processed"
+    psi0_root = tmp_path / "psi0"
+    psi0_root.mkdir()
+    failure_reports = []
+    certifier_calls = []
+
+    def fail_after_parent_fsync(point):
+        if point == "after_destination_parent_fsync":
+            raise RuntimeError("injected post-parent-fsync hook failure")
+
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: converter.ConverterIdentity("a" * 40, "b" * 64),
+    )
+    monkeypatch.setattr(converter, "no_fault", fail_after_parent_fsync)
+    monkeypatch.setattr(
+        converter,
+        "report_conversion_failure",
+        lambda *args: failure_reports.append(args),
+    )
+    monkeypatch.setattr(
+        converter,
+        "certify_published_dataset",
+        lambda *args, **kwargs: certifier_calls.append((args, kwargs)),
+    )
+    args = converter.build_parser().parse_args(
+        [
+            *_conversion_argv(source, output),
+            "--certify-psi0-root",
+            str(psi0_root),
+            "--certify-psi0-commit",
+            "c" * 40,
+            "--certify-python",
+            sys.executable,
+        ]
+    )
+
+    with pytest.raises(converter.PublishedBoundaryError) as caught:
+        converter.run_conversion(args)
+
+    assert caught.value.publication.state == "published"
+    assert output.is_dir()
+    assert failure_reports == []
+    assert certifier_calls == []
+    assert list(tmp_path.glob(".processed.certification-*")) == []
+
+
+def _make_task9_fake_psi0_checkout(root: Path) -> tuple[Path, str, Path]:
+    checkout = root / "fake-psi0"
+    package = checkout / "src/psi/data/lerobot"
+    package.mkdir(parents=True)
+    for init in (
+        checkout / "src/psi/__init__.py",
+        checkout / "src/psi/data/__init__.py",
+        checkout / "src/psi/data/lerobot/__init__.py",
+    ):
+        init.write_text("")
+    import_marker = root / "fake-psi0-imported"
+    (package / "compat.py").write_text(
+        f"""\
+import json
+import os
+from pathlib import Path
+
+import torch
+
+LEROBOT_LAYOUT = "fake"
+Path({str(import_marker)!r}).write_text("imported")
+
+
+class LeRobotDataset:
+    def __init__(self, *, repo_id, root):
+        assert repo_id == "simple-certified"
+        self.root = Path(root)
+        info = json.loads((self.root / "meta/info.json").read_text())
+        self.total = info["total_frames"]
+        height, width, _channels = info["features"]["observation.images.egocentric"]["shape"]
+        self.height = height
+        self.width = width
+        cache_root = Path(os.environ["HOME"]).parent
+        assert Path(os.environ["HF_HOME"]) == cache_root / "hf"
+        assert Path(os.environ["HF_DATASETS_CACHE"]) == cache_root / "datasets"
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+        assert os.environ["HF_DATASETS_OFFLINE"] == "1"
+        (Path(os.environ["HF_HOME"]) / "task9").mkdir()
+        (Path(os.environ["HF_HOME"]) / "task9/cache.bin").write_bytes(b"cache")
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, index):
+        return {{
+            "observation.images.egocentric": torch.zeros(
+                (3, self.height, self.width), dtype=torch.float32
+            ),
+            "states": torch.zeros((32,), dtype=torch.float32),
+            "action": torch.zeros((36,), dtype=torch.float32),
+            "index": torch.tensor(index, dtype=torch.int64),
+        }}
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+    subprocess.run(["git", "add", "src"], cwd=checkout, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Task Nine",
+            "-c",
+            "user.email=task9@example.invalid",
+            "commit",
+            "-qm",
+            "fake pinned PSI0",
+        ],
+        cwd=checkout,
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return checkout, commit, import_marker
+
+
+def _direct_children() -> tuple[int, ...]:
+    children_path = Path(f"/proc/{os.getpid()}/task/{os.getpid()}/children")
+    if not children_path.exists():
+        return ()
+    return tuple(int(value) for value in children_path.read_text().split())
+
+
+def test_complete_synthetic_pipeline_transcodes_certifies_and_recertifies(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts.certify_psi0_dataset import (
+        certify_published_dataset as certify,
+        validate_dataset,
+        validate_evidence_terminal,
+    )
+
+    source_a = make_source_episode(
+        tmp_path / "source-a",
+        episode_index=4,
+        frames=5,
+        fps=4,
+        size="64x48",
+        video_codec="libx264",
+        task_index=2,
+        task_text="first synthetic task",
+    )
+    source_b = make_source_episode(
+        tmp_path / "source-b",
+        episode_index=7,
+        frames=6,
+        fps=5,
+        size="80x60",
+        video_codec="mpeg4",
+        task_index=3,
+        task_text="second synthetic task",
+    )
+    source_before = {source: _tree_snapshot(source) for source in (source_a, source_b)}
+    checkout, commit, import_marker = _make_task9_fake_psi0_checkout(tmp_path)
+    output = tmp_path / "processed"
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: _recorded_converter_identity(),
+    )
+    args = converter.build_parser().parse_args(
+        [
+            "--sim-root",
+            str(tmp_path / "source-*"),
+            "--out-dir",
+            str(output),
+            "--skip",
+            "1",
+            "--downsample",
+            "2",
+            "--total-episodes",
+            "2",
+            "--fps",
+            "4",
+            "--video-key",
+            "observation.rgb_head_stereo_left",
+            "--chunks-size",
+            "1",
+            "--certify-psi0-root",
+            str(checkout),
+            "--certify-psi0-commit",
+            commit,
+            "--certify-python",
+            sys.executable,
+        ]
+    )
+    children_before = _direct_children()
+
+    publication = converter.run_conversion(args)
+
+    assert isinstance(publication, converter.PublicationResult)
+    assert publication.state == "published"
+    validation = validate_dataset(output, expected=None, require_final_modes=True)
+    assert validation.total_episodes == 2
+    assert validation.total_frames == 5
+    info = json.loads((output / "meta/info.json").read_text())
+    assert info["features"]["observation.images.egocentric"]["video_info"] == {
+        "has_audio": False,
+        "video.channels": 3,
+        "video.codec": "h264",
+        "video.fps": 4.0,
+        "video.height": 360,
+        "video.is_depth_map": False,
+        "video.pix_fmt": "yuv420p",
+        "video.width": 640,
+    }
+    assert info["features"]["observation.images.egocentric"]["shape"] == [
+        360,
+        640,
+        3,
+    ]
+    certificates = sorted(tmp_path.glob(".processed.certification-*"))
+    assert len(certificates) == 1
+    terminal = validate_evidence_terminal(certificates[0])
+    assert terminal["verdict"] == "PASS"
+    loader = json.loads((certificates[0] / "psi0-loader-result.json").read_text())
+    assert loader["result"]["visited_indices"] == list(range(5))
+    assert import_marker.read_text() == "imported"
+    assert {
+        source: _tree_snapshot(source) for source in (source_a, source_b)
+    } == source_before
+    assert _direct_children() == children_before
+
+    with converter.conversion_lock(output):
+        second = certify(
+            publication,
+            psi0_root=checkout,
+            psi0_commit=commit,
+            python=Path(sys.executable),
+            certificate_uuid=uuid.UUID("00000000-0000-0000-0000-000000000009"),
+        )
+    assert second != certificates[0]
+    assert validate_evidence_terminal(second)["verdict"] == "PASS"
+    assert len(list(tmp_path.glob(".processed.certification-*"))) == 2
+
+
+def test_run_conversion_preflight_failure_creates_no_staging(tmp_path, monkeypatch):
+    source = make_source_episode(tmp_path / "source", frames=2, fps=4)
+    output = tmp_path / "processed"
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: converter.ConverterIdentity("a" * 40, "b" * 64),
+    )
+    args = converter.build_parser().parse_args(_conversion_argv(source, output))
+    args.skip = 2
+
+    with pytest.raises(ValueError, match="greater than skip"):
+        converter.run_conversion(args)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".processed.staging-*"))
+
+
+def test_run_conversion_generation_failure_preserves_failed_staging(
+    tmp_path,
+    monkeypatch,
+):
+    source = make_source_episode(tmp_path / "source", frames=2, fps=4)
+    output = tmp_path / "processed"
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: converter.ConverterIdentity("a" * 40, "b" * 64),
+    )
+    monkeypatch.setattr(
+        converter,
+        "generate_staged_dataset",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("injected generation failure")),
+    )
+    args = converter.build_parser().parse_args(_conversion_argv(source, output))
+
+    with pytest.raises(RuntimeError, match="injected generation failure"):
+        converter.run_conversion(args)
+
+    staging = next(tmp_path.glob(".processed.staging-*"))
+    assert (
+        json.loads((staging / "CONVERSION_STATUS.json").read_text())["state"]
+        == "failed"
+    )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("fault_point", "error_type", "classification", "published"),
+    [
+        (
+            "after_payload_close",
+            converter.PublicationStateError,
+            "pre_completion_failed",
+            False,
+        ),
+        (
+            "after_complete_temp_creation",
+            converter.PublicationStateError,
+            "completion_uncertain_unpublished",
+            False,
+        ),
+        (
+            "after_complete_root_fsync",
+            converter.PublicationStateError,
+            "completion_uncertain_unpublished",
+            False,
+        ),
+        (
+            "after_publication_rename",
+            converter.PublicationUncertainError,
+            "publication_uncertain",
+            True,
+        ),
+    ],
+)
+def test_run_conversion_negative_durability_matrix(
+    tmp_path,
+    monkeypatch,
+    fault_point,
+    error_type,
+    classification,
+    published,
+):
+    source = make_source_episode(tmp_path / "source", frames=2, fps=4)
+    output = tmp_path / "processed"
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: converter.ConverterIdentity("a" * 40, "b" * 64),
+    )
+
+    def inject(point):
+        if point == fault_point:
+            raise RuntimeError(f"injected {point}")
+
+    monkeypatch.setattr(converter, "no_fault", inject)
+    args = converter.build_parser().parse_args(_conversion_argv(source, output))
+
+    with pytest.raises(error_type) as caught:
+        converter.run_conversion(args)
+
+    if published:
+        assert output.is_dir()
+        assert not list(tmp_path.glob(".processed.staging-*"))
+    else:
+        staging = next(tmp_path.glob(".processed.staging-*"))
+        report = converter.inspect_preserved_staging(staging, output)
+        assert report["failure_classification"] == classification
+        if fault_point == "after_complete_root_fsync":
+            assert caught.value.state == "complete_unpublished"
+
+
+def test_run_conversion_destination_collision_preserves_both_roots(
+    tmp_path,
+    monkeypatch,
+):
+    source = make_source_episode(tmp_path / "source", frames=2, fps=4)
+    output = tmp_path / "processed"
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: converter.ConverterIdentity("a" * 40, "b" * 64),
+    )
+    actual_validate = converter.validate_staged_dataset
+
+    def validate_then_collide(staging, plan):
+        result = actual_validate(staging, plan)
+        output.mkdir()
+        (output / "sentinel").write_bytes(b"collision")
+        return result
+
+    monkeypatch.setattr(converter, "validate_staged_dataset", validate_then_collide)
+    args = converter.build_parser().parse_args(_conversion_argv(source, output))
+
+    with pytest.raises(converter.PublicationStateError) as caught:
+        converter.run_conversion(args)
+
+    assert caught.value.state == "complete_unpublished"
+    assert (output / "sentinel").read_bytes() == b"collision"
+    assert len(list(tmp_path.glob(".processed.staging-*"))) == 1
+
+
+def test_run_conversion_certification_failure_keeps_published_output(
+    tmp_path,
+    monkeypatch,
+):
+    source = make_source_episode(tmp_path / "source", frames=2, fps=4)
+    output = tmp_path / "processed"
+    psi0_root = tmp_path / "psi0"
+    psi0_root.mkdir()
+    monkeypatch.setattr(
+        converter,
+        "resolve_converter_identity",
+        lambda *_: converter.ConverterIdentity("a" * 40, "b" * 64),
+    )
+    monkeypatch.setattr(
+        converter,
+        "certify_published_dataset",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected certification failure")
+        ),
+    )
+    args = converter.build_parser().parse_args(
+        [
+            *_conversion_argv(source, output),
+            "--certify-psi0-root",
+            str(psi0_root),
+            "--certify-psi0-commit",
+            "c" * 40,
+            "--certify-python",
+            sys.executable,
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="injected certification failure"):
+        converter.run_conversion(args)
+
+    assert output.is_dir()
+    assert not list(tmp_path.glob(".processed.staging-*"))
