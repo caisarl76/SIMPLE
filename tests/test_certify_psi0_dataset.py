@@ -1,8 +1,13 @@
+import importlib.util
 import json
 import os
+import py_compile
 import shutil
 import stat
+import struct
 import subprocess
+import sys
+import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -14,12 +19,13 @@ import pyarrow.parquet as pq
 import pytest
 
 from psi0_converter_fixtures import make_source_episode
+from scripts import certify_psi0_dataset as certifier
 from scripts import postprocess_psi0 as converter
 from scripts.certify_psi0_dataset import (
     DatasetExpectations,
     DatasetValidationError,
     PublishedUncertifiedError,
-    certify_published_dataset,
+    certify_published_dataset as _production_certify_published_dataset,
     validate_dataset,
     validate_evidence_terminal,
 )
@@ -42,6 +48,415 @@ SCALAR_FIELDS = (
     "task_index",
     "next.done",
 )
+LOADER_DENIED_AUDIT_EVENTS = sorted(
+    (
+        "os.exec",
+        "os.fork",
+        "os.forkpty",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.system",
+        "socket.__new__",
+        "socket.bind",
+        "socket.connect",
+        "socket.connect_ex",
+        "socket.getaddrinfo",
+        "socket.gethostbyaddr",
+        "socket.gethostbyname",
+        "socket.gethostbyname_ex",
+        "socket.getnameinfo",
+        "socket.sendto",
+        "subprocess.Popen",
+    ),
+    key=str.encode,
+)
+
+
+def certify_published_dataset(*args, **kwargs):
+    """Keep pre-Task-8 evidence durability tests focused and fast."""
+
+    psi0_root = Path(kwargs["psi0_root"]).absolute()
+    repository_root = Path(__file__).resolve().parents[1]
+    if psi0_root != repository_root:
+        return _production_certify_published_dataset(*args, **kwargs)
+    original = certifier._run_psi0_loader
+    original_collect = certifier._collect_psi0_environment
+    should_stub_collection = (
+        getattr(original_collect, "__name__", "") == "_collect_psi0_environment"
+    )
+    if should_stub_collection:
+
+        def collect_stub(root, commit, python):
+            details = {
+                "psi0_root": str(root.absolute()),
+                "psi0_src": str(root.absolute() / "src"),
+                "psi0_commit": commit,
+                "tracked_status": [],
+                "python": str(python.absolute()),
+                "python_realpath": str(python.resolve(strict=False)),
+                "python_version": "task-7-test",
+                "platform": "task-7-test",
+                "packages": {
+                    name: "task-7-test"
+                    for name in (
+                        "av",
+                        "datasets",
+                        "numpy",
+                        "pyarrow",
+                        "torch",
+                        "torchvision",
+                    )
+                },
+                "distributions": [],
+            }
+            details["compat_module"] = {
+                "commit": commit,
+                "relative_path": "src/psi/data/lerobot/compat.py",
+                "origin": str(root.absolute() / "src/psi/data/lerobot/compat.py"),
+                "blob_sha256": "0" * 64,
+            }
+            details["distribution_manifest_sha256"] = converter.sha256_bytes(
+                converter.canonical_json_bytes(details["distributions"])
+            )
+            return {
+                "schema_version": 1,
+                "details": details,
+                "details_sha256": converter.sha256_bytes(
+                    converter.canonical_json_bytes(details)
+                ),
+            }
+
+        certifier._collect_psi0_environment = collect_stub
+
+    def loader_stub(**loader_kwargs):
+        validation = loader_kwargs["result"]
+        evidence_root = loader_kwargs["evidence_root"]
+        environment = certifier._worker_environment(evidence_root / ".loader-cache")
+        episodes = [
+            json.loads(line)
+            for line in (validation.dataset_root / "meta/episodes.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        info = json.loads((validation.dataset_root / "meta/info.json").read_text())
+        image_shape = info["features"]["observation.images.egocentric"]["shape"]
+        result_value = {
+            "schema_version": 1,
+            "verdict": "PASS",
+            "sys_path_0": str(loader_kwargs["psi0_root"].absolute() / "src"),
+            "visited_indices": list(range(validation.total_frames)),
+            "episode_ranges": [
+                [row["dataset_from_index"], row["dataset_to_index"]] for row in episodes
+            ],
+            "offline_environment": environment,
+            "tensor_contract": {
+                "action": {"dtype": "torch.float32", "shape": [36]},
+                "observation.images.egocentric": {
+                    "dtype": "torch.float32",
+                    "shape": [3, image_shape[0], image_shape[1]],
+                },
+                "states": {"dtype": "torch.float32", "shape": [32]},
+            },
+            "module_provenance": {
+                "commit": loader_kwargs["psi0_commit"],
+                "relative_path": "src/psi/data/lerobot/compat.py",
+                "origin": str(
+                    loader_kwargs["psi0_root"].absolute()
+                    / "src/psi/data/lerobot/compat.py"
+                ),
+                "blob_sha256": "0" * 64,
+            },
+            "network_policy": {
+                "audit_hook": "deny_inet_resolver_process_escape",
+                "denied_events": LOADER_DENIED_AUDIT_EVENTS,
+                "violations": [],
+            },
+        }
+        result_name = ".psi0-loader-result-task-7-test.tmp"
+        argv = [
+            str(loader_kwargs["python"].absolute()),
+            "-I",
+            "scripts/certify_psi0_dataset.py",
+            "--loader-worker",
+            "--psi0-src",
+            str(loader_kwargs["psi0_root"].absolute() / "src"),
+            "--dataset-root",
+            str(validation.dataset_root),
+            "--result",
+            str(evidence_root / result_name),
+        ]
+        return (
+            {
+                "schema_version": 1,
+                "argv": argv,
+                "environment": environment,
+                "environment_sha256": converter.sha256_bytes(
+                    converter.canonical_json_bytes(environment)
+                ),
+            },
+            {
+                "schema_version": 1,
+                "entries": [
+                    {
+                        "path": name,
+                        "type": "directory",
+                        "size": 0,
+                        "sha256": None,
+                    }
+                    for name in sorted(
+                        ("home", "hf", "datasets", "xdg", "torch", "tmp"),
+                        key=str.encode,
+                    )
+                ],
+            },
+            {
+                "schema_version": 1,
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "result_sha256": converter.sha256_bytes(
+                    converter.canonical_json_bytes(result_value)
+                ),
+                "result": result_value,
+            },
+        )
+
+    certifier._run_psi0_loader = loader_stub
+    try:
+        return _production_certify_published_dataset(*args, **kwargs)
+    finally:
+        certifier._run_psi0_loader = original
+        if should_stub_collection:
+            certifier._collect_psi0_environment = original_collect
+
+
+def _make_fake_psi0_checkout(
+    root: Path,
+    *,
+    behavior: str = "valid",
+) -> tuple[Path, str, Path]:
+    checkout = root / f"psi0-{behavior}"
+    package = checkout / "src/psi/data/lerobot"
+    package.mkdir(parents=True)
+    for init in (
+        checkout / "src/psi/__init__.py",
+        checkout / "src/psi/data/__init__.py",
+        checkout / "src/psi/data/lerobot/__init__.py",
+    ):
+        init.write_text("")
+    import_marker = root / f"{behavior}-imported"
+    module = f"""\
+import json
+import os
+import sys
+from pathlib import Path
+
+import torch
+
+LEROBOT_LAYOUT = "fake"
+BEHAVIOR = {behavior!r}
+IMPORT_MARKER = Path({str(import_marker)!r})
+if BEHAVIOR == "pycache_prefix":
+    expected_prefix = Path(os.environ["TMPDIR"]) / "pycache"
+    assert sys.pycache_prefix == str(expected_prefix)
+    assert expected_prefix.is_dir()
+    assert not list(expected_prefix.iterdir())
+if BEHAVIOR in ("sourceless_pyc", "race_sourceless_pyc"):
+    import evil
+IMPORT_MARKER.write_text("imported")
+
+
+class LeRobotDataset:
+    def __init__(self, *, repo_id, root):
+        assert repo_id == "simple-certified"
+        self.root = Path(root)
+        info = json.loads((self.root / "meta/info.json").read_text())
+        self.total = info["total_frames"]
+        shape = info["features"]["observation.images.egocentric"]["shape"]
+        self.height, self.width = shape[:2]
+        cache_root = Path(os.environ["HOME"]).parent
+        expected = {{
+            "HOME": cache_root / "home",
+            "HF_HOME": cache_root / "hf",
+            "HF_DATASETS_CACHE": cache_root / "datasets",
+            "XDG_CACHE_HOME": cache_root / "xdg",
+            "TORCH_HOME": cache_root / "torch",
+            "TMPDIR": cache_root / "tmp",
+        }}
+        assert all(Path(os.environ[key]) == value for key, value in expected.items())
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+        assert os.environ["HF_DATASETS_OFFLINE"] == "1"
+        assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+        assert os.environ["PYTHONNOUSERSITE"] == "1"
+        self.visits = Path(os.environ["TMPDIR"]) / "visited.jsonl"
+        (Path(os.environ["HF_HOME"]) / "fake-hub").mkdir()
+        (Path(os.environ["HF_HOME"]) / "fake-hub/index.bin").write_bytes(b"hub")
+        (Path(os.environ["HF_DATASETS_CACHE"]) / "fake-dataset.bin").write_bytes(b"dataset")
+
+    def __len__(self):
+        return self.total
+
+    def __getitem__(self, index):
+        with self.visits.open("a") as stream:
+            stream.write(f"{{index}}\\n")
+        if BEHAVIOR == "network" and index == 0:
+            import socket
+
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
+        if BEHAVIOR == "resolver" and index == 0:
+            import socket
+
+            socket.getaddrinfo("localhost", 80)
+        if BEHAVIOR == "subprocess" and index == 0:
+            import subprocess
+
+            subprocess.run(["/bin/true"], check=True)
+        if BEHAVIOR == "missing" and index == 2:
+            raise IndexError("missing synthetic row")
+        returned_index = index
+        if BEHAVIOR == "duplicate" and index == 2:
+            returned_index = 1
+        elif BEHAVIOR == "gap" and index == 2:
+            returned_index = 3
+        state_shape = (31,) if BEHAVIOR == "wrong_shape" and index == 1 else (32,)
+        dtype = torch.float64 if BEHAVIOR == "wrong_dtype" and index == 1 else torch.float32
+        states = torch.zeros(state_shape, dtype=dtype)
+        if BEHAVIOR == "nonfinite" and index == 1:
+            states[0] = float("nan")
+        return {{
+            "observation.images.egocentric": torch.zeros(
+                (3, self.height, self.width), dtype=torch.float32
+            ),
+            "states": states,
+            "action": torch.zeros((36,), dtype=torch.float32),
+            "index": torch.tensor(returned_index, dtype=torch.int64),
+        }}
+"""
+    (package / "compat.py").write_text(module)
+    if behavior == "race_sourceless_pyc":
+        evil_marker = root / "race-sourceless-pyc-executed"
+        evil_source = root / "race-evil-source.py"
+        evil_bytecode = root / "race-evil.pyc"
+        evil_source.write_text(
+            "from pathlib import Path\n"
+            f"Path({str(evil_marker)!r}).write_text('executed')\n"
+        )
+        py_compile.compile(
+            str(evil_source),
+            cfile=str(evil_bytecode),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+        )
+        payload = evil_bytecode.read_bytes()
+        evil_source.unlink()
+        evil_bytecode.unlink()
+        (checkout / "src/psi/__init__.py").write_text(
+            "from pathlib import Path\n"
+            f"Path({str(checkout / 'src/evil.pyc')!r}).write_bytes({payload!r})\n"
+        )
+    subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+    subprocess.run(["git", "add", "src"], cwd=checkout, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Task Eight",
+            "-c",
+            "user.email=task8@example.invalid",
+            "commit",
+            "-qm",
+            "fake pinned PSI0",
+        ],
+        cwd=checkout,
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return checkout, commit, import_marker
+
+
+def _install_unchecked_hash_compat_pyc(checkout: Path, marker: Path) -> None:
+    compat = checkout / "src/psi/data/lerobot/compat.py"
+    source = compat.read_text()
+    needle = 'IMPORT_MARKER.write_text("imported")\n'
+    malicious = source.replace(
+        needle,
+        needle + f'Path({str(marker)!r}).write_text("unchecked pyc executed")\n',
+        1,
+    )
+    assert malicious != source
+    malicious_source = checkout.parent / "malicious-compat.py"
+    malicious_source.write_text(malicious)
+    pycache = compat.parent / "__pycache__"
+    pycache.mkdir()
+    cache_path = Path(importlib.util.cache_from_source(str(compat)))
+    py_compile.compile(
+        str(malicious_source),
+        cfile=str(cache_path),
+        dfile=str(compat),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
+
+
+def _replace_with_malicious_timestamp_compat_pyc(checkout: Path, marker: Path) -> Path:
+    compat = checkout / "src/psi/data/lerobot/compat.py"
+    source = compat.read_text()
+    needle = 'IMPORT_MARKER.write_text("imported")\n'
+    malicious = source.replace(
+        needle,
+        needle + f'Path({str(marker)!r}).write_text("timestamp pyc executed")\n',
+        1,
+    )
+    assert malicious != source
+    malicious_source = checkout.parent / "malicious-timestamp-compat.py"
+    malicious_source.write_text(malicious)
+    cache_path = Path(importlib.util.cache_from_source(str(compat)))
+    py_compile.compile(
+        str(malicious_source),
+        cfile=str(cache_path),
+        dfile=str(compat),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    payload = bytearray(cache_path.read_bytes())
+    source_metadata = compat.stat()
+    payload[8:12] = struct.pack("<I", int(source_metadata.st_mtime) & 0xFFFFFFFF)
+    payload[12:16] = struct.pack("<I", source_metadata.st_size & 0xFFFFFFFF)
+    cache_path.write_bytes(payload)
+    assert int.from_bytes(payload[4:8], "little") == 0
+    return cache_path
+
+
+def _certify_with_fake_loader(
+    publication: converter.PublicationResult,
+    checkout: Path,
+    commit: str,
+    certificate_id: uuid.UUID,
+) -> Path:
+    with converter.conversion_lock(publication.dataset_root):
+        return certify_published_dataset(
+            publication,
+            psi0_root=checkout,
+            psi0_commit=commit,
+            python=Path(sys.executable),
+            certificate_uuid=certificate_id,
+        )
 
 
 def _identity_for_recorded_blob() -> converter.ConverterIdentity:
@@ -2253,7 +2668,7 @@ def test_evidence_uncertain_recovery_revalidates_and_fsyncs_under_lock(
     before = _snapshot_tree(publication.dataset_root)
     events = []
     original_fsync = converter.PublicationFilesystem.fsync_directory
-    original_certify = certifier.certify_published_dataset
+    original_certify = certify_published_dataset
 
     def fsync_directory(self, path):
         converter.assert_conversion_lock_held(publication.dataset_root)
@@ -2364,3 +2779,687 @@ def test_evidence_print_tree_digest_is_read_only_and_requires_published_tree(
         path.chmod(0o555 if path.is_dir() else 0o444)
     assert certifier.main(["--dataset-root", str(staging), "--print-tree-digest"]) == 1
     assert not list(staging.parent.glob(".manifestless.certification-*"))
+
+
+def _read_canonical_evidence(path: Path) -> dict[str, object]:
+    payload = path.read_bytes()
+    value = json.loads(payload)
+    assert payload == converter.canonical_json_bytes(value)
+    return value
+
+
+def test_psi0_loader_parent_uses_isolated_worker_and_traverses_every_row(
+    tmp_path, generated
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(tmp_path)
+    evidence = _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    assert import_marker.read_text() == "imported"
+    assert not (evidence / ".loader-cache").exists()
+    assert validate_evidence_terminal(evidence)["verdict"] == "PASS"
+
+    environment = _read_canonical_evidence(evidence / "psi0-environment.json")
+    details = environment["details"]
+    assert environment["details_sha256"] == converter.sha256_bytes(
+        converter.canonical_json_bytes(details)
+    )
+    assert details["psi0_commit"] == commit
+    assert details["tracked_status"] == []
+    assert details["psi0_root"] == str(checkout.resolve())
+    assert details["packages"] == {
+        name: details["packages"][name]
+        for name in ("av", "datasets", "numpy", "pyarrow", "torch", "torchvision")
+    }
+    assert details["distributions"] == sorted(
+        details["distributions"], key=lambda item: (item["name"], item["version"])
+    )
+    assert details["distribution_manifest_sha256"] == converter.sha256_bytes(
+        converter.canonical_json_bytes(details["distributions"])
+    )
+
+    command = _read_canonical_evidence(evidence / "psi0-loader-command.json")
+    assert command["argv"][1:3] == ["-I", "scripts/certify_psi0_dataset.py"]
+    assert command["argv"][3] == "--loader-worker"
+    worker_environment = command["environment"]
+    assert set(worker_environment) == {
+        "PATH",
+        "HOME",
+        "HF_HOME",
+        "HF_DATASETS_CACHE",
+        "XDG_CACHE_HOME",
+        "TORCH_HOME",
+        "TMPDIR",
+        "HF_HUB_OFFLINE",
+        "HF_DATASETS_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "PYTHONNOUSERSITE",
+    }
+    cache_root = evidence / ".loader-cache"
+    assert Path(worker_environment["HOME"]) == cache_root / "home"
+    assert Path(worker_environment["HF_HOME"]) == cache_root / "hf"
+    assert Path(worker_environment["HF_DATASETS_CACHE"]) == cache_root / "datasets"
+    assert Path(worker_environment["XDG_CACHE_HOME"]) == cache_root / "xdg"
+    assert Path(worker_environment["TORCH_HOME"]) == cache_root / "torch"
+    assert Path(worker_environment["TMPDIR"]) == cache_root / "tmp"
+    assert command["environment_sha256"] == converter.sha256_bytes(
+        converter.canonical_json_bytes(worker_environment)
+    )
+
+    cache = _read_canonical_evidence(evidence / "psi0-loader-cache.json")
+    assert cache["entries"]
+    assert cache["entries"] == sorted(
+        cache["entries"], key=lambda item: item["path"].encode()
+    )
+    assert {entry["type"] for entry in cache["entries"]} == {
+        "directory",
+        "regular",
+    }
+    visits = next(
+        entry for entry in cache["entries"] if entry["path"] == "tmp/visited.jsonl"
+    )
+    assert visits["sha256"] == converter.sha256_bytes(b"0\n1\n2\n3\n4\n")
+    result = _read_canonical_evidence(evidence / "psi0-loader-result.json")
+    worker_result = result["result"]
+    assert result["result_sha256"] == converter.sha256_bytes(
+        converter.canonical_json_bytes(worker_result)
+    )
+    assert worker_result["verdict"] == "PASS"
+    assert worker_result["visited_indices"] == list(range(5))
+    assert worker_result["episode_ranges"] == [[0, 1], [2, 4]]
+    assert worker_result["sys_path_0"] == str((checkout / "src").resolve())
+    assert worker_result["module_provenance"] == {
+        "blob_sha256": converter.sha256_bytes(
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "show",
+                    f"{commit}:src/psi/data/lerobot/compat.py",
+                ],
+                check=True,
+                capture_output=True,
+            ).stdout
+        ),
+        "commit": commit,
+        "origin": str((checkout / "src/psi/data/lerobot/compat.py").resolve()),
+        "relative_path": "src/psi/data/lerobot/compat.py",
+    }
+    assert worker_result["network_policy"] == {
+        "audit_hook": "deny_inet_resolver_process_escape",
+        "denied_events": LOADER_DENIED_AUDIT_EVENTS,
+        "violations": [],
+    }
+    assert worker_result["tensor_contract"] == {
+        "action": {"dtype": "torch.float32", "shape": [36]},
+        "observation.images.egocentric": {
+            "dtype": "torch.float32",
+            "shape": [3, 360, 640],
+        },
+        "states": {"dtype": "torch.float32", "shape": [32]},
+    }
+
+
+def _coherently_rewrite_evidence_member(evidence: Path, name: str, mutate) -> None:
+    evidence.chmod(0o755)
+    member = evidence / name
+    terminal_path = evidence / "PASS.json"
+    member.chmod(0o644)
+    terminal_path.chmod(0o644)
+    value = json.loads(member.read_text())
+    mutate(value)
+    member.write_bytes(converter.canonical_json_bytes(value))
+    terminal = json.loads(terminal_path.read_text())
+    entry = next(item for item in terminal["entries"] if item["path"] == name)
+    entry["size"] = member.stat().st_size
+    entry["sha256"] = converter.sha256_file(member)
+    terminal_path.write_bytes(converter.canonical_json_bytes(terminal))
+    member.chmod(0o444)
+    terminal_path.chmod(0o444)
+    evidence.chmod(0o555)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "visited_indices",
+        "episode_ranges",
+        "tensor_contract",
+        "cache_empty",
+        "cache_missing_root",
+        "cache_cross_type",
+        "cache_noncanonical_path",
+        "cache_extra_root",
+        "cache_missing_parent",
+        "cache_descendant_under_file",
+    ],
+)
+def test_psi0_loader_terminal_semantics_are_bound_to_dataset_and_cache_roots(
+    tmp_path, generated, mutation
+):
+    _, _, publication = generated
+    checkout, commit, _ = _make_fake_psi0_checkout(tmp_path)
+    evidence = _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    if mutation.startswith("cache_"):
+
+        def mutate_cache(value):
+            entries = value["entries"]
+            if mutation == "cache_empty":
+                entries.clear()
+            elif mutation == "cache_missing_root":
+                entries[:] = [entry for entry in entries if entry["path"] != "home"]
+            elif mutation == "cache_cross_type":
+                home = next(entry for entry in entries if entry["path"] == "home")
+                home["type"] = "regular"
+                home["sha256"] = "0" * 64
+            elif mutation == "cache_noncanonical_path":
+                entries.append(
+                    {
+                        "path": "home//nested",
+                        "type": "directory",
+                        "size": 0,
+                        "sha256": None,
+                    }
+                )
+                entries.sort(key=lambda entry: entry["path"].encode())
+            elif mutation == "cache_extra_root":
+                entries.append(
+                    {
+                        "path": "rogue",
+                        "type": "directory",
+                        "size": 0,
+                        "sha256": None,
+                    }
+                )
+                entries.sort(key=lambda entry: entry["path"].encode())
+            elif mutation == "cache_missing_parent":
+                entries[:] = [
+                    entry for entry in entries if entry["path"] != "hf/fake-hub"
+                ]
+            else:
+                entries.append(
+                    {
+                        "path": "datasets/fake-dataset.bin/descendant",
+                        "type": "directory",
+                        "size": 0,
+                        "sha256": None,
+                    }
+                )
+                entries.sort(key=lambda entry: entry["path"].encode())
+
+        _coherently_rewrite_evidence_member(
+            evidence, "psi0-loader-cache.json", mutate_cache
+        )
+    else:
+
+        def mutate_result(value):
+            result = value["result"]
+            if mutation == "visited_indices":
+                result["visited_indices"] = [0, 1, 3, 2, 4]
+            elif mutation == "episode_ranges":
+                result["episode_ranges"] = [[0, 2], [3, 4]]
+            else:
+                result["tensor_contract"]["action"]["shape"] = [35]
+            value["result_sha256"] = converter.sha256_bytes(
+                converter.canonical_json_bytes(result)
+            )
+
+        _coherently_rewrite_evidence_member(
+            evidence, "psi0-loader-result.json", mutate_result
+        )
+
+    with pytest.raises(ValueError, match="PSI0 loader"):
+        validate_evidence_terminal(evidence)
+
+
+@pytest.mark.parametrize(
+    "behavior",
+    ["wrong_shape", "wrong_dtype", "nonfinite", "gap", "duplicate", "missing"],
+)
+def test_psi0_loader_rejects_invalid_samples_and_cleans_cache(
+    tmp_path, generated, behavior
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior=behavior
+    )
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    evidence = caught.value.evidence_root
+    assert import_marker.is_file()
+    assert not (evidence / ".loader-cache").exists()
+    assert not list(evidence.glob(".psi0-loader-result-*.tmp"))
+    terminal = validate_evidence_terminal(evidence)
+    assert terminal["verdict"] == "FAIL"
+    assert terminal["error_code"] == "PSI0_LOADER_VALIDATION"
+    result = _read_canonical_evidence(evidence / "psi0-loader-result.json")
+    assert result["result"]["verdict"] == "FAIL"
+    assert result["result_sha256"] == converter.sha256_bytes(
+        converter.canonical_json_bytes(result["result"])
+    )
+
+
+def test_psi0_loader_revalidates_checkout_after_cache_setup_before_import(
+    tmp_path, generated, monkeypatch
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(tmp_path)
+
+    def mutate_checkout(point):
+        if point == "after_cache_setup":
+            (checkout / "src/psi/data/lerobot/compat.py").write_text(
+                "mutated after initial validation\n"
+            )
+
+    monkeypatch.setattr(certifier, "_loader_fault", mutate_checkout, raising=False)
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    assert not import_marker.exists()
+    assert not (caught.value.evidence_root / "PASS.json").exists()
+
+
+def test_psi0_loader_rejects_untracked_unchecked_hash_pyc_before_import(
+    tmp_path, generated
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(tmp_path)
+    pyc_marker = tmp_path / "unchecked-pyc-executed"
+    _install_unchecked_hash_compat_pyc(checkout, pyc_marker)
+
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    evidence = caught.value.evidence_root
+    assert not pyc_marker.exists()
+    assert not import_marker.exists()
+    assert not (evidence / "PASS.json").exists()
+
+
+@pytest.mark.parametrize("kind", ["fifo", "multilink"])
+def test_checkout_bytecode_scanner_rejects_unsafe_metadata_without_opening(
+    tmp_path, monkeypatch, kind
+):
+    source = tmp_path / f"{kind}-source"
+    pycache = source / "__pycache__"
+    pycache.mkdir(parents=True)
+    module = source / "module.py"
+    module.write_text("VALUE = 1\n")
+    cache_path = Path(importlib.util.cache_from_source(str(module)))
+    if kind == "fifo":
+        os.mkfifo(cache_path, 0o600)
+    else:
+        backing = tmp_path / "multilink-bytecode"
+        backing.write_bytes(b"not opened")
+        os.link(backing, cache_path)
+    original_open = certifier.os.open
+
+    def forbid_unsafe_open(path, flags, *args, **kwargs):
+        if path == cache_path.name:
+            pytest.fail("checkout scanner opened unsafe bytecode metadata")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(certifier.os, "open", forbid_unsafe_open)
+    started = time.monotonic()
+    with pytest.raises(DatasetValidationError, match="PSI0_CHECKOUT"):
+        certifier._validate_checkout_bytecode_caches(source)
+    assert time.monotonic() - started < 2.0
+
+
+def test_checkout_bytecode_scanner_nonblocking_open_rejects_fifo_replacement(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "swap-source"
+    pycache = source / "__pycache__"
+    pycache.mkdir(parents=True)
+    module = source / "module.py"
+    module.write_text("VALUE = 1\n")
+    cache_path = Path(importlib.util.cache_from_source(str(module)))
+    py_compile.compile(
+        str(module),
+        cfile=str(cache_path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    original_open = certifier.os.open
+    swapped = False
+
+    def replace_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == cache_path.name and not swapped:
+            assert flags & os.O_NONBLOCK
+            dir_fd = kwargs["dir_fd"]
+            os.unlink(path, dir_fd=dir_fd)
+            os.mkfifo(path, 0o600, dir_fd=dir_fd)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(certifier.os, "open", replace_before_open)
+    started = time.monotonic()
+    with pytest.raises(DatasetValidationError, match="PSI0_CHECKOUT"):
+        certifier._validate_checkout_bytecode_caches(source)
+    assert swapped
+    assert time.monotonic() - started < 2.0
+
+
+def test_psi0_loader_rejects_direct_sourceless_timestamp_pyc_before_import(
+    tmp_path, generated
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior="sourceless_pyc"
+    )
+    evil_marker = tmp_path / "direct-evil-pyc-executed"
+    evil_source = tmp_path / "evil-source.py"
+    evil_source.write_text(
+        f"from pathlib import Path\nPath({str(evil_marker)!r}).write_text('executed')\n"
+    )
+    py_compile.compile(
+        str(evil_source),
+        cfile=str(checkout / "src/evil.pyc"),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    terminal = validate_evidence_terminal(caught.value.evidence_root)
+    assert terminal["error_code"] == "PSI0_CHECKOUT"
+    assert not evil_marker.exists()
+    assert not import_marker.exists()
+
+
+def test_psi0_loader_blocks_sourceless_pyc_added_after_worker_scan(tmp_path, generated):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior="race_sourceless_pyc"
+    )
+    evil_marker = tmp_path / "race-sourceless-pyc-executed"
+
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    assert not (caught.value.evidence_root / "PASS.json").exists()
+    assert not evil_marker.exists()
+    assert not import_marker.exists()
+
+
+def test_psi0_loader_worker_rejects_untracked_unchecked_hash_pyc_before_import(
+    tmp_path, generated
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior="worker-pyc"
+    )
+    pyc_marker = tmp_path / "worker-unchecked-pyc-executed"
+    _install_unchecked_hash_compat_pyc(checkout, pyc_marker)
+    cache_root = tmp_path / "worker-cache"
+    cache_root.mkdir(mode=0o700)
+    for name in ("home", "hf", "datasets", "xdg", "torch", "tmp"):
+        (cache_root / name).mkdir(mode=0o700)
+    result_path = tmp_path / "worker-result.json"
+    module_identity = certifier._compat_module_identity(checkout / "src", commit)
+    result_path.write_bytes(
+        converter.canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "expected_commit": commit,
+                "module_identity": module_identity,
+            }
+        )
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "scripts/certify_psi0_dataset.py",
+            "--loader-worker",
+            "--psi0-src",
+            str(checkout / "src"),
+            "--dataset-root",
+            str(publication.dataset_root),
+            "--result",
+            str(result_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=certifier._worker_environment(cache_root),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert json.loads(result_path.read_bytes())["verdict"] == "FAIL"
+    assert not pyc_marker.exists()
+    assert not import_marker.exists()
+
+
+def test_psi0_loader_redirects_bytecode_cache_before_import(tmp_path, generated):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior="pycache_prefix"
+    )
+
+    evidence = _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    assert import_marker.is_file()
+    assert validate_evidence_terminal(evidence)["verdict"] == "PASS"
+
+
+def test_task11_import_probe_timestamp_pyc_is_ignored_during_certification(
+    tmp_path, generated
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior="task11-probe"
+    )
+    source = checkout / "src"
+    probe_environment = dict(os.environ)
+    probe_environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    probe_environment.pop("PYTHONPYCACHEPREFIX", None)
+    probe_environment.update(
+        {
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "PYTHONNOUSERSITE": "1",
+        }
+    )
+    probe = subprocess.run(
+        [sys.executable, "-I", "-", str(source)],
+        input="""\
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(source))
+from psi.data.lerobot.compat import LEROBOT_LAYOUT, LeRobotDataset
+
+print(LEROBOT_LAYOUT, LeRobotDataset)
+""",
+        env=probe_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert probe.returncode == 0, probe.stderr
+    checkout_pycs = sorted(source.rglob("*.pyc"))
+    assert checkout_pycs
+    assert all(
+        int.from_bytes(path.read_bytes()[4:8], "little") == 0 for path in checkout_pycs
+    )
+
+    import_marker.unlink()
+    pyc_payload_marker = tmp_path / "task11-probe-pyc-executed"
+    _replace_with_malicious_timestamp_compat_pyc(checkout, pyc_payload_marker)
+
+    evidence = _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    assert validate_evidence_terminal(evidence)["verdict"] == "PASS"
+    assert import_marker.read_text() == "imported"
+    assert not pyc_payload_marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("behavior", "expected_event"),
+    [
+        ("network", "socket.__new__"),
+        ("resolver", "socket.getaddrinfo"),
+        ("subprocess", "subprocess.Popen"),
+    ],
+)
+def test_psi0_loader_network_and_process_attempts_fail_and_clean_cache(
+    tmp_path, generated, behavior, expected_event
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(
+        tmp_path, behavior=behavior
+    )
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    evidence = caught.value.evidence_root
+    assert import_marker.is_file()
+    assert not (evidence / ".loader-cache").exists()
+    terminal = validate_evidence_terminal(evidence)
+    assert terminal["verdict"] == "FAIL"
+    result = _read_canonical_evidence(evidence / "psi0-loader-result.json")["result"]
+    assert result["network_policy"]["violations"]
+    assert result["network_policy"]["violations"][0]["event"] == expected_event
+
+
+@pytest.mark.parametrize("failure", ["dirty", "wrong_commit"])
+def test_psi0_loader_rejects_unpinned_checkout_before_import(
+    tmp_path, generated, failure
+):
+    _, _, publication = generated
+    checkout, commit, import_marker = _make_fake_psi0_checkout(tmp_path)
+    if failure == "dirty":
+        (checkout / "src/psi/data/lerobot/compat.py").write_text("dirty tracked file\n")
+    else:
+        commit = "0" * 40
+
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    evidence = caught.value.evidence_root
+    assert not import_marker.exists()
+    assert not (evidence / ".loader-cache").exists()
+    terminal = validate_evidence_terminal(evidence)
+    assert terminal["verdict"] == "FAIL"
+    assert terminal["error_code"] == "PSI0_CHECKOUT"
+
+
+def test_psi0_loader_cache_cleanup_failure_forbids_terminal_evidence(
+    tmp_path, generated, monkeypatch
+):
+    _, _, publication = generated
+    checkout, commit, _ = _make_fake_psi0_checkout(tmp_path)
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise OSError("injected cache cleanup failure")
+
+    monkeypatch.setattr(certifier, "_remove_loader_cache", fail_cleanup, raising=False)
+    with pytest.raises(PublishedUncertifiedError) as caught:
+        _certify_with_fake_loader(publication, checkout, commit, uuid.uuid4())
+
+    assert caught.value.code == "CACHE_CLEANUP_FAILED"
+    evidence = caught.value.evidence_root
+    assert (evidence / ".loader-cache").is_dir()
+    assert not (evidence / "PASS.json").exists()
+    assert not (evidence / "FAIL.json").exists()
+
+
+def test_psi0_loader_cache_cleanup_cli_reports_absolute_evidence_root(
+    tmp_path, generated, monkeypatch, capsys
+):
+    _, _, original = generated
+    publication = _published_copy(original, tmp_path / "cleanup-cli")
+    checkout, commit, _ = _make_fake_psi0_checkout(tmp_path)
+
+    monkeypatch.setattr(
+        certifier,
+        "_remove_loader_cache",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("cleanup failed")),
+    )
+    assert (
+        certifier.main(
+            [
+                "--dataset-root",
+                str(publication.dataset_root),
+                "--recover-publication-uncertain",
+                "--psi0-root",
+                str(checkout),
+                "--psi0-commit",
+                commit,
+                "--python",
+                sys.executable,
+            ]
+        )
+        == 1
+    )
+    evidence_roots = list(
+        publication.dataset_root.parent.glob(
+            f".{publication.dataset_root.name}.certification-*"
+        )
+    )
+    assert len(evidence_roots) == 1
+    stderr = capsys.readouterr().err
+    assert "CACHE_CLEANUP_FAILED" in stderr
+    assert str(evidence_roots[0].absolute()) in stderr
+    assert not (evidence_roots[0] / "PASS.json").exists()
+    assert not (evidence_roots[0] / "FAIL.json").exists()
+
+
+@pytest.mark.production_loader
+def test_real_pinned_psi0_loader_traverses_every_synthetic_row(tmp_path):
+    psi0_root_value = os.environ.get("PSI0_PRODUCTION_ROOT")
+    psi0_commit = os.environ.get("PSI0_PRODUCTION_COMMIT")
+    assert psi0_root_value, "PSI0_PRODUCTION_ROOT is required"
+    assert psi0_commit, "PSI0_PRODUCTION_COMMIT is required"
+    psi0_root = Path(psi0_root_value)
+
+    plan = _make_copy_plan(tmp_path)
+    staging = tmp_path / ".copy-dataset.production-loader-staging"
+    converter.generate_staged_dataset(plan, staging)
+    publication = converter.publish_staged_dataset(
+        staging,
+        plan.output_path,
+        plan.converter,
+        converter.PublicationFilesystem(),
+        lambda _point: None,
+    )
+    with converter.conversion_lock(publication.dataset_root):
+        evidence = certify_published_dataset(
+            publication,
+            psi0_root=psi0_root,
+            psi0_commit=psi0_commit,
+            python=Path(sys.executable),
+            certificate_uuid=uuid.uuid4(),
+        )
+
+    assert validate_evidence_terminal(evidence)["verdict"] == "PASS"
+    assert not (evidence / ".loader-cache").exists()
+    cache = _read_canonical_evidence(evidence / "psi0-loader-cache.json")
+    assert any(
+        entry["type"] == "regular"
+        and Path(entry["path"]).parts[0] in {"hf", "datasets"}
+        for entry in cache["entries"]
+    )
+    result = _read_canonical_evidence(evidence / "psi0-loader-result.json")
+    worker_result = result["result"]
+    assert worker_result["visited_indices"] == list(range(7))
+    assert worker_result["episode_ranges"] == [[0, 2], [3, 6]]
+    assert worker_result["network_policy"]["violations"] == []
+    assert worker_result["tensor_contract"] == {
+        "action": {"dtype": "torch.float32", "shape": [36]},
+        "observation.images.egocentric": {
+            "dtype": "torch.float32",
+            "shape": [3, 360, 640],
+        },
+        "states": {"dtype": "torch.float32", "shape": [32]},
+    }

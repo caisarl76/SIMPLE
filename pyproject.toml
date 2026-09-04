@@ -56,6 +56,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.package-data]
 simple = ["resources/*"]
 
+[tool.pytest.ini_options]
+markers = [
+  "production_loader: requires the pinned PSI0 checkout and runs its real LeRobot loader",
+]
+
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu128"
 
