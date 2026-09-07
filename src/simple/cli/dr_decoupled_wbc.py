@@ -8,6 +8,7 @@ Licensed under the terms in LICENSE file.
 from __future__ import annotations
 
 import os
+from simple.output_paths import output_path
 os.environ["_TYPER_STANDARD_TRACEBACK"] = "1"
 
 import json
@@ -112,7 +113,7 @@ def main(
     headless: Annotated[bool, typer.Option()] = False,
     max_episode_steps: Annotated[int | None, typer.Option()] = None,
     success_criteria: Annotated[float | None, typer.Option()] = None,
-    save_dir: Annotated[str, typer.Option()] = "data/evals",
+    save_dir: Annotated[str, typer.Option()] = output_path("evals"),
 ):
     """Create minimal evaluation dataset with first frame and environment_config."""
     sonic_config = _make_sonic_config()

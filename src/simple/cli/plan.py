@@ -7,6 +7,7 @@ Licensed under the terms in LICENSE file.
 import os
 os.environ["_TYPER_STANDARD_TRACEBACK"]="1"
 from simple.mp.curobo import CuRoboPlanner
+from simple.output_paths import output_path
 from simple.agents.mp import MotionPlannerAgent
 from simple.tasks.registry import TaskRegistry
 from simple.core.task import Task
@@ -102,7 +103,7 @@ def dump_actions_to_save(mp_agent: MotionPlannerAgent):
 def main(
     task: Annotated[str, typer.Option()] = "franka_tabletop_grasp",
     save_label: Annotated[str, typer.Option()] = "plan",
-    save_dir: Annotated[str, typer.Option()] = "data/output",
+    save_dir: Annotated[str, typer.Option()] = output_path("output"),
     num_poses: Annotated[int, typer.Option()] = 40,
     render_hz: Annotated[int, typer.Option()] = 30,
     dr_level: Annotated[int, typer.Option()] = 0,
@@ -158,4 +159,3 @@ def typer_main():
 
 if __name__ == "__main__":
     typer.run(main)
-

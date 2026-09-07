@@ -6,3 +6,5 @@
    :maxdepth: 1
 
 build_custom_robot
+psi0_batch
+```

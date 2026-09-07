@@ -4,6 +4,7 @@ import importlib
 import json
 import multiprocessing as mp
 import os
+from simple.output_paths import output_path
 from collections import defaultdict
 from contextlib import contextmanager
 from multiprocessing.connection import wait
@@ -152,7 +153,7 @@ def _run_eval_worker(
     data_format: Annotated[str, typer.Option()] = "rlds_numpy",
     sim_mode: Annotated[str, typer.Option()] = "mujoco_isaac",
     headless: Annotated[bool, typer.Option()] = False,
-    eval_dir: Annotated[str, typer.Option()] = "data/evals",
+    eval_dir: Annotated[str, typer.Option()] = output_path("evals"),
     max_episode_steps: Annotated[int | None, typer.Option()] = None,
     num_episodes: Annotated[int, typer.Option()] = 100,
     episode_start: Annotated[int, typer.Option()] = 0,
@@ -628,7 +629,7 @@ def main(
     data_format: Annotated[str, typer.Option()] = "rlds_numpy",
     sim_mode: Annotated[str, typer.Option()] = "mujoco_isaac",
     headless: Annotated[bool, typer.Option()] = False,
-    eval_dir: Annotated[str, typer.Option()] = "data/evals",
+    eval_dir: Annotated[str, typer.Option()] = output_path("evals"),
     max_episode_steps: Annotated[int | None, typer.Option()] = None,
     num_episodes: Annotated[int, typer.Option()] = 100,
     episode_start: Annotated[int, typer.Option()] = 0,

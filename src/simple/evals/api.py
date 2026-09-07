@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
+from simple.output_paths import output_path
 
 
 @dataclass(frozen=True)
@@ -14,7 +15,7 @@ class EvalConfig:
     data_format: str = "rlds_numpy"
     sim_mode: str = "mujoco_isaac"
     headless: bool = False
-    eval_dir: str = "data/evals"
+    eval_dir: str = field(default_factory=lambda: output_path("evals"))
     max_episode_steps: int = 15000
     num_episodes: int = 100
     episode_start: int = 0

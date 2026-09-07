@@ -7,6 +7,7 @@ Licensed under the terms in LICENSE file.
 import os
 os.environ["_TYPER_STANDARD_TRACEBACK"]="1"
 import os, sys
+from simple.output_paths import output_path
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from simple.args import args
 from simple.engines.isaac_app import create_simulation_app
@@ -244,7 +245,7 @@ def get_eef_pose(room: IsaacSimSimulator):
 
 def main(    task: Annotated[str, typer.Option()] = "franka_tabletop_grasp",
     save_label: Annotated[str, typer.Option()] = "plan",
-    save_dir: Annotated[str, typer.Option()] = "data/output",
+    save_dir: Annotated[str, typer.Option()] = output_path("output"),
     render_hz: Annotated[int, typer.Option()] = 30,
     dr_level: Annotated[int, typer.Option()] = 0,
     num_shards: Annotated[int, typer.Option()] = 0,

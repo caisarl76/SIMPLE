@@ -5,6 +5,7 @@ Copyright (c) 2025 Songlin Wei and Contributors
 Licensed under the terms in LICENSE file.
 """
 import os
+from simple.output_paths import output_path
 os.environ["_TYPER_STANDARD_TRACEBACK"]="1"
 import sys
 
@@ -278,7 +279,7 @@ class ControlAgent(PrimitiveAgent):
 def main(
     task: Annotated[str, typer.Option()] = "franka_tabletop_grasp",
     save_label: Annotated[str, typer.Option()] = "plan",
-    save_dir: Annotated[str, typer.Option()] = "data/output",
+    save_dir: Annotated[str, typer.Option()] = output_path("output"),
     render_hz: Annotated[int, typer.Option()] = 30,
     dr_level: Annotated[int, typer.Option()] = 3,
     num_shards: Annotated[int, typer.Option()] = 0,
@@ -397,5 +398,4 @@ def main(
 
 if __name__ == "__main__":
     typer.run(main)
-
 

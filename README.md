@@ -357,6 +357,9 @@ python -m simple.cli.datagen \
 
 ### 2. Post-processing
 
+For HDD output defaults and a single command covering generation, raw checks,
+conversion, and pinned PSI0 certification, see the [batch workflow](docs/source/workflows/psi0_batch.md).
+
 To prepare the generated datasets for policy learning, we need to post-process the raw output data to be strictly compatible with the training pipeline of our foundation model, [Psi-0](https://github.com/physical-superintelligence-lab/Psi0).
 
 We provide two distinct post-processing scripts depending on how the data was collected:
@@ -366,9 +369,11 @@ For data generated via the automated motion planning pipeline (`datagen.py`), us
 
 **Example Usage:**
 ```bash
+export SIMPLE_OUTPUT_ROOT="${SIMPLE_OUTPUT_ROOT:-/mnt/data/jihun/datasets/SIMPLE}"
+mkdir -p "$SIMPLE_OUTPUT_ROOT/processed_psi0"
 python scripts/postprocess_psi0.py \
-  --sim-root="data/datagen*/simple/G1WholebodyXMoveBendPickMP-v0/level-0/" \
-  --out-dir=data/processed_psi0/G1WholebodyXMoveBendPickMP-v0 \
+  --sim-root="$SIMPLE_OUTPUT_ROOT/datagen*/simple/G1WholebodyXMoveBendPickMP-v0/level-0/" \
+  --out-dir="$SIMPLE_OUTPUT_ROOT/processed_psi0/G1WholebodyXMoveBendPickMP-v0" \
   --skip=60
 
 ```

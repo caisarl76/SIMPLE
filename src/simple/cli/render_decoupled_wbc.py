@@ -21,6 +21,7 @@ Licensed under the terms in LICENSE file.
 from __future__ import annotations
 
 import os
+from simple.output_paths import output_path
 os.environ["_TYPER_STANDARD_TRACEBACK"] = "1"
 
 import json
@@ -201,7 +202,7 @@ def main(
     render_hz: Annotated[int, typer.Option()] = 30,
     num_episodes: Annotated[int, typer.Option()] = -1,
     record: Annotated[bool, typer.Option()] = False,
-    save_dir: Annotated[str, typer.Option()] = "data/render_decoupled_wbc",
+    save_dir: Annotated[str, typer.Option()] = output_path("render_decoupled_wbc"),
     dr_level: Annotated[int, typer.Option()] = 0,
 ):
     """Replay recorded teleop dataset with Isaac Sim rendering."""

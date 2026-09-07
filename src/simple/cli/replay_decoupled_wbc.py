@@ -14,6 +14,7 @@ Licensed under the terms in LICENSE file.
 from __future__ import annotations
 
 import os
+from simple.output_paths import output_path
 os.environ["_TYPER_STANDARD_TRACEBACK"] = "1"
 
 import json
@@ -219,7 +220,7 @@ def main(
     record: Annotated[bool, typer.Option()] = True,
     replay_dir: Annotated[str, typer.Option()] = "",
     loop_episodes: Annotated[bool, typer.Option()] = False,
-    save_dir: Annotated[str, typer.Option()] = "data/replay_decoupled_wbc",
+    save_dir: Annotated[str, typer.Option()] = output_path("replay_decoupled_wbc"),
     dr_level: Annotated[int | None, typer.Option()] = None,
     success_criteria: Annotated[float | None, typer.Option()] = None,
     resume: Annotated[bool, typer.Option()] = False

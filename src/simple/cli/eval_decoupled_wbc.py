@@ -4,6 +4,7 @@ import importlib
 import json
 import multiprocessing as mp
 import os
+from simple.output_paths import output_path
 from collections import defaultdict
 from contextlib import contextmanager
 from multiprocessing.connection import wait
@@ -170,7 +171,7 @@ def _run_eval_worker(
     data_format: Annotated[str, typer.Option()] = "rlds_numpy",
     sim_mode: Annotated[str, typer.Option()] = "mujoco_isaac",
     headless: Annotated[bool, typer.Option()] = False,
-    eval_dir: Annotated[str, typer.Option()] = "data/evals_decoupled_wbc",
+    eval_dir: Annotated[str, typer.Option()] = output_path("evals_decoupled_wbc"),
     max_episode_steps: Annotated[int | None, typer.Option()] = None,
     num_episodes: Annotated[int, typer.Option()] = 16,
     episode_start: Annotated[int, typer.Option()] = 0,
@@ -211,7 +212,7 @@ def _run_eval_worker(
     server_timestamp = policy_info.get("timestamp")
     if server_policy and server_timestamp:
         task_component = f"{server_policy}-{server_timestamp}.{task_component}"
-    eval_output_dir = os.path.join("data/evals", policy, task_component, dr)
+    eval_output_dir = os.path.join(eval_dir, policy, task_component, dr)
     os.makedirs(eval_output_dir, exist_ok=True)
 
     if rollout_save_dir and num_workers != 1:
@@ -710,7 +711,7 @@ def main(
     data_format: Annotated[str, typer.Option()] = "rlds_numpy",
     sim_mode: Annotated[str, typer.Option()] = "mujoco_isaac",
     headless: Annotated[bool, typer.Option()] = False,
-    eval_dir: Annotated[str, typer.Option()] = "data/evals_decoupled_wbc",
+    eval_dir: Annotated[str, typer.Option()] = output_path("evals_decoupled_wbc"),
     max_episode_steps: Annotated[int | None, typer.Option()] = None,
     num_episodes: Annotated[int, typer.Option()] = 20,
     episode_start: Annotated[int, typer.Option()] = 0,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import atexit
 import importlib
 import json
@@ -8,6 +8,7 @@ from pathlib import Path
 import pickle
 import time
 from typing import Any, Callable, Protocol
+from simple.output_paths import output_path
 
 
 class SupportsReset(Protocol):
@@ -34,7 +35,7 @@ class EvalConfig:
     data_format: str = "rlds_numpy"
     sim_mode: str = "mujoco_isaac"
     headless: bool = False
-    eval_dir: str = "data/evals"
+    eval_dir: str = field(default_factory=lambda: output_path("evals"))
     max_episode_steps: int = 15000
     data_dir: str = "data/datagen"
     success_criteria: float = 0.9

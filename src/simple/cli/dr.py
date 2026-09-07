@@ -14,6 +14,7 @@ os.environ["_TYPER_STANDARD_TRACEBACK"]="1"
 import json
 import shutil
 from pathlib import Path
+from simple.output_paths import output_path
 PRERESET_TASK_STATE = "" #"examples/demo_task_state_dict.json" # 
 
 def main(
@@ -26,7 +27,7 @@ def main(
     max_episode_steps: Annotated[int, typer.Option()] = 30000,
     render_hz: Annotated[int, typer.Option()] = 30, # FIXME
     data_format: Annotated[str, typer.Option()] = "lerobot",
-    save_dir: Annotated[str, typer.Option()] = "data/datagen",
+    save_dir: Annotated[str, typer.Option()] = output_path("datagen"),
     num_episodes: Annotated[int, typer.Option()] = 100,
     shard_size: Annotated[int, typer.Option()] = 100,
     dr_level: Annotated[int, typer.Option()] = 0,
