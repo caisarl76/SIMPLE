@@ -937,17 +937,15 @@ def _validate_converter_identity(
 
 def _find_source(roots: list[Path], pattern: str, digest: object, code: str) -> Path:
     candidates = [path for root in roots for path in root.glob(pattern)]
-    matches = []
     for path in candidates:
         try:
             payload = converter._read_regular_file_bytes(path, "recorded source")
         except (OSError, RuntimeError):
             continue
         if converter.sha256_bytes(payload) == digest:
-            matches.append(path)
-    if len(matches) != 1:
-        _fail(code, "recorded source cannot be uniquely reopened")
-    return matches[0]
+            # Provenance binds content; separate batches may contain identical copies.
+            return path
+    _fail(code, "recorded source cannot be reopened with its SHA-256")
 
 
 def _source_derived_vectors(

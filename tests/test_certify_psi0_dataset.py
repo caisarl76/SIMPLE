@@ -587,6 +587,55 @@ def _make_unit_plan(root: Path) -> converter.ConversionPlan:
     )
 
 
+@pytest.mark.parametrize("source_change", ["missing", "tampered"])
+def test_duplicate_source_content_across_roots_is_validated_by_digest(
+    tmp_path, source_change
+):
+    source_a = make_source_episode(tmp_path / "source-a", frames=2, fps=4)
+    shutil.copytree(source_a, tmp_path / "source-b")
+    plan = converter.preflight_conversion(
+        SimpleNamespace(
+            skip=0,
+            downsample=1,
+            chunks_size=1,
+            total_episodes=2,
+            fps="4",
+            video_key="observation.rgb_head_stereo_left",
+            out_dir=str(tmp_path / "dataset"),
+            sim_root=str(tmp_path / "source-*"),
+        ),
+        _identity_for_recorded_blob(),
+    )
+    staging = tmp_path / ".dataset.staging-duplicates"
+    converter.generate_staged_dataset(plan, staging)
+    result = validate_dataset(
+        staging,
+        expected=DatasetExpectations.from_plan(plan),
+        require_final_modes=False,
+    )
+    assert result.total_episodes == 2
+    assert result.total_frames == 4
+    publication = converter.publish_staged_dataset(
+        staging,
+        plan.output_path,
+        plan.converter,
+        converter.PublicationFilesystem(),
+        lambda _point: None,
+    )
+    result = validate_dataset(
+        publication.dataset_root, expected=None, require_final_modes=True
+    )
+    assert result.total_episodes == 2
+    assert result.total_frames == 4
+
+    for episode in plan.episodes:
+        if source_change == "missing":
+            episode.parquet_path.unlink()
+        else:
+            episode.parquet_path.write_bytes(b"changed source bytes")
+    _assert_code(publication.dataset_root, None, "PROVENANCE_SOURCE", final=True)
+
+
 @pytest.fixture(scope="module")
 def generated(tmp_path_factory):
     root = tmp_path_factory.mktemp("certify-production")
