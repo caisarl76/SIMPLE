@@ -33,8 +33,9 @@ retain their original behavior; use fresh destinations for those commands.
 ## Prerequisites
 
 - A working SIMPLE simulation environment with Isaac/MuJoCo, CuRobo, assets, and
-  materialized policy weights. The completed 30-episode run used the existing
-  `.worktrees/psi0-normal-benchmark` checkout at `fd6972d`.
+  materialized policy weights. The original 30-episode run used
+  `.worktrees/psi0-normal-benchmark` at `fd6972d`; the corrected DR verification
+  uses `.worktrees/dr-material-verification` at `45f16a8`.
 - A Python environment with NumPy, PyArrow, Torch, and the pinned PSI0 loader's
   dependencies for validation/conversion; locally this is `.venv/bin/python`.
 - `ffmpeg`, `ffprobe`, and `nvidia-smi` on `PATH`.
@@ -50,7 +51,7 @@ starting simulation:
 
 ```bash
 python3 scripts/generate_psi0_batch.py \
-  --generator-root .worktrees/psi0-normal-benchmark \
+  --generator-root .worktrees/dr-material-verification \
   --psi0-root /home/jihun/work/Psi0/.worktrees/simple-dataset-cert-885538e \
   --psi0-commit 885538e0bbee05caa1a89d382653c860596eee95 \
   --gpu 1 --episodes-per-level 10 --levels 0 1 2 \
@@ -62,7 +63,9 @@ the orchestration interpreter when executing (it imports the final certificate
 validator). The generator defaults to `<generator-root>/.venv/bin/python`;
 `--generator-python` and `--converter-python` can override the subprocess
 interpreters. The default generator checkout is the current repository; the
-explicit checkout above reproduces the established simulation environment.
+explicit checkout above includes the verified DR material fix and uses the
+established simulation environment. Avoid the older benchmark checkout when
+you need fixed materials at DR1/DR2.
 
 Each level runs sequentially with 50 Hz rendering, headless mode, WebRTC disabled,
 and a fresh output directory. Only the selected GPU's compute occupancy blocks
@@ -115,9 +118,26 @@ sheets and findings live beside the original batch in `review/REVIEW.md`.
 
 All episodes use the same cracker-box target and room. They are useful for a
 pipeline/training smoke test, but do not establish broad object or scene coverage.
-In the actual recordings, table materials vary at **all three levels**; level 2
-removes distractors. Do not interpret these labels as fixed-material benchmark
-conditions. `TabletopGraspDRManager.set_level()` changes the material configuration,
-but `MaterialDR` caches its mode on construction. That discrepancy needs a separate
-runtime fix and regenerated data before a controlled DR comparison. Preserve the
-current raw recordings and certificates as evidence of the actual run.
+In those original September 7 recordings, table materials vary at **all three
+levels**; level 2 removes distractors. Do not relabel that batch as fixed-material
+benchmark data. Preserve its raw recordings and certificates.
+
+Commit `45f16a8` fixes material sampling to read the current configuration and makes
+fixed object shader values deterministic, including fixed ground material when
+an explicit table material is supplied. Five material regression tests pass
+(the old code fails three of them); the combined focused suite passes 22 tests.
+
+The September 8 verification generated three fresh episodes per level in
+`/mnt/data/jihun/datasets/SIMPLE/dr-material-verification/20260908T022158Z-622a2d4b`:
+
+| DR level | Material states | Lighting states | Distractors per episode | Retained frames |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 3 | 3 | 3 | 464 |
+| 1 | 1 | 1 | 3 | 462 |
+| 2 | 1 | 1 | 0 | 461 |
+
+Both PSI0 certifications passed all 1,387 retained frames (1,927 raw frames).
+`dr-conditions.json` records the parameter checks; `review/REVIEW.md` and its
+contact sheets record sampled visual inspection of all nine episodes and four
+camera streams. These are verification samples, not evidence of broad object or
+scene generalization.
