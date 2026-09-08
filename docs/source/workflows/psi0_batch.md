@@ -141,3 +141,80 @@ Both PSI0 certifications passed all 1,387 retained frames (1,927 raw frames).
 contact sheets record sampled visual inspection of all nine episodes and four
 camera streams. These are verification samples, not evidence of broad object or
 scene generalization.
+
+## Prepare training and run the H100 smoke test
+
+`scripts/prepare_psi0_training_split.py` copies raw episodes into disjoint
+`raw/train/` and `raw/val/` trees. Within each source DR directory, the last
+episode is held out and the remaining episodes are used for training. It
+preserves source episode IDs and environment configurations, checks copied
+file hashes, and writes the assignments and source batch provenance to
+`split.json`. These sparse raw trees are converter inputs, not training repos;
+convert each tree separately to obtain contiguous episode indices and freshly
+computed statistics. Existing output directories are rejected.
+
+```bash
+python3 scripts/prepare_psi0_training_split.py \
+  --batch-root /mnt/data/jihun/datasets/SIMPLE/dr-material-verification/20260908T022158Z-622a2d4b \
+  --output-root /mnt/data/jihun/datasets/SIMPLE/training/corrected9-20260908
+```
+
+That destination already exists from the September 8 run. Choose a new path to
+repeat preparation. Its `processed/train` contains six episodes / 925 frames;
+`processed/val` contains three episodes / 462 frames. Both splits passed two
+certifications through PSI0 commit `885538e0bbee05caa1a89d382653c860596eee95`.
+Training and validation source Parquet hashes do not overlap. Use only
+`processed/train/meta/stats_psi0.json` for normalization in both splits.
+Stored actions remain 36-D and states 32-D; the model pads states to 36-D.
+
+The full PSI0 smoke test ran in Docker on **H100 physical GPU 7**, not on the
+workstation. Container `jihun_psi0_simple_corrected9_gpu7_20260908` uses an
+isolated source snapshot, read-only data and pretrained weights, and separate
+writable results. The existing `jihun_psi0_sonic_train_gpu23_20260805` container
+was inspected only; its GPUs were occupied by other workloads.
+
+The run completed three optimizer steps, three held-out validation passes,
+and checkpoint saves with batch size one, bf16, frozen VLM, 36-D actions,
+30-frame chunks, and RTC training. All losses were finite:
+
+| Step | Training loss | Validation loss |
+| --- | ---: | ---: |
+| 1 | 43.4030 | 44.4903 |
+| 2 | 42.2987 | 39.5637 |
+| 3 | 29.9186 | 45.9084 |
+
+Checkpoints 2 and 3 remain on H100 under
+`/mnt/data01/jhkim/model_weight/Psi0/simple-corrected9-smoke-20260908/results/runs/finetune/`.
+Checkpoint 3 passed a fresh strict VLM/action-head reload. This verifies the
+training pipeline; three steps do not establish a learned picking policy.
+
+Local evidence is under the training destination in `training-result.json`
+and `h100-evidence/`, including the exact source/launch package, arguments,
+run configuration, metrics, and logs. The first training attempt lacked FFmpeg;
+installing it inside the new container resolved video decoding. The successful
+environment used Python 3.11, Torch 2.7.0+cu126, Transformers 4.57.1, and
+FlashAttention 2.7.4.post1. Metrics were recorded locally without W&B uploads.
+
+The 13 required pretrained files were downloaded and checksum-verified from
+`USC-PSI-Lab/psi-model` revision `a4c69a6e4af7eee5beb1aee2597c4184fc508683`
+into `/mnt/data/jihun/model_weights/psi0-training`. H100 used its existing
+pretrained assets under `/mnt/data01/jhkim/model_weight/Psi0`.
+
+When using a shared simulation virtual environment, explicitly set
+`PYTHONPATH=<corrected-generator-worktree>/src`. Otherwise its editable install
+can import a different worktree even when the working directory is correct.
+
+Checkpoint 3 also completed one held-out simulation episode per DR level,
+with a 300-step cap: **0/3 task successes**. All 12 camera videos contain
+301 frames at 640×360 and 50 Hz. Sampled front-left review shows the robot
+remaining upright but knocking the target off the table. This is a completed
+runtime smoke test, not successful task learning. Results and contact sheets
+are in `simulation-smoke-retry1/`; the earlier failed import attempt remains
+in `simulation-smoke/`. The H100 smoke container was stopped after evaluation.
+
+The next generation batch was started at
+`/mnt/data/jihun/datasets/SIMPLE/batches/20260908T073639Z-6cb35317`, requesting
+100 corrected episodes per DR level on workstation GPU 1. Its `result.json`
+will establish completion and certification; a started run alone is not a
+completed dataset. It retains the same target and room as the verification
+batch, so broader object/scene coverage remains separate work.
